@@ -189,8 +189,7 @@ class ProcessorBridge:
         try:
             # Build a full transition so complementary_data (containing the
             # task instruction) is available to all pipeline steps.
-            from lerobot.processor.converters import create_transition
-            from lerobot.processor.core import TransitionKey
+            from lerobot.processor.converters import create_transition, TransitionKey
 
             complementary: dict[str, Any] = {}
             if instruction:
