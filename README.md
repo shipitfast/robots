@@ -494,9 +494,41 @@ register_policy("reach", lambda: ReachPolicy, aliases=["lerp"])
 policy = create_policy("reach")
 ```
 
-The same shape extends to MoveIt2 (forward `target_pose` + `joint_state` to
-a sidecar ROS 2 service via ZMQ / gRPC).  Reference implementations are
-tracked on the [Strands Labs - Robots project board](https://github.com/orgs/strands-labs/projects/2).
+#### `MoveIt2Policy` (reference implementation, ROS 2 sidecar)
+
+`MoveIt2Policy` is a thin ZMQ + msgpack client that talks to a sidecar
+ROS 2 node running `moveit_py`. The ROS 2 stack lives entirely
+out-of-process, so users without ROS 2 sourced are unaffected — the only
+client-side dependency is the `[moveit2]` extra (`pyzmq`, `msgpack`).
+
+```bash
+pip install 'strands-robots[moveit2]'
+```
+
+Bring up the sidecar via the docker-compose recipe at
+[`strands_robots/policies/moveit2/server/`](./strands_robots/policies/moveit2/server/)
+or natively with `python -m strands_robots.policies.moveit2.server.zmq_node`,
+then:
+
+```python
+from strands_robots.policies import create_policy
+
+policy = create_policy(
+    "moveit2",                    # alias: "moveit"
+    host="127.0.0.1",
+    port=5556,
+    planning_group="arm",
+)
+
+actions = policy.get_actions_sync(
+    observation_dict={"observation.state": [0.0] * 6},
+    instruction="reach for the red block",   # ignored by planners
+    target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],
+)
+```
+
+See the [MoveIt2 policy docs](https://strands-labs.github.io/robots/policies/moveit2/)
+for the goal-kwarg vocabulary, trajectory chunking, and sidecar deployment.
 
 #### `CuroboPolicy` (in-process collision-aware planning, GPU)
 
