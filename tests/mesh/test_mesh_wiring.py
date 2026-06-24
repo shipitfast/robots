@@ -44,11 +44,14 @@ def patched_init_mesh(monkeypatch):
 
 
 def test_robot_factory_attaches_mesh_in_sim_mode(patched_init_mesh):
-    """Robot() with default mesh=True attaches the mesh produced by init_mesh."""
+    """Robot(..., mesh=True) attaches the mesh produced by init_mesh.
+
+    Mesh defaults to OFF now (quiet-by-default), so opting in is explicit.
+    """
     from strands_robots import Robot
 
     mock_init_mesh, fake_mesh = patched_init_mesh
-    sim = Robot("so100", mode="sim")
+    sim = Robot("so100", mode="sim", mesh=True)
     try:
         # init_mesh was called with the constructed sim and peer_type='sim'.
         assert mock_init_mesh.called
@@ -140,3 +143,53 @@ def test_robot_factory_mesh_init_failure_does_not_break_sim(monkeypatch):
             sim.destroy()
         except Exception:
             pass
+
+
+def test_robot_factory_env_opt_in_enables_mesh(monkeypatch):
+    """A bare Robot() honours STRANDS_MESH=true (opt-in without code change).
+
+    mesh defaults to None (quiet), so the factory consults STRANDS_MESH and
+    passes mesh=True down to init_mesh when the env opts in.
+    """
+    from unittest.mock import MagicMock
+
+    from strands_robots import Robot
+
+    monkeypatch.setenv("STRANDS_MESH", "true")
+    fake = MagicMock(name="MockMesh")
+    fake.peer_id = "envbot-test"
+    fake.alive = True
+    with patch("strands_robots.mesh.init_mesh", return_value=fake) as m:
+        sim = Robot("so100", mode="sim")
+        try:
+            assert m.called
+            assert m.call_args.kwargs["mesh"] is True
+            assert sim.mesh is fake
+        finally:
+            try:
+                sim.destroy()
+            except Exception:
+                # Best-effort teardown: a destroy() hiccup during cleanup
+                # must not mask the assertion outcome under test.
+                pass
+
+
+def test_robot_factory_explicit_false_beats_env_true(monkeypatch):
+    """Explicit mesh=False wins even when STRANDS_MESH=true is set."""
+    from strands_robots import Robot
+
+    monkeypatch.setenv("STRANDS_MESH", "true")
+    with patch("strands_robots.mesh.init_mesh", return_value=None) as m:
+        sim = Robot("so100", mode="sim", mesh=False)
+        try:
+            # Factory must forward mesh=False; init_mesh then returns None.
+            if m.called:
+                assert m.call_args.kwargs.get("mesh") is False
+            assert sim.mesh is None
+        finally:
+            try:
+                sim.destroy()
+            except Exception:
+                # Best-effort teardown: a destroy() hiccup during cleanup
+                # must not mask the assertion outcome under test.
+                pass

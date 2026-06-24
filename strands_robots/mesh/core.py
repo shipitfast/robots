@@ -490,14 +490,17 @@ class Mesh(SensorLoopsMixin):
             return False
 
         logger.error(
-            "[mesh] %s: PERMISSIVE DEFAULT ACL ACTIVE UNDER MTLS -- "
-            "Mesh NOT STARTED. Any CA-signed peer can publish/subscribe "
-            "on any key. Remediate one of:\n"
-            "  1. Supply STRANDS_MESH_ACL_FILE pointing at a role-separated "
+            "[mesh:%s] Mesh did NOT start: it would accept any TLS-signed peer "
+            "on every topic (no access-control list configured).\n"
+            "  Pick one:\n"
+            "    - Local dev / single machine?  Set STRANDS_MESH_LOCAL_DEV=true "
+            "(turns off mTLS+ACL for localhost experiments).\n"
+            "    - Sharing a trusted lab network?  Set "
+            "STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 to accept this posture.\n"
+            "    - Production?  Point STRANDS_MESH_ACL_FILE at a role-separated "
             "ACL (see examples/mesh_acl_example.json5).\n"
-            "  2. Set STRANDS_MESH_ACCEPT_PERMISSIVE_ACL=1 to acknowledge "
-            "the dev/lab posture.\n"
-            "  3. Disable the mesh (do not call Mesh.start()).",
+            "    - Don't need the mesh?  It is OFF by default now -- just drop "
+            "mesh=True (or set STRANDS_MESH=false).",
             self.peer_id,
         )
         return True
@@ -522,12 +525,14 @@ class Mesh(SensorLoopsMixin):
             # (e.g. physical-only recovery) see the warning and accept it.
             if not os.getenv("STRANDS_MESH_OVERRIDE_CODE", "").strip():
                 logger.warning(
-                    "[safety] %s: STRANDS_MESH_OVERRIDE_CODE is not set -- the "
-                    "emergency-stop lockout will be UNRECOVERABLE over the mesh. "
-                    "A single estop broadcast will lock this robot until a "
-                    "physical restart (fleet-wide DoS risk). Set "
-                    "STRANDS_MESH_OVERRIDE_CODE to the same value on every peer "
-                    "to enable remote resume.",
+                    "[safety:%s] No emergency-stop resume code set. If any peer "
+                    "broadcasts an e-stop, this robot stays locked until you "
+                    "physically restart it (one message can freeze the whole "
+                    "fleet).\n"
+                    "  To allow remote resume: set STRANDS_MESH_OVERRIDE_CODE to "
+                    "the SAME value on every peer.\n"
+                    "  Local dev?  STRANDS_MESH_LOCAL_DEV=true is fine to ignore "
+                    "this.",
                     self.peer_id,
                 )
 
@@ -549,13 +554,12 @@ class Mesh(SensorLoopsMixin):
 
             if _zc_bool_env("STRANDS_MESH_MULTICAST", default=False):
                 logger.warning(
-                    "[safety] %s: STRANDS_MESH_MULTICAST=true -- multicast "
-                    "scouting is enabled. Any device on the LAN can attract "
-                    "fleet robots without credentials (unauthenticated UDP "
-                    "224.0.0.224:7446). This is a fleet-takeover risk on "
-                    "untrusted networks. Set STRANDS_MESH_MULTICAST=false "
-                    "(the default) unless operating on a physically isolated "
-                    "network.",
+                    "[safety:%s] Multicast scouting is ON "
+                    "(STRANDS_MESH_MULTICAST=true). Any device on the LAN can "
+                    "discover and attract fleet robots without credentials "
+                    "(open UDP 224.0.0.224:7446).\n"
+                    "  Only use this on a physically isolated / trusted network. "
+                    "Otherwise set STRANDS_MESH_MULTICAST=false (the default).",
                     self.peer_id,
                 )
 
@@ -3275,10 +3279,17 @@ def init_mesh(
 ) -> Mesh | None:
     """Construct and start a Mesh for the given robot.
 
-    Returns None when mesh is disabled (STRANDS_MESH=false or mesh=False).
+    Returns None when mesh is disabled. ``STRANDS_MESH=false`` is a hard kill
+    switch and an explicit ``mesh=False`` both disable mesh; the env var only
+    forces mesh OFF, never ON (so an explicit opt-out is always honoured).
     """
-    env = os.getenv("STRANDS_MESH", "true").strip().lower()
-    if env == "false":
+    # STRANDS_MESH=false is a hard kill switch: it disables mesh regardless of
+    # the ``mesh`` argument. An explicit ``mesh=False`` always wins too -- the
+    # env var only ever forces mesh OFF here, never ON, so a caller that
+    # explicitly opted out is honoured. The opt-in path (a bare ``Robot()``
+    # turning mesh ON via STRANDS_MESH=true) is resolved in the Robot factory.
+    env = os.getenv("STRANDS_MESH", "").strip().lower()
+    if env in ("false", "0", "no"):
         mesh = False
     if not mesh:
         return None
