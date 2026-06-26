@@ -27,6 +27,12 @@ from .resolution import resolve_policy_class_by_name, resolve_policy_class_from_
 
 logger = logging.getLogger(__name__)
 
+# Fallback control rate used ONLY when RTC runs without the runtime having
+# called set_control_frequency(). Used to keep a standalone (no-runner) RTC
+# call functional; the runner always plumbs the real rate. A loud one-time
+# warning fires whenever this fallback is used.
+_RTC_FALLBACK_FPS: float = 30.0
+
 
 # Process-level cache of loaded underlying models, keyed by the load-determining
 # inputs. Loading a VLA checkpoint (e.g. MolmoAct2 SO-100/101 = 1295 weight
@@ -200,6 +206,10 @@ class LerobotLocalPolicy(Policy):
         self._rtc_latency_history: deque = deque(maxlen=100)
         self._rtc_last_inference_time: float = 0.0
         self._rtc_last_log_time: float = 0.0
+        # Warn at most once per policy when RTC runs without a known
+        # control_frequency (set_control_frequency never called) so the
+        # 30Hz fallback is loud, not silent.
+        self._rtc_freq_warned: bool = False
 
         # Action diagnostics: surface a model<->embodiment action-dim mismatch
         # (zero-filled actuators) and a persistent near-zero action stream
@@ -897,14 +907,18 @@ class LerobotLocalPolicy(Policy):
             self._rtc_max_guidance_weight,
         )
 
-    def _estimate_inference_delay(self, fps: float = 30.0) -> int:
+    def _estimate_inference_delay(self, fps: float) -> int:
         """Estimate the number of action steps consumed during inference.
 
         Uses the p95 latency from recent inference calls to estimate how many
-        action steps the robot executed while waiting for the new chunk.
+        action steps the robot executed while waiting for the new chunk. The
+        result is ``p95_latency * fps``, so ``fps`` MUST be the real control
+        rate of the executing loop - a wrong rate scales the delay wrong and
+        corrupts the RTC chunk-seam blend. The caller resolves ``fps`` from
+        :attr:`Policy.control_frequency` (set by the runtime).
 
         Args:
-            fps: Robot control frequency in Hz. Defaults to 30.
+            fps: Robot control frequency in Hz (the loop's real control rate).
 
         Returns:
             Estimated delay in action steps (minimum 0).
@@ -956,8 +970,25 @@ class LerobotLocalPolicy(Policy):
         if action_chunk.dim() == 3 and action_chunk.shape[0] == 1:
             action_chunk = action_chunk.squeeze(0)
 
-        # Estimate inference delay - how many steps were consumed while computing
-        inference_delay = self._estimate_inference_delay()
+        # Estimate inference delay - how many steps were consumed while
+        # computing. The delay is (p95 latency * control_frequency), so it
+        # MUST use the loop's real control rate; assuming a fixed rate makes
+        # the chunk-seam blend wrong at every other frequency. The runtime
+        # (PolicyRunner) calls set_control_frequency() before the loop.
+        fps = self.control_frequency
+        if fps is None:
+            if not self._rtc_freq_warned:
+                logger.warning(
+                    "RTC: control_frequency unknown for '%s', falling back to "
+                    "%.0fHz - inference-delay estimation will be off at any other "
+                    "control rate. Call set_control_frequency(hz) before running "
+                    "(PolicyRunner does this automatically).",
+                    type(self._policy).__name__,
+                    _RTC_FALLBACK_FPS,
+                )
+                self._rtc_freq_warned = True
+            fps = _RTC_FALLBACK_FPS
+        inference_delay = self._estimate_inference_delay(fps=fps)
 
         # Store leftover for next RTC call (unconsumed portion of this chunk).
         # The consumer executes ``execution_horizon`` actions before re-querying
