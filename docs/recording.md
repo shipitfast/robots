@@ -62,6 +62,29 @@ When `root` already contains a LeRobotDataset (a `meta/` directory),
 LeRobotDataset, and is **not empty** is left untouched and reported as an error
 rather than clobbered - pass `overwrite=True` or choose a new/empty `root`.
 
+When you drive recording through the `run_policy` tool (which owns the
+`start_recording` -> rollout -> `stop_recording` cycle), forward the same
+subset with `dataset_cameras=`:
+
+```python
+from strands_robots.tools.run_policy import run_policy
+
+run_policy(
+    simulation=sim,
+    robot_name="so101",
+    policy_provider="lerobot_local",
+    instruction="pick up the cube",
+    n_episodes=1,
+    dataset_root="/tmp/my_dataset",
+    dataset_cameras=["camera1", "camera2", "camera3"],  # drops the implicit 'default'
+)
+```
+
+When set, `dataset_cameras` is forwarded as `start_recording(cameras=...)`
+(the camera subset is a MuJoCo-backend feature). Omit it (the default `None`)
+to record every scene camera - the default path forwards no `cameras` kwarg at
+all, so it stays backend-agnostic across the MuJoCo and Newton engines.
+
 ## Multi-episode recording
 
 A recording session is one dataset. The simplest way to collect N episodes in
