@@ -1150,6 +1150,23 @@ and stilting cost the same. On a fixed-base arm (no floating base) the term
 degrades to `0.0` and logs the missing base once, consistent with the DSL's
 other name-resolution degradation.
 
+### Added: base_orientation locomotion-regularizer reward term for the predicate/reward DSL
+
+The dense-reward DSL grew a `base_orientation` term: `-weight * (g_x ** 2 + g_y ** 2)`,
+where `(g_x, g_y, g_z)` is the world gravity direction expressed in a floating
+base's frame (the "projected gravity" a legged controller reads), derived from
+`get_observation`'s `base_quat` signal. It is the standard legged_gym / IsaacLab
+`orientation` regularizer and the third piece of a minimal velocity-tracking
+reward: `base_velocity` alone is degenerate (a policy can crouch OR lean to cheat
+the forward-velocity reward), so a viable locomotion reward pairs `base_velocity`
+with `base_height` (which stops crouch-cheating) AND `base_orientation` (which
+stops lean/tilt-cheating) in one `dense_reward` list (the terms sum per step). The
+penalty is 0 when the base is level, grows as `-weight * sin(theta) ** 2` for a
+roll/pitch of `theta`, and is invariant to yaw -- a policy may turn freely while
+walking upright, only roll/pitch off level is penalised. On a fixed-base arm (no
+floating base) the term degrades to `0.0` and logs the missing base once,
+consistent with the DSL's other name-resolution degradation.
+
 ### Fixed:
 
 - `lerobot_local`: observation-history policies (Diffusion `n_obs_steps=2`, VQBeT `n_obs_steps=5`) crashed with `AssertionError` when run through `Simulation.run_policy`. `_auto_detect_actions_per_step` adopted the model's `n_action_steps` chunk and routed inference to `predict_action_chunk()`, whose offline branch stacks a single live observation frame as `n_obs_steps=1`; LeRobot's `generate_actions()` then trips `assert n_obs_steps == config.n_obs_steps`. These checkpoints now keep `actions_per_step=1` so inference runs through `select_action()`, which maintains the required observation-history queue and still replays the model's `n_action_steps` chunk from its internal queue (open-loop chunk replay is preserved). Single-history policies (ACT, SmolVLA, pi0, MolmoAct2) are unaffected.
