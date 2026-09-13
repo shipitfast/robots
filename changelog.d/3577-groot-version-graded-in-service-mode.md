@@ -8,3 +8,9 @@ N1.7 server; the typo surfaced as a server-side shape error. The guard now runs
 in both modes, so a mis-cased or blank `groot_version` is refused at
 construction with a `ValueError` naming the parameter and the accepted
 spellings.
+
+The parameter's `Args:` entry said it is "Only read in local mode, so it is
+validated only on the branch that reads it" - the claim that scoped the guard,
+and the one a service caller reads. It now names both readers, and
+`groot_version_error` states the domain as a release selector rather than a
+loader selector, since service mode loads nothing.

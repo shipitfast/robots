@@ -566,8 +566,11 @@ class Gr00tPolicy(Policy):
         groot_version: Force one of
             :data:`~strands_robots.utils.SUPPORTED_GROOT_VERSIONS` (``"n1.5"``,
             ``"n1.6"``, ``"n1.7"``) instead of auto-detecting the installed
-            release. Only read in local mode, so it is validated only on the
-            branch that reads it, as ``port`` is. A value naming no release is
+            release. Read in both modes: local mode dispatches a loader on it,
+            and service mode chooses the observation wire shape from it
+            (``"n1.7"`` adds the time axis an N1.7 server requires). It is
+            therefore validated at the door in either mode, unlike ``port``,
+            which only the branch that dials reads. A value naming no release is
             refused by name rather than reported as Isaac-GR00T being absent.
         strict: Strict input validation.
         api_token: ZMQ auth token. Falls back to ``GROOT_API_TOKEN`` env var if not provided.

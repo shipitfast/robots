@@ -139,6 +139,24 @@ class TestTheVersionIsGradedInBothModes:
         assert wire["video.front"].shape == (1, 1, 8, 8, 3)
         assert wire["state.single_arm"].shape == (1, 1, 5)
 
+    def test_the_parameter_entry_names_the_service_reader(self):
+        """The ``Args:`` entry is the surface a caller reads for this parameter.
+
+        It stated the value is "Only read in local mode, so it is validated only
+        on the branch that reads it, as ``port`` is" - the claim that scoped the
+        guard, and the one that told a service caller their spelling would go
+        ungraded. Both halves stopped holding once the wire shape was chosen
+        from it, so the entry names the service reader too. Pinned because
+        nothing else grades the claim: the cell above proves service mode reads
+        the value, and this keeps the documentation of it from drifting back to
+        local-only while the guard stays in both modes.
+        """
+        doc = " ".join((Gr00tPolicy.__doc__ or "").split())
+        start = doc.index("groot_version: Force one of")
+        entry = doc[start : doc.index("strict:", start)]
+        assert "Only read in local mode" not in entry, "the falsified claim is back in the entry a caller reads"
+        assert "service mode" in entry, "the entry must name the reader the local-only claim omitted"
+
 
 class TestAnAbsentPackageIsOneAnswerForEverySpellingOfTheRequest:
     """Forcing a release used to skip the check and raise ``ModuleNotFoundError``."""
