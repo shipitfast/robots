@@ -62,6 +62,7 @@ from strands_robots.teleop_mixin import TeleopMixin, _stop_reported_stopped
 from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     boolean_flag_error,
+    camera_token_error,
     dds_domain_id_error,
     positive_count_error,
     positive_finite_number_error,
@@ -289,6 +290,58 @@ def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
         ) from None
 
 
+def _camera_option_vocabulary(camera_name: str, config: Mapping[str, Any]) -> tuple[type, dict[str, Any]]:
+    """Resolve the config class one camera entry names and the options it may state.
+
+    The one owner of the camera option vocabulary. ``type`` selects the class
+    through lerobot's ``CameraConfig`` choice registry, and the options an entry
+    may then name are that class's declared dataclass fields - so a backend
+    lerobot adds, or a field it renames, is admitted here by construction rather
+    than by a list kept in step by hand. Every surface that accepts the
+    serialized ``cameras`` shape reads it from here: the ``Robot`` factory
+    constructs the config, and ``lerobot_teleoperate`` renders the same entry
+    into the ``--robot.cameras`` argv of a detached subprocess, where an option
+    the class does not declare would be refused minutes later in that process's
+    log rather than here.
+
+    Args:
+        camera_name: The key this camera was registered under, named in every
+            refusal so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options, already known to be a mapping.
+
+    Returns:
+        The resolved ``CameraConfig`` subclass and its declared fields by name.
+
+    Raises:
+        ValueError: If ``type`` is not a registered camera backend, or the entry
+            names an option the resolved class does not declare. An unknown
+            option is refused rather than dropped per AGENTS.md > Review
+            Learnings (#86): a silently discarded option reports success while
+            the camera streams at the default. The suggestion is drawn from the
+            resolved class's own fields: an ``index_or_path`` sent to a
+            RealSense is a real mistake, and pointing at
+            ``serial_number_or_name`` is what makes it fixable.
+    """
+    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
+    accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
+
+    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
+    if unknown:
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
+            if close:
+                hints.append(f"{key!r} -> {close[0]!r}")
+        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
+        raise ValueError(
+            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
+            f"{ConfigClass.__name__} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
+            f"the camera backend). (If this is a typo, fix it.)"
+        )
+    return ConfigClass, fields
+
+
 def _build_camera_config(camera_name: str, config: Any) -> Any:
     """Build the lerobot camera config for one entry of a ``cameras`` dict.
 
@@ -305,42 +358,31 @@ def _build_camera_config(camera_name: str, config: Any) -> Any:
         names, ready for ``lerobot.cameras.make_cameras_from_configs``.
 
     Raises:
-        ValueError: If ``config`` is not a mapping, names a camera ``type``
-            lerobot does not register, carries a key that is not a declared
-            field of the resolved class, omits a field that has no default, or
-            holds a value lerobot's own config validation refuses. An unknown
-            key is refused rather than dropped per AGENTS.md > Review Learnings
-            (#86): a silently discarded option reports success while the camera
-            streams at the default.
+        ValueError: If ``camera_name`` is not a bare token
+            (:func:`~strands_robots.utils.camera_token_error`), or if ``config``
+            is not a mapping, names a camera ``type`` lerobot does not register,
+            carries a key that is not a declared field of the resolved class,
+            omits a field that has no default, or holds a value lerobot's own
+            config validation refuses. An unknown key is refused rather than
+            dropped per AGENTS.md > Review Learnings (#86): a silently discarded
+            option reports success while the camera streams at the default.
     """
+    # The name is graded before the options because it is what every consumer
+    # keys this camera's frames by -- a mesh topic level, an S3 object key, a
+    # dataset feature key -- so no option is worth checking under a name none of
+    # them can carry. ``lerobot_teleoperate`` holds its ``robot_cameras`` to the
+    # same rule at the same point, through the same owner.
+    if (name_err := camera_token_error("Robot(cameras=...)", "camera name", camera_name)) is not None:
+        raise ValueError(name_err)
     if not isinstance(config, Mapping):
         raise ValueError(
             f"Camera {camera_name!r} config must be a mapping of option name to value, "
             f"got {type(config).__name__}: {config!r}."
         )
 
-    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    ConfigClass, fields = _camera_option_vocabulary(camera_name, config)
     class_name = ConfigClass.__name__
-
-    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
     accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
-
-    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
-    if unknown:
-        hints = []
-        for key in unknown:
-            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
-            if close:
-                hints.append(f"{key!r} -> {close[0]!r}")
-        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
-        # The suggestion is drawn from the resolved class's own fields: an
-        # ``index_or_path`` sent to a RealSense is a real mistake, and pointing
-        # at ``serial_number_or_name`` is what makes it fixable.
-        raise ValueError(
-            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
-            f"{class_name} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
-            f"the camera backend). (If this is a typo, fix it.)"
-        )
 
     missing = sorted(
         name
@@ -609,6 +651,14 @@ class Robot(TeleopMixin, AgentTool):
             robot: LeRobot Robot instance, RobotConfig, or robot type string
             cameras: Camera configuration dict:
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
+                Each key names one camera and must be a bare token of letters,
+                digits, ``_`` or ``-``: it is the identity every consumer keys
+                that camera's frames by - a level of the mesh topic they are
+                published on, a segment of the S3 key they are offloaded to, and
+                the ``observation.images.<name>`` feature key a recording writes
+                them under - so a name carrying punctuation any of those reserves
+                is refused here
+                (:func:`~strands_robots.utils.camera_token_error`).
             action_horizon: Actions consumed from each inferred policy chunk
                 before re-querying. Must be a positive integer - it is a lower
                 bound on the chunk slice the task loop applies
@@ -2782,7 +2832,7 @@ class Robot(TeleopMixin, AgentTool):
             "name": self.tool_name_str,
             "description": f"Universal robot control with async task execution ({self.robot}). "
             f"Actions: execute (blocking), start (async), status, stop. "
-            f"For execute/start actions: instruction and policy_port are required. "
+            f"For execute/start actions: instruction is required; policy_port when the provider dials a server. "
             f"For status/stop actions: no additional parameters needed.",
             "inputSchema": {
                 "json": {
@@ -2800,7 +2850,7 @@ class Robot(TeleopMixin, AgentTool):
                         },
                         "policy_port": {
                             "type": "integer",
-                            "description": "Policy service port (required for execute/start actions)",
+                            "description": "Policy service port. Required by groot and moveit2, read by the other server-dialing providers, refused for providers that build in process (mock, lerobot_local).",
                         },
                         "policy_host": {
                             "type": "string",
@@ -2925,13 +2975,17 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for execute action"}],
+                                "content": [{"text": "instruction is required for execute action"}],
                             },
                         )
                     )
@@ -2965,13 +3019,17 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for start action"}],
+                                "content": [{"text": "instruction is required for start action"}],
                             },
                         )
                     )

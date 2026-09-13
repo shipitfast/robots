@@ -109,6 +109,8 @@ from strands_robots.simulation.mujoco.backend import (
     _ensure_mujoco,
     filter_mujoco_attach_noise,
     mj_name_to_id,
+    pose_qpos_components,
+    qpos_ceiling_error,
 )
 from strands_robots.simulation.mujoco.manipulation import ManipulationMixin
 from strands_robots.simulation.mujoco.motion_primitives import MotionPrimitivesMixin
@@ -1095,6 +1097,12 @@ class MuJoCoSimEngine(
         scalar taken as the z-component). A value MuJoCo cannot integrate is
         rejected with a structured error instead of being compiled into
         ``model.opt``. ``None`` selects the engine default for either.
+
+        ``ground_plane`` must be a ``bool``: it selects a posture (lay a floor
+        or leave the world open), so a non-boolean is refused under the shared
+        :func:`~strands_robots.utils.boolean_flag_error` domain rather than
+        read by truthiness - ``"false"`` does not lay a floor and ``0`` does
+        not omit one.
         """
         # mujoco verified at __init__
 
@@ -1121,6 +1129,15 @@ class MuJoCoSimEngine(
                     }
                 ],
             }
+
+        # ``ground_plane`` selects a posture - lay a floor or leave the world
+        # open - so it is checked, not read by truthiness: ``"false"`` would lay
+        # the floor the word declines, and ``0`` would omit it without being a
+        # declared spelling. Checked ahead of the world-exists report, which
+        # reads the flag to describe the world it cannot rebuild, and ahead of
+        # the compile that would lay the floor.
+        if err := self._validate_posture_flags("create_world", ground_plane=ground_plane):
+            return err
 
         if self._world is not None and self._world._model is not None:
             return self._world_exists_error(
@@ -1883,6 +1900,13 @@ class MuJoCoSimEngine(
         model source". The bare model-source message is kept only when no
         ``name`` was supplied at all.
 
+        Resolving the model from ``name`` is a DEPRECATED fallback, and the
+        success message carries a ``Warning:`` line naming the ``data_config=``
+        form to use instead. That notice belongs to the call that used the
+        fallback and to no other: it is not reported on a later call that
+        resolved its model correctly, including when the deprecated call it
+        came from failed.
+
         A model source that is SUPPLIED but empty (``urdf_path=""`` /
         ``data_config=""``) is refused naming THAT parameter, rather than read
         as omitted. Read by truthiness the two were indistinguishable, so an
@@ -2017,6 +2041,15 @@ class MuJoCoSimEngine(
         #      fallback kept for one release with a DeprecationWarning).
         # Pass `data_config` for new code; the `name`-as-registry-key path
         # will be removed.
+        #
+        # The deprecation notice is per-call state, so it is carried in a local
+        # and not on the engine: an attribute armed here is only disarmed by the
+        # success return below, so any error exit between the two (a mesh the
+        # downloader cannot resolve, an injection the recompiler refuses, an
+        # unexpected compile crash) left it armed for the NEXT add_robot to
+        # report - accusing a caller that passed data_config= correctly, and
+        # naming the earlier robot.
+        deprecation_hint: str | None = None
         resolved_path = urdf_path
         if not resolved_path and data_config:
             resolved_path = resolve_model(data_config)
@@ -2035,7 +2068,7 @@ class MuJoCoSimEngine(
                     name,
                     name,
                 )
-                self._add_robot_deprecation_hint: str | None = (
+                deprecation_hint = (
                     f"Hint: add_robot(name='{name}') resolved via deprecated "
                     f"name-as-registry-key fallback. Prefer: "
                     f"add_robot(name='<instance_label>', data_config='{name}')."
@@ -2202,9 +2235,7 @@ class MuJoCoSimEngine(
 
             source = f"data_config='{data_config}'" if data_config else os.path.basename(resolved_path)
             mesh_line = f"\nMesh peer: {robot.peer_id}" if robot.peer_id else ""
-            hint = getattr(self, "_add_robot_deprecation_hint", None)
-            self._add_robot_deprecation_hint = None
-            hint_line = f"\nWarning: {hint}" if hint else ""
+            hint_line = f"\nWarning: {deprecation_hint}" if deprecation_hint else ""
             return {
                 "status": "success",
                 "content": [
@@ -3843,7 +3874,11 @@ class MuJoCoSimEngine(
                 means unspecified: ``shape="plane"`` resolves it to True, every
                 other shape to False. A plane cannot be dynamic, so an explicit
                 ``is_static=False`` there is refused rather than overridden --
-                which is why the default is ``None`` and not ``False``.
+                which is why the default is ``None`` and not ``False``. A
+                supplied value must be a boolean, because it selects a posture:
+                ``0`` is that same refused ``False`` and must not reach the
+                override instead of the refusal, and ``"false"`` reads as truthy
+                and would weld a body asked to be dynamic.
             mesh_path: Mesh asset path; required and only used when
                 ``shape="mesh"``. The asset defines the geom's extent, and
                 MuJoCo collides a mesh geom as its **convex hull** -- not as the
@@ -3920,6 +3955,26 @@ class MuJoCoSimEngine(
         if name in self._world.objects:
             return {"status": "error", "content": [{"text": f"Object '{name}' exists."}]}
 
+        # ``is_static`` selects a posture, so it is checked rather than read by
+        # truthiness. The resolution below tests it by IDENTITY and every later
+        # read is a truthiness one, so a non-boolean escaped both: ``0`` is the
+        # same value as the ``False`` the next branch refuses for a plane, yet
+        # it reached the silent override that branch exists to prevent, and
+        # ``"false"`` welded a body asked to be dynamic while storing that
+        # string on the record :class:`SimObject` annotates ``bool``. ``None``
+        # is the documented "unspecified" sentinel, resolved just below, so only
+        # a value the caller supplied is graded.
+        if is_static is not None:
+            if err := self._validate_posture_flags("add_object", is_static=is_static):
+                return err
+            # Normalized to a plain ``bool`` now it is known to be one. The
+            # resolution below tests by identity and ``np.False_ is False`` is
+            # False, so the numpy boolean this domain accepts reached the quiet
+            # override instead of its refusal; and a surviving ``np.True_`` would
+            # land on :class:`SimObject.is_static`, which is annotated ``bool``,
+            # and render as ``np.True_`` in the agent-visible listing.
+            is_static = bool(is_static)
+
         # planes are infinite and must be static.  Explicit
         # is_static=False for a plane is an error; None or True both
         # resolve to True. Non-plane shapes default to dynamic.
@@ -3960,6 +4015,13 @@ class MuJoCoSimEngine(
             return {"status": "error", "content": [{"text": e}]}
         orientation, e = coerce_orientation_quaternion("add_object", "orientation", orientation)
         if e is not None:
+            return {"status": "error", "content": [{"text": e}]}
+        # Finite is not enough for the pose of a DYNAMIC body: it is written
+        # into the object's freejoint qpos, where a magnitude past MuJoCo's own
+        # ceiling makes the next step reset the whole world. A static body is
+        # welded with no freejoint, owns no qpos entry and is stable however
+        # far away it sits, so it is not held to the ceiling.
+        if not is_static and (e := qpos_ceiling_error("add_object", pose_qpos_components(position, orientation))):
             return {"status": "error", "content": [{"text": e}]}
         if size is not None and (e := finite_vector_error("add_object", "size", size)) is not None:
             return {"status": "error", "content": [{"text": e}]}
@@ -4230,7 +4292,13 @@ class MuJoCoSimEngine(
             jnt_id = mj_name_to_id(model, mj.mjtObj.mjOBJ_JOINT, f"{name}_joint")
             if jnt_id >= 0:
                 # Dynamic object: a freejoint carries its pose, so move it cheaply
-                # through data.qpos + a forward pass (no recompile).
+                # through data.qpos + a forward pass (no recompile). The pose
+                # lands in qpos verbatim, so hold it to MuJoCo's ceiling first -
+                # past it the next step resets every joint and object. Only this
+                # branch writes qpos; the static branch below has no qpos entry
+                # to overflow, so a far-away static body stays movable.
+                if e := qpos_ceiling_error("move_object", pose_qpos_components(position, orientation)):
+                    return {"status": "error", "content": [{"text": e}]}
                 qpos_addr = model.jnt_qposadr[jnt_id]
                 moved = False
                 if position is not None:
@@ -4389,7 +4457,14 @@ class MuJoCoSimEngine(
         mount points before placing a camera; robot bodies are namespaced
         ``<robot>/<body>`` (e.g. ``so101/gripper`` is the SO101 wrist mount).
 
-        Validation: ``name`` must be a non-empty ``str`` containing no NUL, and
+        Validation: ``name`` must be a non-empty ``str`` containing no NUL; must
+        be a camera token (letters, digits, ``_`` or ``-``, opening on a letter
+        or a digit) optionally scoped to one robot as ``<robot>/<camera>``, which
+        is how a wrist camera is named on a namespaced robot
+        (:func:`~strands_robots.utils.scoped_camera_name_error` - the name is the
+        key the mesh topic, the S3 object key and the
+        ``observation.images.<name>`` dataset feature are built from, and each of
+        those reads other punctuation as structure); and
         must not be one of the free-camera routing tokens
         (:data:`~strands_robots.utils.FREE_CAMERA_TOKENS` - ``None``, ``""``,
         ``"default"``, ``"free"``). ``render``/``render_depth``/``get_frame``
@@ -4397,7 +4472,7 @@ class MuJoCoSimEngine(
         so a camera created under any of them could never be rendered from even
         though it is registered, compiled into the model and listed by
         ``list_cameras``; a non-string name is additionally not addressable
-        through the agent-tool surface. Both halves of the name rule come from
+        through the agent-tool surface. All three parts of the name rule come from
         the shared :func:`~strands_robots.utils.camera_name_error`, which every
         backend's ``add_camera`` reads, so the rule and its order are stated
         once: the name is judged BEFORE any value, because a reserved name is

@@ -15,12 +15,19 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 import torch
 
-from ...utils import name_list_error, positive_count_error, positive_finite_number_error
+from ...utils import (
+    boolean_flag_error,
+    free_camera_routing_rank,
+    name_list_error,
+    positive_count_error,
+    positive_finite_number_error,
+)
 from .. import Policy, align_action_values, chunk_count_error
 from .._log_safety import sanitize_log_value
 from .._state_keys import drop_velocity_siblings
@@ -145,6 +152,45 @@ def _merge_obs_rename(base: dict[str, str], override: dict[str, str | None] | No
 # kinova_gen3 is joint_1..joint_7), which is why the run, not the prefix, is
 # what identifies a placeholder.
 _GENERIC_STATE_KEY_PREFIX = "joint_"
+
+
+def _route_camera_key_map(base: dict[str, str], camera_key_map: Mapping[str, str] | None) -> dict[str, str]:
+    """Route an explicit ``camera_key_map`` over an embodiment's ``obs_rename``.
+
+    ``camera_key_map`` is the first rung of camera routing for every other
+    router in this class (:meth:`LerobotLocalPolicy._resolve_camera_targets`,
+    :meth:`LerobotLocalPolicy._to_lerobot_observation` and
+    :meth:`LerobotLocalPolicy._synthesized_camera_renames` all resolve it before
+    any name match), so the declarative path has to honor it too: the only
+    difference between those routers and this one is whether the checkpoint
+    ships a preprocessor and whether an ``embodiment`` is declared, and a camera
+    binding may not depend on either.
+
+    The replacement is scoped by rename TARGET, not by source key. An
+    embodiment declares ``{"front": "observation.images.image"}``; a caller who
+    maps their own camera onto that same feature means *instead of* ``front``,
+    not *as well as* - two sources feeding one target would let whichever the
+    pipeline renamed last win. So every declared source whose target a
+    ``camera_key_map`` entry claims is dropped before the entries are added.
+
+    An entry naming an image feature the model does not declare is left in the
+    merged map so ``EmbodimentMap.validate`` refuses it by name, matching the
+    ``camera_key_map routes camera ... but the policy does not declare it``
+    refusal the other two routers raise.
+
+    Args:
+        base: The embodiment's declared ``obs_rename`` map.
+        camera_key_map: Caller mapping of runtime camera name -> image feature.
+
+    Returns:
+        The routed rename map; a copy of ``base`` when no map is given.
+    """
+    if not camera_key_map:
+        return dict(base)
+    claimed = set(camera_key_map.values())
+    merged = {src: dst for src, dst in base.items() if dst not in claimed}
+    merged.update(camera_key_map)
+    return merged
 
 
 def _undeclared_image_feature_error(
@@ -369,9 +415,14 @@ class LerobotLocalPolicy(Policy):
             default) adopts the model config value, else 10.0.
         camera_key_map: Optional explicit mapping of robot/sim camera name
             (e.g. "top") to the policy's declared image feature key
-            (e.g. "observation.images.top"). When omitted, cameras are
-            routed by exact short-name match and then by declared order
-            with a warning on mismatch.
+            (e.g. "observation.images.top"). It is the first rung of camera
+            routing on every path, including a declared ``embodiment``: an
+            entry claiming an image feature replaces the source key the
+            embodiment declares for that feature, so a scene whose cameras are
+            named for the scene routes without renaming them. When omitted,
+            cameras are routed by the embodiment's ``obs_rename``, then by
+            exact short-name match and then by declared order with a warning on
+            mismatch.
         strict_keys: When True, raise (instead of warning + a degraded
             binding) wherever a key cannot be bound by name. It governs BOTH
             halves of the key binding, not cameras alone:
@@ -393,7 +444,11 @@ class LerobotLocalPolicy(Policy):
             actuator, so padding TRAVELS those joints to zero. Enable only when
             the consumer needs a fixed-width action dict and zero is a
             meaningful target for every key it pads. Either way the dim
-            mismatch itself is reported once via ``diagnose_action_dim``.
+            mismatch itself is reported once via ``diagnose_action_dim``. A
+            boolean, checked rather than read by truthiness - it selects a
+            posture rather than scaling a quantity, so a truthy spelling of off
+            (``"false"``, ``"no"``, ``"0"``) is refused rather than selecting
+            the padding posture the word asks to skip.
     """
 
     def __init__(
@@ -475,13 +530,22 @@ class LerobotLocalPolicy(Policy):
         # When True, raise instead of routing cameras positionally if their
         # names cannot be matched to the policy's declared image keys (and no
         # camera_key_map covers them). Defaults to False (positional fallback
-        # with a warning), preserving zero-config ergonomics.
+        # with a warning), preserving zero-config ergonomics. Checked like
+        # ``pad_short_actions`` below: it selects a posture, and a truthy
+        # spelling of *off* ("false") would otherwise select the strict one.
+        if error := boolean_flag_error(strict_keys, "strict_keys", "lerobot_local"):
+            raise ValueError(error)
         self.strict_keys = strict_keys
         # When the model emits fewer action values than the robot declares
         # actuator keys, False (the default) omits the unmatched actuators so
         # they hold position; True commands them 0.0, which on an absolute-
         # position action space travels them to zero. See align_action_values.
-        self.pad_short_actions = bool(pad_short_actions)
+        # Checked rather than coerced with bool(): the two values select
+        # postures, and bool() is where "false" - a spelling of the omitting
+        # default - became the padding posture that moves those actuators.
+        if error := boolean_flag_error(pad_short_actions, "pad_short_actions", "lerobot_local"):
+            raise ValueError(error)
+        self.pad_short_actions = pad_short_actions
         # Routing-degradation telemetry. The heuristic (non-declarative)
         # remap path can keep a run alive while silently producing
         # meaningless inputs - a camera routed to an arbitrary model image
@@ -498,7 +562,10 @@ class LerobotLocalPolicy(Policy):
         # process level and shared by later instances with the same load
         # key (see _MODEL_CACHE). Set False to force a private load (e.g.
         # concurrent rollouts of the same checkpoint that must not share
-        # per-episode model state).
+        # per-episode model state). A posture as well, so checked the same way:
+        # "false" would otherwise share the model it asks not to share.
+        if error := boolean_flag_error(cache_model, "cache_model", "lerobot_local"):
+            raise ValueError(error)
         self.cache_model = cache_model
         # MolmoAct2-specific knobs. MolmoAct2 SO-100/101 checkpoints are
         # transformers-native (no lerobot draccus `type`), so they take a
@@ -1479,10 +1546,12 @@ class LerobotLocalPolicy(Policy):
 
         Resolution: the model needs every declared image feature populated, so
         for each image rename TARGET (``observation.images.*``) at least one of
-        its source keys must be present in ``observation_keys``. A caller-
-        supplied ``obs_rename_override`` is merged over the embodiment's
-        ``obs_rename`` first, so an explicit override that maps a present camera
-        onto the feature satisfies the check.
+        its source keys must be present in ``observation_keys``. The caller's own
+        camera bindings are routed over the embodiment's ``obs_rename`` first -
+        ``camera_key_map`` (routing rung 1, see :func:`_route_camera_key_map`)
+        and then ``obs_rename_override`` - so an explicit binding that maps a
+        present camera onto the feature satisfies the check rather than being
+        refused with a remedy it already used.
 
         The converse is also checked: an explicit ``image_keys=`` replaces the
         feature list that would be derived from those same rename targets (it is
@@ -1573,7 +1642,14 @@ class LerobotLocalPolicy(Policy):
         except Exception:  # noqa: BLE001 - unknown/odd spec; create_policy reports it
             return
 
-        obs_rename = _merge_obs_rename(embodiment.obs_rename, policy_config.get("obs_rename_override"))
+        # ``camera_key_map`` is routing rung 1 (see :func:`_route_camera_key_map`),
+        # so it is applied before the availability check below: a caller who
+        # bound their cameras with it has already answered the question this
+        # check asks, and refusing them would name a remedy they used.
+        obs_rename = _merge_obs_rename(
+            _route_camera_key_map(embodiment.obs_rename, policy_config.get("camera_key_map")),
+            policy_config.get("obs_rename_override"),
+        )
 
         # Group source keys by the image feature TARGET they feed. A target is
         # satisfied when ANY of its sources is present in the observation, so an
@@ -1606,9 +1682,10 @@ class LerobotLocalPolicy(Policy):
             f"are in the runtime observation, which provides {sorted(obs)}. Either:\n"
             f"  (a) rename your sim cameras to one of {expected} "
             f"(e.g. sim.add_camera(name={expected[0]!r}, ...)), or\n"
-            f"  (b) pass policy_config={{'obs_rename_override': "
-            f"{{'<your_camera_name>': '{missing_features[0]}'}}}} to map an existing "
-            f"camera onto the model's image feature without renaming it."
+            f"  (b) pass policy_config={{'camera_key_map': "
+            f"{{'<your_camera_name>': '{missing_features[0]}'}}}} (or the equivalent "
+            f"'obs_rename_override') to map an existing camera onto the model's image "
+            f"feature without renaming it."
         )
 
     def _synthesized_camera_renames(self) -> dict[str, str]:
@@ -1658,8 +1735,10 @@ class LerobotLocalPolicy(Policy):
 
         1. Resolves ``self._embodiment_spec`` (name / dict / EmbodimentMap), or
            synthesises a trivial map from ``robot_state_keys`` for back-compat.
-        2. Validates the map against the model's declared input/output features
-           (fail-fast on dim or key mismatch).
+        2. Routes ``camera_key_map`` and then ``obs_rename_override`` over the
+           map's declared ``obs_rename``, and validates the result against the
+           model's declared input/output features (fail-fast on dim or key
+           mismatch).
         3. Injects ``rename_map`` + a ``strands_pack_state`` step into the
            preprocessor pipeline via :meth:`ProcessorBridge.apply_embodiment`.
 
@@ -1692,13 +1771,21 @@ class LerobotLocalPolicy(Policy):
         except ValueError as exc:
             raise RuntimeError(f"Failed to load embodiment {spec!r}: {exc}") from exc
 
-        # Merge any caller-supplied obs_rename override OVER the embodiment's
-        # declared renames so custom sim camera names route onto the model's
-        # image features without renaming cameras. Override entries win.
-        if self._obs_rename_override:
+        # Route the caller's own camera bindings over the embodiment's declared
+        # renames so custom sim camera names reach the model's image features
+        # without renaming cameras. ``camera_key_map`` is applied first (routing
+        # rung 1, honored identically by the other routers - see
+        # :func:`_route_camera_key_map`), then ``obs_rename_override`` over that:
+        # the override is the last word because it is the only spelling that can
+        # DROP a declared rename (a falsy value), so a caller already relying on
+        # it keeps exactly the map they had.
+        if self.camera_key_map or self._obs_rename_override:
             from dataclasses import replace
 
-            merged = _merge_obs_rename(embodiment.obs_rename, self._obs_rename_override)
+            merged = _merge_obs_rename(
+                _route_camera_key_map(embodiment.obs_rename, self.camera_key_map),
+                self._obs_rename_override,
+            )
             embodiment = replace(embodiment, obs_rename=merged)
 
         # Fail-fast validation against the model's declared features.
@@ -2734,18 +2821,36 @@ class LerobotLocalPolicy(Policy):
         image_items = [(k, v) for k, v in observation_dict.items() if isinstance(v, np.ndarray) and v.ndim >= 2]
         used_feats: set[str] = set()
         unmatched_imgs = []
-        for k, v in image_items:
-            mapped = self.camera_key_map.get(k) if self.camera_key_map else None
-            if mapped is not None:
+        # 1a) The explicit map is applied over the WHOLE observation before any
+        #     exact-name match runs. Resolving it inside the single loop below
+        #     instead would make the precedence depend on observation order: a
+        #     camera that happens to be iterated earlier and matches a declared
+        #     key by name would claim the slot the caller bound by hand, and the
+        #     mapped camera would then be dropped for having no free slot left.
+        #     ``_resolve_camera_targets`` resolves the map in its own first pass
+        #     for the same reason, and the two routers have to agree - the only
+        #     difference between them is whether the checkpoint ships a
+        #     preprocessor, which is not something a camera binding may depend on.
+        mapped_sources: set[str] = set()
+        if self.camera_key_map:
+            for k, v in image_items:
+                mapped = self.camera_key_map.get(k)
+                if mapped is None:
+                    continue
                 if mapped not in declared_img_feats:
                     raise ValueError(
                         f"camera_key_map routes camera '{k}' to image key '{mapped}', "
                         "but the policy does not declare it. Declared image keys: "
                         f"{sorted(declared_img_feats)}."
                     )
+                mapped_sources.add(k)
                 if mapped not in used_feats:
                     out[mapped] = v
                     used_feats.add(mapped)
+        # 1b) Exact-name match, then positional fill, for the cameras the
+        #     explicit map did not already route.
+        for k, v in image_items:
+            if k in mapped_sources:
                 continue
             prefixed = f"observation.images.{k}"
             if prefixed in self._input_features and prefixed not in used_feats:
@@ -2765,7 +2870,13 @@ class LerobotLocalPolicy(Policy):
                 used_feats.add(k)
             else:
                 unmatched_imgs.append((k, v))
-        # Fill any remaining declared image slots, in declaration order.
+        # Fill any remaining declared image slots, in declaration order, with
+        # the backend's own free view ranked behind every camera the caller
+        # added - the same ordering ``_resolve_camera_targets`` applies, because
+        # the only difference between the two routers is whether the checkpoint
+        # ships a preprocessor, which is not something a camera binding may
+        # depend on.
+        unmatched_imgs.sort(key=lambda item: free_camera_routing_rank(item[0]))
         free_feats = [f for f in declared_img_feats if f not in used_feats]
         if self.strict_keys and unmatched_imgs and free_feats:
             raise ValueError(
@@ -2904,7 +3015,8 @@ class LerobotLocalPolicy(Policy):
         """Build batch from observation dict already in LeRobot format (observation.* keys).
 
         Converts each value to the appropriate tensor format:
-        - Images (HWC uint8) → CHW float32 [0, 1] with batch dim
+        - Images (HWC uint8) → CHW float32 [0, 1] with batch dim, for a
+          ``np.uint8`` array and a ``torch.uint8`` tensor alike
         - State vectors → float32 with batch dim
         - Scalars → float32 tensor with batch dim
 
@@ -2937,6 +3049,16 @@ class LerobotLocalPolicy(Policy):
                 # HWC → CHW: LeRobot expects channel-first image layout
                 if is_image and tensor.dim() == 3 and tensor.shape[-1] in (1, 3, 4):
                     tensor = tensor.permute(2, 0, 1)
+                # uint8 images are [0, 255] - normalize to float32 [0, 1], the
+                # same conversion the ndarray branch below and
+                # :meth:`_canonicalize_obs_images` apply. ``torch.uint8`` is the
+                # dtype signal for an unscaled frame exactly as ``np.uint8`` is,
+                # and without this the frame reaches the model as Byte: lerobot's
+                # image resize then raises "upsample_bilinear2d_out_frame not
+                # implemented for 'Byte'", which names neither the observation
+                # key nor the conversion the caller is missing.
+                if is_image and tensor.dtype == torch.uint8:
+                    tensor = tensor.float() / 255.0
                 # Add batch dimension (required by policy.select_action)
                 if is_image and tensor.dim() == 3:
                     tensor = tensor.unsqueeze(0)
@@ -3058,6 +3180,17 @@ class LerobotLocalPolicy(Policy):
                 unmatched.append(cam)
 
         # 3) Positional fallback into the remaining declared slots (loud).
+        #    The free view a backend registers for itself ranks behind every
+        #    camera the caller added (``free_camera_routing_rank``): it is FIRST
+        #    in the observation, so filling the slots in observation order gave
+        #    slot 0 to a debug view of the whole scene and, once the slots ran
+        #    out, dropped one of the caller's real cameras to seat it. That is
+        #    the outcome the exact-name rung on the sibling router already names
+        #    as the reason it binds by name. The rank leaves the real cameras in
+        #    their existing relative order, so it decides only which camera a
+        #    guess picks, and it does not drop the free view - a scene whose only
+        #    camera is the free view still fills the slot it filled before.
+        unmatched.sort(key=free_camera_routing_rank)
         free = [feat for feat in targets if feat not in used]
         if self.strict_keys and unmatched and free:
             raise ValueError(

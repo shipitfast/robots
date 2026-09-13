@@ -350,7 +350,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
             timestep: Physics timestep in seconds (defaults to the engine's
                 ``default_timestep``).
             gravity: Gravity vector ``[x, y, z]`` (default ``[0, 0, -9.81]``).
-            ground_plane: Whether to add a ground plane.
+            ground_plane: Whether to add a ground plane. Must be a ``bool``:
+                a non-boolean is refused under the shared
+                :func:`~strands_robots.utils.boolean_flag_error` domain rather
+                than read by truthiness.
             terrain: Heightfield terrain kind (e.g. ``"rough"``/``"stairs"``/``"pyramid"``/``"slope"``,
                 MuJoCo backend only). The Newton backend has no heightfield
                 ground yet, so a non-None value is rejected with an actionable
@@ -409,6 +412,12 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                     }
                 ],
             }
+        # ``ground_plane`` selects a posture - lay a floor or leave the world
+        # open - so it is checked, not read by truthiness (the same domain the
+        # MuJoCo backend applies): ``"false"`` would lay the floor the word
+        # declines, and ``0`` would omit it without being a declared spelling.
+        if err := self._validate_posture_flags("create_world", ground_plane=ground_plane):
+            return err
         # Same contract as set_timestep / set_gravity (and the MuJoCo backend):
         # never build a world around a dt or gravity vector the setters would
         # refuse. The effective timestep is validated so an unusable engine
@@ -854,7 +863,9 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 refused rather than handed to the solver rebuild.
             is_static: When True the object is fixed in the world.
                 ``None`` (the default) means unspecified; Newton derives
-                nothing from ``shape``, so it resolves to dynamic.
+                nothing from ``shape``, so it resolves to dynamic. A supplied
+                value must be a boolean: it selects a posture, so ``0`` and the
+                truthy ``"false"`` are refused rather than read by truthiness.
             mesh_path: Path to a mesh asset (``.obj`` / ``.stl`` / ``.glb`` /
                 ``.usd`` -- anything ``trimesh.load`` accepts). Required and
                 only used when ``shape="mesh"``; the mesh is loaded via
@@ -878,6 +889,21 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # than reaching the error path it guards.
         if (name_err := entity_name_error("add_object", "name", name)) is not None:
             return {"status": "error", "content": [{"text": name_err}]}
+
+        # ``is_static`` selects a posture, so it is checked rather than read by
+        # truthiness - the same domain the MuJoCo backend applies, so a spelling
+        # one backend refuses is refused by all of them. Every read of it here is
+        # a truthiness one, so ``"false"`` fixed a body asked to be dynamic and
+        # ``0`` was stored verbatim. ``None`` is the documented "unspecified"
+        # sentinel, resolved just below, so only a supplied value is graded.
+        if is_static is not None:
+            if err := self._validate_posture_flags("add_object", is_static=is_static):
+                return err
+            # Normalized to a plain ``bool`` now it is known to be one: the
+            # ``numpy`` boolean this domain accepts would otherwise land on
+            # :class:`SimObject.is_static`, which is annotated ``bool``, and
+            # render as ``np.True_`` in the agent-visible object listing.
+            is_static = bool(is_static)
 
         # ``None`` means the caller did not specify, per
         # :meth:`~strands_robots.simulation.base.SimEngine.add_object`. Newton
@@ -1441,9 +1467,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         there is no upper cap.
 
         Args:
-            name: Unique camera name; a non-empty ``str`` containing no NUL and
-                not a free-camera routing token, the same rule and the same
-                order the MuJoCo backend's ``add_camera`` applies
+            name: Unique camera name; a non-empty ``str`` containing no NUL,
+                not a free-camera routing token, and a camera token optionally
+                scoped to one robot as ``<robot>/<camera>`` - the same rule and
+                the same order the MuJoCo backend's ``add_camera`` applies
                 (:func:`~strands_robots.utils.camera_name_error`, judged before
                 any value below). Duplicate
                 names are rejected; remove the existing camera with
@@ -1471,7 +1498,8 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # The whole name rule, in the one order ``camera_name_error`` owns and
         # the MuJoCo backend's ``add_camera`` reads too: a value that cannot be
         # a registry key, then a ``str`` this backend's render entry points
-        # resolve past. Both guards precede every value rule below, so the two
+        # resolve past, then a ``str`` the consumers that key frames by the name
+        # read as structure. Both guards precede every value rule below, so the two
         # backends name the same cause for the same request - the reserved-name
         # test used to sit after the pose, fov and pixel-dimension rules here,
         # and a request with a routing token AND a bad value was refused by both

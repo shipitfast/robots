@@ -139,6 +139,19 @@ which swaps the compiled scene but leaves the camera registry untouched) is
 absent from the observation rather than filled in with the
 overview, so a column is never quietly populated from the wrong camera.
 
+Renaming means picking a name `add_camera` accepts, and that alphabet is not
+free: the name is also the key the camera's frames travel under - the mesh
+publishes each frame on `strands/<peer_id>/camera/<name>`, the IoT offload joins
+it into the S3 object key, and a recording writes it as
+`observation.images.<name>`. So a camera name is a bare token of letters, digits,
+`_` or `-` opening on a letter or a digit, optionally scoped to one robot as
+`<robot>/<camera>` - `wrist`, `front_cam`, `cam-2`, `arm0/wrist_cam`. One scope
+level and no more, because that is the namespace `add_robot` gives what it spawns
+and the one the mesh strips before publishing. Anything else (`a b`, `wrist.rgb`,
+`*`, `..`, `sub/../etc`, `a//b`) is refused at `add_camera` rather than
+registered and then misrouted, dropped, or written under a key that addresses
+another camera.
+
 That guarantee needs the scene's cameras to have distinct column names, and the
 `/` -> `__` collapse is not injective: `arm0/wrist` and `arm0__wrist` are two
 cameras and one column. `start_recording` refuses such a scene up front, naming
@@ -560,6 +573,14 @@ and once it has exited, starting would silently discard the frames the failed
 stop just promised were recoverable. Retrying the stop is the remedy in both
 cases, and on a recording whose loop has exited it joins immediately and encodes.
 
+That registration is published before the capture thread is started, so the check
+also covers two starts racing each other: there is no window in which a thread is
+capturing while `get_cameras_recording_status` answers `[idle]` and
+`stop_cameras_recording` reports "Was not recording cameras" as a success. If the
+capture thread cannot be started at all, the recording is deregistered again and
+`start_cameras_recording` returns a structured error naming it, rather than
+leaving behind a registration that only a flush could clear.
+
 `get_cameras_recording_status` reports which of the four phases holds, in its
 text and as `phase` in its JSON block:
 
@@ -883,6 +904,22 @@ Construct the recorder with `strict=False` to trade that for best-effort
 recording: a failed write is counted in `dropped_frame_count`, warned about at
 `WARNING` (on the 1st, 2nd, 4th, 8th ... failure so a 50 Hz loop cannot flood the
 log), and the rollout continues.
+
+`strict` must be a boolean - it selects a posture, so it is checked on the same
+domain as `use_videos` / `streaming_encoding` / `overwrite` rather than read by
+truthiness, and a value outside it is a `ValueError` from the constructor:
+
+```python
+DatasetRecorder(dataset=ds, strict=None)      # ValueError: strict must be a boolean
+DatasetRecorder(dataset=ds, strict="false")   # ValueError: strict must be a boolean
+```
+
+Read by truthiness these inverted in both directions. Every falsy non-boolean
+(`None`, `0`, `""`, `[]`) selected best-effort recording without ever being a
+declared spelling of it, so a run that lost a quarter of its frames completed and
+reported success; and every non-empty string is truthy, so `strict="false"` - the
+spelling reached for to opt out - selected fail-fast and then named `strict=True`
+in the message above whatever the caller wrote.
 
 ### An episode the recorder cannot flush stops a recorded evaluation
 

@@ -303,6 +303,25 @@ separately rather than against that shared domain, because the accepted sets
 differ: PPO parallelizes and accepts any count `>= 1`, while the MuJoCo-backed
 FastSAC is single-env and requires exactly `1`.
 
+Those three factors and `buffer_size` also have to *reach* `learning_starts`, and
+on the two off-policy backends `validate()` checks that they do. The threshold is
+the replay fill the first gradient step waits for, and two counts bound the fill a
+run ever reaches: the step budget it collects,
+`max(1, total_timesteps // steps) * steps`, and the ring buffer's own capacity.
+Either below the threshold takes **zero** gradient steps for the whole run.
+`learning_starts >= batch_size` does not cover it - that relation sizes the first
+batch, not the wait for it - so `total_timesteps=20` against
+`learning_starts=32`, and `buffer_size=8` against `learning_starts=16`, each
+returned `[]` from `validate()` and then `status="success"` with a written
+checkpoint and an exported `policy.pt`: the randomly initialized network `setup`
+built, since nothing had trained it. Both are plain positive integers that pass
+every per-field domain, and `buffer_size=1` is the same one-slot buffer as
+`buffer_size=True` - which the count domain already refuses for exactly this
+outcome. Each short count is now reported on its own, naming the threshold it
+cannot reach, so a caller sees every value it has to raise. The relation is asked
+only of counts: a non-count in any operand is left to the gate that names that
+field, rather than described as an unreachable threshold.
+
 `hidden_dims` must be a sequence of positive integer layer widths, checked by
 `validate()` on all three RL backends - each builds every network it trains by
 expanding the same field (the on-policy actor and critic; off-policy the actor,
@@ -357,6 +376,21 @@ to an infinity on the first step, and because the temperature multiplies the
 log-probability in the actor loss the resulting checkpoint holds non-finite
 parameters. Both previously reported success. It is inert when
 `autotune_alpha=False`, which builds no temperature optimizer.
+
+The three RL posture flags - `normalize_obs` on every backend,
+`normalize_advantage` on PPO, `autotune_alpha` on FastSAC - are `bool`s on the
+same shared domain as `TrainSpec.resume` and `streaming`, checked by the
+`validate()` of each backend that reads them and by no other. Each selects a
+posture rather than scaling a quantity, and each was read by truthiness where it
+is spent (`... if spec.normalize_obs else None`, `if spec.normalize_advantage:`,
+`if self.autotune_alpha:`), so the spellings a caller reaches for to opt out -
+`"false"`, `"no"`, `"0"` - selected the affirmative branch, and `0` or `None`
+selected the negative one without being a declared spelling of it. Every one
+previously passed `validate()`. `autotune_alpha` is checked **ahead of** the
+`alpha_lr` check it gates, and that check reads the rate only once the flag is a
+usable `True`: `autotune_alpha="false", alpha_lr=-1.0` used to be refused as
+`alpha_lr` - the rate of an optimizer the caller had asked not to build - and is
+now refused as the flag.
 
 `init_alpha` - the temperature that rate moves - must be a positive finite
 number, checked by the same `validate()`. FastSAC stores the temperature's
