@@ -12,7 +12,8 @@ This grades every ``python`` fence in ``docs/**/*.md`` and ``README.md``: for
 each ``attach_teleop`` call whose type is a string literal, every keyword must be
 one the mixin reads or one ``_build_teleop_config`` would accept for that type.
 The dataclass is resolved through lerobot's own registry, so the oracle is the
-one the factory consults.
+one the factory consults - which is why this module gates on lerobot, an extra
+rather than a base dependency, and skips where the registry cannot be read.
 """
 
 from __future__ import annotations
@@ -24,9 +25,13 @@ from pathlib import Path
 
 import pytest
 
-import strands_robots
-from strands_robots.teleop_mixin import TeleopMixin
-from strands_robots.teleoperator import (
+pytest.importorskip("lerobot.teleoperators.config", reason="lerobot arrives through an extra, not the base install")
+
+from lerobot.teleoperators.config import TeleoperatorConfig  # noqa: E402
+
+import strands_robots  # noqa: E402
+from strands_robots.teleop_mixin import TeleopMixin  # noqa: E402
+from strands_robots.teleoperator import (  # noqa: E402
     _FORWARDABLE_TELEOP_KWARGS,
     _ensure_lerobot_teleoperators_registered,
 )
@@ -43,7 +48,7 @@ def _documentation_files() -> list[Path]:
 
 def _mixin_keywords() -> set[str]:
     """The keywords ``attach_teleop`` consumes itself (everything else is forwarded)."""
-    signature = ast.parse(Path(TeleopMixin.attach_teleop.__code__.co_filename).read_text())
+    signature = ast.parse(Path(TeleopMixin.attach_teleop.__code__.co_filename).read_text(encoding="utf-8"))
     for node in ast.walk(signature):
         if isinstance(node, ast.FunctionDef) and node.name == "attach_teleop":
             return {arg.arg for arg in node.args.kwonlyargs}
@@ -52,8 +57,6 @@ def _mixin_keywords() -> set[str]:
 
 def _accepted_by_factory(teleop_type: str) -> set[str]:
     """What ``_build_teleop_config`` recognises for ``teleop_type``: dataclass fields + allowlist + id."""
-    from lerobot.teleoperators.config import TeleoperatorConfig
-
     _ensure_lerobot_teleoperators_registered()
     config_class = TeleoperatorConfig.get_choice_class(teleop_type)
     fields = {f.name for f in dataclasses.fields(config_class)}
