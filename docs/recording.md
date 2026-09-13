@@ -139,6 +139,19 @@ which swaps the compiled scene but leaves the camera registry untouched) is
 absent from the observation rather than filled in with the
 overview, so a column is never quietly populated from the wrong camera.
 
+Renaming means picking a name `add_camera` accepts, and that alphabet is not
+free: the name is also the key the camera's frames travel under - the mesh
+publishes each frame on `strands/<peer_id>/camera/<name>`, the IoT offload joins
+it into the S3 object key, and a recording writes it as
+`observation.images.<name>`. So a camera name is a bare token of letters, digits,
+`_` or `-` opening on a letter or a digit, optionally scoped to one robot as
+`<robot>/<camera>` - `wrist`, `front_cam`, `cam-2`, `arm0/wrist_cam`. One scope
+level and no more, because that is the namespace `add_robot` gives what it spawns
+and the one the mesh strips before publishing. Anything else (`a b`, `wrist.rgb`,
+`*`, `..`, `sub/../etc`, `a//b`) is refused at `add_camera` rather than
+registered and then misrouted, dropped, or written under a key that addresses
+another camera.
+
 That guarantee needs the scene's cameras to have distinct column names, and the
 `/` -> `__` collapse is not injective: `arm0/wrist` and `arm0__wrist` are two
 cameras and one column. `start_recording` refuses such a scene up front, naming
@@ -560,6 +573,14 @@ and once it has exited, starting would silently discard the frames the failed
 stop just promised were recoverable. Retrying the stop is the remedy in both
 cases, and on a recording whose loop has exited it joins immediately and encodes.
 
+That registration is published before the capture thread is started, so the check
+also covers two starts racing each other: there is no window in which a thread is
+capturing while `get_cameras_recording_status` answers `[idle]` and
+`stop_cameras_recording` reports "Was not recording cameras" as a success. If the
+capture thread cannot be started at all, the recording is deregistered again and
+`start_cameras_recording` returns a structured error naming it, rather than
+leaving behind a registration that only a flush could clear.
+
 `get_cameras_recording_status` reports which of the four phases holds, in its
 text and as `phase` in its JSON block:
 
@@ -657,8 +678,13 @@ recorder = DatasetRecorder.create(
     #   action_features=robot.action_features,
     # When recording from a sim Robot (no `observation_features` attr), pass
     # `joint_names=[...]` instead - the recorder builds the schema for you.
+    # The names must be the observation's own keys: for the so100 sim these
+    # are Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw - i.e.
+    # `list(sim.get_observation()["so100"].keys())`. A declared name that a
+    # frame's observation (or action) does not carry makes `add_frame` raise;
+    # nothing is ever recorded as a stand-in 0.0.
     camera_keys=["default"],
-    joint_names=["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"],
+    joint_names=["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw"],
     task="pick up the red cube",
     # root=None → $HF_LEROBOT_HOME/user/my_dataset
     # vcodec="h264", streaming_encoding=True, image_writer_threads=4
@@ -733,7 +759,9 @@ shape of the cameras it covers and the pair sets the shape of every other one.
 Note the order - `camera_dims` is `(height, width)`, the reverse of the pair.
 
 It is a **declaration, not a resize** - the recorder rescales nothing - so
-whatever is given goes straight into the LeRobot feature as `(3, height, width)`.
+whatever is given goes straight into the LeRobot feature as
+`(height, width, 3)` with names `[height, width, channels]` - the layout
+lerobot itself records and every published v3 dataset uses.
 `create()` refuses a shape it cannot honor, on the same shared domain and in the
 same place as the column names above:
 
@@ -877,6 +905,22 @@ recording: a failed write is counted in `dropped_frame_count`, warned about at
 `WARNING` (on the 1st, 2nd, 4th, 8th ... failure so a 50 Hz loop cannot flood the
 log), and the rollout continues.
 
+`strict` must be a boolean - it selects a posture, so it is checked on the same
+domain as `use_videos` / `streaming_encoding` / `overwrite` rather than read by
+truthiness, and a value outside it is a `ValueError` from the constructor:
+
+```python
+DatasetRecorder(dataset=ds, strict=None)      # ValueError: strict must be a boolean
+DatasetRecorder(dataset=ds, strict="false")   # ValueError: strict must be a boolean
+```
+
+Read by truthiness these inverted in both directions. Every falsy non-boolean
+(`None`, `0`, `""`, `[]`) selected best-effort recording without ever being a
+declared spelling of it, so a run that lost a quarter of its frames completed and
+reported success; and every non-empty string is truthy, so `strict="false"` - the
+spelling reached for to opt out - selected fail-fast and then named `strict=True`
+in the message above whatever the caller wrote.
+
 ### An episode the recorder cannot flush stops a recorded evaluation
 
 `save_episode` is the episode-level counterpart, and a failed flush is worse than
@@ -915,6 +959,26 @@ an aggregate is never reported over episodes whose frames reached no dataset.
 | `finalize()` | Write metadata, stats, close writers |
 | `push_to_hub(tags=None, private=False)` | Upload to a versioned HF dataset repo. `private` selects the published repo's visibility, so it must be a boolean — a truthy spelling of off such as `"false"` would otherwise select the opposite posture |
 | `sync_to_bucket(bucket, run_id=None, private=True)` | Sync to a mutable HF Storage Bucket (`hf://buckets/...`) — Xet-deduped collection target; needs the `hf` CLI. `bucket` (`name` or `org/name`) and `run_id` (single segment) are allowlist-validated (`[A-Za-z0-9._-]`, no traversal) before the sync, and `create` / `private` / `delete` must each be a boolean — `delete` mirror-deletes remote files absent locally, so a truthy `"false"` must not select it |
+
+`sync_to_bucket` needs the `hf` CLI with the `buckets`/`sync` subcommands
+(`pip install -U "huggingface_hub>=1.5"` + `hf auth login` - those subcommands
+first ship in 1.5.0; every earlier release, including 1.0-1.4.x, installs an
+`hf` entry point without them).
+
+`sync_to_bucket` is the recorder's own method, so it needs the live session.
+Any dataset directory already on disk - recorded earlier in the process, or on
+hardware via `lerobot-record` - syncs (or re-syncs daily) through the
+module-level helper instead:
+
+```python
+from strands_robots import sync_dataset_to_bucket
+
+sync_dataset_to_bucket("/tmp/demo", "your-org/robot-fave")
+# -> {"status": "success", "bucket_uri": "hf://buckets/your-org/robot-fave/demo"}
+```
+
+`run_id` defaults to the directory name; pass `run_id="nightly"` to choose the
+bucket subpath, and `delete=True` for mirror semantics.
 
 ## Read back
 
@@ -1029,7 +1093,7 @@ frame and yields from a reservoir buffer. Capture order is therefore
 `buffer_size=1` (a reservoir of one cannot reorder) plus `max_num_shards=1`
 (a single shard has nothing to interleave), as above.
 
-Useful kwargs (forwarded to `StreamingLeRobotDataset`, version-tolerant):
+Useful kwargs (all forwarded to `StreamingLeRobotDataset`):
 `episodes=[...]` (subset without download), `buffer_size`, `max_num_shards`,
 `return_uint8=True` (default; halves frame bandwidth), and
 `drop_videos=True` (proprio-only — skips video decode entirely, so it works on
@@ -1066,28 +1130,31 @@ pointing at a remedy that lands on the silent proprio-only stream. Falsy
 non-booleans took the other branch just as silently: `validate_deltas=0` skipped
 the delta-grid check, so an off-grid `delta_timestamps` that `validate_deltas=True`
 refuses opened and streamed; `return_uint8=None` streamed float32 at ~4x the
-bandwidth with the warning about that cost suppressed by the same truthiness; and
+bandwidth of the uint8 it spells; and
 `streaming=0` failed inside LeRobot on `num_shards`. `reader.dataloader(shuffle=...)`
 needs no such check - it discards the key whatever it held.
 
-One kwarg is **not** tolerant-forwarded because its absence changes semantics:
-`repo_type="bucket"` requires `lerobot>=0.6.1`, which the `[lerobot]` extra
-floors — so a resolver-conformant install always has it. On an environment
-carrying an older lerobot, `open()` raises `RuntimeError` naming the upgrade
-instead of silently streaming from the versioned dataset namespace (a different
-storage system).
+Every kwarg is forwarded unconditionally: each lerobot-bearing extra floors
+lerobot at `0.6.1`, whose `StreamingLeRobotDataset` accepts all of them —
+`repo_type` included. `open()` therefore never drops a keyword to suit an older
+constructor, which for `repo_type` would have streamed the versioned dataset
+namespace instead of the requested bucket, a different storage system. An
+environment carrying a below-floor lerobot gets lerobot's own `TypeError`
+naming the keyword.
 
 For **training**, the upstream trainer uses the same engine:
 
 ```bash
-python -m lerobot.scripts.lerobot_train --policy.type=act \
+lerobot-train --policy.type=act \
   --dataset.repo_id=user/my_dataset --dataset.streaming=true --num_workers=4
 ```
 
+(`lerobot-train` is the entry point over `python -m lerobot.scripts.lerobot_train`;
+flags are draccus `--dotted.key=value` form.)
+
 > **macOS:** video streaming needs Homebrew ffmpeg on the dyld path. `import
 > strands_robots` auto-fixes this (zero-touch); disable with
-> `STRANDS_ROBOTS_NO_DYLD_SHIM=1`. See the README "Recording & streaming
-> datasets" section.
+> `STRANDS_ROBOTS_NO_DYLD_SHIM=1`.
 
 ## See also
 

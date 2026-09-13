@@ -145,7 +145,8 @@ def set_eval_seed(seed: int) -> None:
     installs that don't have torch (e.g. ``policy_provider="mock"``
     smoke tests).
     """
-    # Local import: base.py imports this module at module level, so reaching the
+    # Local import: ``simulation.base`` imports this module at module level, so
+    # reaching the
     # shared domain from here has to stay deferred - the same convention this
     # module already uses for simulation.benchmark / .recording / .predicates.
     from strands_robots.simulation.base import MAX_EVAL_SEED, randomization_seed_error
@@ -197,6 +198,51 @@ OnFrame = Callable[[int, dict[str, Any], dict[str, Any]], None]
 # Success function: called after each step during evaluate().
 # success_fn(observation) -> bool
 SuccessFn = Callable[[dict[str, Any]], bool]
+
+#: Largest ``k`` reported by :func:`pass_hat_k`. Beyond a handful of consecutive
+#: attempts the estimate is dominated by its own variance on the episode counts an
+#: evaluation actually runs, and a reader who needs more can compute it from
+#: ``n_success`` and ``episodes_completed``, which are both in the same result.
+_PASS_HAT_K_MAX = 8
+
+
+def pass_hat_k(n_completed: int, n_success: int, k_max: int = _PASS_HAT_K_MAX) -> dict[int, float]:
+    """Probability that ``k`` attempts drawn without replacement all succeed.
+
+    A success rate answers "how often does this work". It does not answer "can I
+    rely on it", and for anything driven repeatedly those are different questions:
+    a policy at 60% has a roughly 8% chance of clearing five consecutive attempts.
+    Reporting only the mean invites a deployment decision the mean does not
+    support.
+
+    Estimated as ``C(c, k) / C(n, k)`` for ``c`` successes out of ``n`` completed
+    attempts, which is the unbiased probability that a uniformly drawn ``k``-subset
+    of the attempts observed is all successes. Deliberately not ``success_rate **
+    k``: that form assumes the attempts are independent, and evaluation attempts on
+    one policy and one scene are correlated by construction (a systematic grasp
+    offset fails every attempt, not a fixed fraction of them), so it reports a
+    reliability the run never demonstrated. The subset form makes no independence
+    claim; it only describes the attempts that were run.
+
+    Args:
+        n_completed: Attempts that ran to a verdict. ``k`` above this is undefined
+            rather than zero - a run of 3 attempts says nothing about 5 in a row -
+            so those keys are absent instead of present and misleading.
+        n_success: Attempts among them that succeeded.
+        k_max: Largest ``k`` to report, clamped to ``n_completed``.
+
+    Returns:
+        ``{k: probability}`` for each ``k`` from 1 up to ``min(k_max,
+        n_completed)``. Empty when no attempt completed, since there is nothing to
+        draw a subset from. ``k=1`` equals the success rate by construction, and is
+        included as the anchor that makes the rest of the row readable.
+    """
+    if n_completed <= 0:
+        return {}
+    upper = min(k_max, n_completed)
+    return {
+        k: (0.0 if n_success < k else math.comb(n_success, k) / math.comb(n_completed, k)) for k in range(1, upper + 1)
+    }
 
 
 def _criterion_verdict(
@@ -319,6 +365,25 @@ _VIDEO_KEY_ALIASES: dict[str, tuple[str, ...]] = {
 _VIDEO_ACCEPTED_KEYS: tuple[str, ...] = tuple(sorted(key for aliases in _VIDEO_KEY_ALIASES.values() for key in aliases))
 
 
+def _video_values_agree(first: Any, second: Any) -> bool:
+    """Whether two spellings of one ``video`` field carry the same value.
+
+    Args:
+        first: Value carried by the earlier-listed spelling.
+        second: Value carried by the later one.
+
+    Returns:
+        ``True`` when the two are equal, so resolving the field discards
+        nothing. A pair whose equality is not a single truth value (an array)
+        counts as disagreeing: the discard would be real either way, and naming
+        both keys is the answer a caller can act on.
+    """
+    try:
+        return bool(first == second)
+    except (TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configuration for optional MP4 recording during :meth:`PolicyRunner.run`.
@@ -366,8 +431,10 @@ class VideoConfig:
     def _pick(d: dict[str, Any], field: str, default: Any = None) -> Any:
         """First present, non-``None`` value among ``field``'s accepted keys.
 
-        Looks the canonical key up first, then the legacy aliases, so
-        ``{"path": ..., "output_path": ...}`` resolves to the canonical one.
+        Looks the canonical key up first, then the legacy aliases. Two
+        spellings that carry DIFFERENT values are refused by
+        :meth:`_alias_conflict_error` before this runs, so no value reachable
+        here is discarded.
         Membership - not truthiness - decides: a caller-supplied ``0`` is
         returned as ``0`` (and rejected by :meth:`validation_error`) instead of
         collapsing into ``default`` the way an ``or`` chain would.
@@ -406,6 +473,40 @@ class VideoConfig:
         return positive_whole_number_error(value, key, "video")
 
     @classmethod
+    def _alias_conflict_error(cls, d: dict[str, Any]) -> str | None:
+        """Error text when two spellings of one field carry different values.
+
+        :meth:`_pick` resolves a field by taking the first spelling that carries
+        a value, so a dict naming two of them honors one and discards the other
+        - the silent drop this schema exists to refuse, reached through keys it
+        accepts. A camera named twice recorded the rollout from one of the two
+        views under ``status="success"``; a path named twice wrote one file and
+        left the other absent. Two spellings carrying the SAME value discard
+        nothing and are accepted.
+
+        Args:
+            d: The caller's video-config dict, already known to hold only
+                accepted keys.
+
+        Returns:
+            A message naming both spellings and their values, or ``None`` when
+            no field is spelled twice with a disagreement.
+        """
+        for field, aliases in _VIDEO_KEY_ALIASES.items():
+            carried = [(key, d[key]) for key in aliases if d.get(key) is not None]
+            if len(carried) < 2:
+                continue
+            winner, kept = carried[0]
+            for key, value in carried[1:]:
+                if not _video_values_agree(kept, value):
+                    return (
+                        f"video: {winner!r} and {key!r} are both spellings of {field}, and they "
+                        f"disagree ({kept!r} vs {value!r}); {winner!r} wins, so {key!r} would be "
+                        "discarded. Pass one spelling of it."
+                    )
+        return None
+
+    @classmethod
     def validation_error(cls, d: Any) -> str | None:
         """Error text when ``d`` is not a video config this class can honor.
 
@@ -415,8 +516,13 @@ class VideoConfig:
         leaves ``path`` unset and the rollout reports ``status="success"``
         with no MP4 anywhere, and ``{"path": p, "resolution": [320, 240]}``
         records at the default 640x480 while the caller believes otherwise.
-        This rejects any key outside the accepted set (with a closest-match
-        hint) and any known key whose value cannot be honored.
+        Two accepted spellings of one field are the same drop wearing an
+        accepted key: ``{"camera": "top", "camera_name": "wrist"}`` recorded
+        from ``top`` while the caller had also named ``wrist``, and ``{"path":
+        a, "output_path": b}`` wrote ``a`` and left ``b`` absent. This rejects
+        any key outside the accepted set (with a closest-match hint), any pair
+        of spellings that disagree about one field, and any known key whose
+        value cannot be honored.
 
         Args:
             d: The caller's ``video`` argument. ``None`` (recording off) and an
@@ -441,6 +547,12 @@ class VideoConfig:
             close = difflib.get_close_matches(str(key).lower(), _VIDEO_ACCEPTED_KEYS, n=1, cutoff=0.7)
             hint = f" Did you mean {close[0]!r}?" if close else ""
             return f"video: unknown key {key!r}.{hint} Accepted keys: {accepted}."
+        # Two spellings of one field: the collision is reported rather than
+        # resolved, for the reason an unknown key is. Ahead of the per-field
+        # domains below, because those grade the value that WINS - run after a
+        # collision they would pass over the discarded one in silence.
+        if error := cls._alias_conflict_error(d):
+            return error
         for field in ("path", "camera"):
             value = cls._pick(d, field)
             if value is not None and not isinstance(value, str):
@@ -1106,6 +1218,29 @@ def _close_started_lifecycle_on_escape[**P, R](func: Callable[P, R]) -> Callable
     return wrapped
 
 
+# Telemetry keys of the chunk-prefetch pipeline. The ``rtc_*`` spellings are
+# kept for one release: the pipeline overlaps inference with execution for ANY
+# chunk-emitting policy, RTC or not, so an ACT rollout reporting
+# ``rtc_async_enabled=true`` read as "RTC ran" when nothing blended a seam.
+_PREFETCH_KEY_RENAMES: dict[str, str] = {
+    "rtc_async_enabled": "chunk_prefetch_enabled",
+    "rtc_chunks_acquired": "chunk_prefetch_chunks_acquired",
+    "rtc_prefetch_hits": "chunk_prefetch_hits",
+    "rtc_prefetch_blocks": "chunk_prefetch_blocks",
+    "rtc_avg_inference_ms": "avg_inference_ms",
+    "rtc_max_inference_ms": "max_inference_ms",
+}
+
+
+def _with_prefetch_keys(block: dict[str, Any], policy: Any) -> dict[str, Any]:
+    """Add the ``chunk_prefetch_*`` names next to the legacy ``rtc_*`` ones and
+    ``policy_rtc_enabled`` (the policy's own ``supports_rtc``), which is the only
+    key that says whether real-time chunking blended the seams."""
+    block.update({new: block[old] for old, new in _PREFETCH_KEY_RENAMES.items() if old in block})
+    block["policy_rtc_enabled"] = bool(getattr(policy, "supports_rtc", False))
+    return block
+
+
 class PolicyRunner:
     """Backend-agnostic policy execution against a ``SimEngine``.
 
@@ -1713,6 +1848,13 @@ class PolicyRunner:
         # policy reset/inference or an action from a value that cannot be called.
         if observer_error := optional_callable_error(observer, "observer", "PolicyRunner.run"):
             raise ValueError(observer_error)
+        # The legacy hook carries the same domain, for a sharper reason: an
+        # exception from it is counted against the consecutive-failure watchdog,
+        # so a value that is not callable at all spent five applied actions
+        # before aborting the episode with "aborting silent dataset corruption"
+        # - a message about a recorder, for a caller mistake visible here.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.run"):
+            raise ValueError(hook_error)
 
         # A single rollout draws the policy's stochastic ops (VLA action-
         # chunk sampling, diffusion noise) from the unmanaged global RNG, so the
@@ -1727,7 +1869,7 @@ class PolicyRunner:
         # structured envelope to read a refusal from. Same shared rule as
         # SimEngine._validate_seed, raised rather than returned because raising
         # is this layer's contract.
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -1839,14 +1981,17 @@ class PolicyRunner:
             # BOTH paths, so ``rtc_chunks_acquired`` counts on both; only the
             # prefetch hit/block counters are async-exclusive.
             _n = len(inference_ms)
-            return {
-                "rtc_async_enabled": bool(async_rtc),
-                "rtc_chunks_acquired": _pipeline.chunks_acquired if _pipeline is not None else 0,
-                "rtc_prefetch_hits": _pipeline.prefetch_hits if _pipeline is not None else 0,
-                "rtc_prefetch_blocks": _pipeline.prefetch_blocks if _pipeline is not None else 0,
-                "rtc_avg_inference_ms": round(sum(inference_ms) / _n, 3) if _n else 0.0,
-                "rtc_max_inference_ms": round(max(inference_ms), 3) if _n else 0.0,
-            }
+            return _with_prefetch_keys(
+                {
+                    "rtc_async_enabled": bool(async_rtc),
+                    "rtc_chunks_acquired": _pipeline.chunks_acquired if _pipeline is not None else 0,
+                    "rtc_prefetch_hits": _pipeline.prefetch_hits if _pipeline is not None else 0,
+                    "rtc_prefetch_blocks": _pipeline.prefetch_blocks if _pipeline is not None else 0,
+                    "rtc_avg_inference_ms": round(sum(inference_ms) / _n, 3) if _n else 0.0,
+                    "rtc_max_inference_ms": round(max(inference_ms), 3) if _n else 0.0,
+                },
+                policy,
+            )
 
         # Video recording lifecycle (path validation + camera probe + writer)
         # lives in _RolloutVideoWriter so run() and evaluate() record identically.
@@ -3134,9 +3279,14 @@ class PolicyRunner:
             success_fn: Legacy success predicate (see above).
             spec: :class:`BenchmarkProtocol` to drive the eval. When
                 provided, overrides the ``success_fn`` path.
-            seed: Master RNG seed. Each episode derives a child RNG from it,
-                so evaluations are reproducible within a process. Only used
-                when ``spec`` is provided.
+            seed: Master RNG seed. Each episode derives a child seed from it,
+                so evaluations are reproducible within a process. Used on BOTH
+                routes: the ``success_fn`` path draws the same per-episode seeds
+                from the same master RNG and forwards each to ``policy.reset``,
+                which this entry used to say it did not. Every episode record in
+                the result reports the ``seed`` its attempt ran on, so a single
+                failing episode can be replayed on its own; it is ``None`` for an
+                unseeded eval, which draws no per-episode seed at all.
             action_horizon: Max actions consumed per policy call before
                 requerying the observation, as in :meth:`run`. Clamped up to the
                 policy's own chunk length when it emits more.
@@ -3213,7 +3363,28 @@ class PolicyRunner:
             ``rtc_avg_inference_ms``, ``rtc_max_inference_ms``) so inference
             cost and latency masking are provable from the payload. When
             ``spec`` is used, it also contains ``cumulative_reward`` and
-            ``avg_reward`` fields per episode and aggregate.
+            ``avg_reward`` fields per episode and aggregate, plus
+            ``max_step_reward`` per episode and ``avg_max_step_reward`` in the
+            aggregate: the peak single-step reward, kept beside the running total
+            because the total is partly a step count, so on a dense-reward task a
+            long flailing attempt out-totals a short one that nearly finished.
+            ``max_step_reward`` is ``None`` for an attempt that ended before any
+            step was scored, and ``avg_max_step_reward`` averages only the
+            attempts that scored one (``None`` when none did) rather than reading
+            an unscored attempt as a peak of zero.
+
+            ``pass_hat_k`` maps ``k`` (as a string, since the payload is JSON) to
+            the probability that ``k`` attempts drawn from those run are all
+            successes - see :func:`pass_hat_k`. It answers whether a policy can be
+            relied on repeatedly, which ``success_rate`` does not: at a 60% rate,
+            five consecutive attempts succeed about 8% of the time. Keys above
+            ``episodes_completed`` are absent rather than ``0.0``, because a short
+            run has not measured a long streak and a zero would read as though it
+            had. Reported on BOTH routes, unlike the reward fields above: it is
+            derived from ``n_success`` and ``episodes_completed``, which the
+            ``success_fn`` path reports too, so it needs no ``spec``. Absent
+            altogether when no success criterion was in force, since every attempt
+            then counts as a failure for a reason unrelated to the policy.
 
             Every payload carries ``success_measured`` (bool): ``True`` when a
             success criterion was in force (a ``spec`` or a non-``None``
@@ -3238,7 +3409,7 @@ class PolicyRunner:
         """
         # Refuse before any frame reaches the engine's open recording.
         self._reject_recording_rate_mismatch(control_frequency, "PolicyRunner.evaluate")
-        # Local import: base.py imports PolicyRunner at module level, so
+        # Local import: ``simulation.base`` imports PolicyRunner at module level, so
         # reaching the shared domain from here has to stay deferred - the
         # same convention this module already uses for
         # simulation.benchmark / simulation.recording / simulation.predicates.
@@ -3265,6 +3436,13 @@ class PolicyRunner:
         # entry point would have refused.
         if horizon_error := positive_count_error(action_horizon, "action_horizon", "PolicyRunner.evaluate"):
             raise ValueError(horizon_error)
+        # The caller's telemetry hook, on the same domain as run()'s and refused
+        # for the reason the eval loop cannot: a hook exception there is
+        # best-effort telemetry, logged and never fatal, so a value that is not
+        # callable at all was reported once per frame and the evaluation still
+        # returned a success rate the hook had watched none of.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "PolicyRunner.evaluate"):
+            raise ValueError(hook_error)
         # The two bounds of this method's own episode loop, on the same shared
         # domain and raised for the same reason. A horizon outside the domain
         # degrades a rollout; a LOOP BOUND outside it removes the evaluation
@@ -3479,7 +3657,12 @@ class PolicyRunner:
                 # re-runs at the same master seed. Forwarded to ``policy.reset``
                 # too, because a service-mode policy samples in another process
                 # that ``set_eval_seed`` cannot reach. Best-effort, like every
-                # other ``reset`` call site.
+                # other ``reset`` call site. Bound to ``None`` first so the
+                # episode record below reports the seed on every route through
+                # the loop: an unseeded eval draws none (a master RNG is
+                # deliberately not built from entropy here), and ``None`` says
+                # that rather than naming a seed the episode never ran on.
+                episode_seed: int | None = None
                 if master_rng is not None:
                     episode_seed = master_rng.randint(0, 2**31 - 1)
                     set_eval_seed(episode_seed)
@@ -3563,7 +3746,7 @@ class PolicyRunner:
                         if success:
                             break
 
-                results.append({"episode": ep, "steps": steps, "success": success})
+                results.append({"episode": ep, "steps": steps, "success": success, "seed": episode_seed})
                 # #708 - roll the attached recorder over to a new episode so the
                 # dataset records per-episode boundaries rather than collapsing
                 # every rollout into one mega-episode.
@@ -3609,14 +3792,17 @@ class PolicyRunner:
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         _n_infer = len(inference_ms)
-        rtc_telemetry = {
-            "rtc_async_enabled": bool(async_rtc),
-            "rtc_chunks_acquired": rtc_chunks_acquired,
-            "rtc_prefetch_hits": rtc_prefetch_hits,
-            "rtc_prefetch_blocks": rtc_prefetch_blocks,
-            "rtc_avg_inference_ms": round(sum(inference_ms) / _n_infer, 3) if _n_infer else 0.0,
-            "rtc_max_inference_ms": round(max(inference_ms), 3) if _n_infer else 0.0,
-        }
+        rtc_telemetry = _with_prefetch_keys(
+            {
+                "rtc_async_enabled": bool(async_rtc),
+                "rtc_chunks_acquired": rtc_chunks_acquired,
+                "rtc_prefetch_hits": rtc_prefetch_hits,
+                "rtc_prefetch_blocks": rtc_prefetch_blocks,
+                "rtc_avg_inference_ms": round(sum(inference_ms) / _n_infer, 3) if _n_infer else 0.0,
+                "rtc_max_inference_ms": round(max(inference_ms), 3) if _n_infer else 0.0,
+            },
+            policy,
+        )
 
         return {
             "status": "error" if recording_save_error is not None else "success",
@@ -3646,6 +3832,20 @@ class PolicyRunner:
                         "stopped_early": stopped_early,
                         "recording_save_error": recording_save_error,
                         "n_success": n_success,
+                        # Derived from ``n_success`` and ``episodes_completed``, both
+                        # reported here, rather than from a reward - so the reliability
+                        # figure belongs to this route as much as to the spec one, which
+                        # is where it shipped. Omitted entirely when no success criterion
+                        # was in force: every attempt then counts as a failure for a
+                        # reason unrelated to the policy, and a row of zeros would read
+                        # as measured unreliability rather than an unasked question. That
+                        # is the same rule that makes keys above ``episodes_completed``
+                        # absent rather than ``0.0``.
+                        **(
+                            {"pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()}}
+                            if success_measured
+                            else {}
+                        ),
                         "avg_steps": round(avg_steps, 1),
                         "max_steps": max_steps,
                         "policy_load_time_s": round(float(getattr(policy, "load_time_s", 0.0)), 3),
@@ -3878,6 +4078,14 @@ class PolicyRunner:
                 failure = False
                 steps = 0
                 cumulative_reward = 0.0
+                # Peak single-step reward, kept beside the running total because the
+                # two answer different questions on a failed attempt: the total says
+                # how much shaped reward accrued over however many steps ran, so a
+                # long flailing episode can out-total a short one that nearly
+                # finished. The peak says how close the attempt ever came. ``None``
+                # until a step scores, so an attempt that ended before ``on_step``
+                # ran reports "no step was scored" rather than a fabricated 0.0.
+                max_step_reward: float | None = None
                 last_info: dict[str, Any] = {}
 
                 for _ in range(max_steps):
@@ -3982,7 +4190,11 @@ class PolicyRunner:
                                     "status": "error",
                                     "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                                 }
-                            cumulative_reward += float(info.reward)
+                            step_reward = float(info.reward)
+                            cumulative_reward += step_reward
+                            max_step_reward = (
+                                step_reward if max_step_reward is None else max(max_step_reward, step_reward)
+                            )
                             last_info = dict(info.info) if info.info else {}
                             if info.done:
                                 stop_episode = True
@@ -4015,7 +4227,9 @@ class PolicyRunner:
                                 "status": "error",
                                 "content": [{"text": f"on_step failed in {spec_name}: {e}"}],
                             }
-                        cumulative_reward += float(info.reward)
+                        step_reward = float(info.reward)
+                        cumulative_reward += step_reward
+                        max_step_reward = step_reward if max_step_reward is None else max(max_step_reward, step_reward)
                         last_info = dict(info.info) if info.info else {}
                         if info.done:
                             break
@@ -4037,6 +4251,7 @@ class PolicyRunner:
                         "success": success,
                         "failure": failure,
                         "cumulative_reward": round(cumulative_reward, 4),
+                        "max_step_reward": (None if max_step_reward is None else round(max_step_reward, 4)),
                         "seed": episode_seed,
                         "info": last_info,
                     }
@@ -4080,6 +4295,12 @@ class PolicyRunner:
         success_rate = n_success / max(n_completed, 1)
         avg_steps = sum(r["steps"] for r in results) / max(n_completed, 1)
         avg_reward = sum(r["cumulative_reward"] for r in results) / max(n_completed, 1)
+        # Averaged over the attempts that actually scored a step. An attempt that
+        # ended before ``on_step`` ran carries ``None`` and is excluded rather than
+        # counted as 0.0, which would drag the peak toward zero for a reason that has
+        # nothing to do with how close any attempt came.
+        _peaks = [r["max_step_reward"] for r in results if r["max_step_reward"] is not None]
+        avg_max_step_reward = round(sum(_peaks) / len(_peaks), 4) if _peaks else None
 
         return {
             "status": "error" if recording_save_error is not None else "success",
@@ -4110,6 +4331,8 @@ class PolicyRunner:
                         "n_failure": n_failure,
                         "avg_steps": round(avg_steps, 1),
                         "avg_reward": round(avg_reward, 4),
+                        "avg_max_step_reward": avg_max_step_reward,
+                        "pass_hat_k": {str(k): round(v, 4) for k, v in pass_hat_k(n_completed, n_success).items()},
                         "max_steps": max_steps,
                         "seed": seed,
                         "benchmark_class": spec_name,
@@ -4199,12 +4422,14 @@ class PolicyRunner:
             # scored every episode a failure - while still working against a
             # test double that returns the bare mapping.
             #
-            # Imported inside the method, not at module level: base.py imports
-            # this module at import time and predicates.py imports base under
+            # Imported inside the method, not at module level: ``simulation.base``
+            # imports this module at import time and ``simulation.predicates``
+            # imports base under
             # TYPE_CHECKING, so a module-level edge from here to predicates
             # closes a loop that CodeQL's py/unsafe-cyclic-import walks - it
-            # does not honour the guard (see the #191 note on base.py's import
-            # of this module). No runtime cycle exists either way, and base.py
+            # does not honour the guard (see the #191 note on the import
+            # of this module in ``simulation.base``). No runtime cycle exists
+            # either way, and ``simulation.base``
             # reaches into predicates the same way from
             # ``_stop_when_unresolved_error``.
             from strands_robots.simulation.predicates import make_predicate

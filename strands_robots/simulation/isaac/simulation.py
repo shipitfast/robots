@@ -48,6 +48,7 @@ from strands_robots.simulation.terrain import validate_difficulty
 from strands_robots.utils import (
     FREE_CAMERA_TOKENS,
     camera_fov_error,
+    camera_name_error,
     coerce_orientation_quaternion,
     coerce_pose_vector,
     coerce_rgba,
@@ -108,12 +109,38 @@ def _quat_wxyz_to_rotmat(quat: np.ndarray) -> np.ndarray:
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read a small positive int from the environment (fallback to ``default``)."""
-    try:
-        v = int(os.environ.get(name, ""))
-        return v if v > 0 else default
-    except (TypeError, ValueError):
+    """Read a small positive int from the environment (fallback to ``default``).
+
+    Every rejection is reported, for the reason :func:`_env_float` below gives
+    for its own: substituting the default in silence leaves the operator's
+    model of the knob wrong with nothing to correct it against. The three
+    knobs this resolver serves are step counts whose effect is only visible
+    several calls away - ``STRANDS_ISAAC_CAMERA_WARMUP_STEPS`` decides whether
+    a new camera's first frame is real or the pipeline's empty buffer - so a
+    typo (``3O``), a float spelling (``10.0``) or a non-positive count that
+    fell back unreported surfaced as a wrong frame rather than as a
+    misconfigured variable. The accepted domain is unchanged: what ``int()``
+    parses and ``> 0`` admits.
+
+    Args:
+        name: Environment variable to read. Unset, empty or unusable falls back.
+        default: Value applied when the variable names no usable count.
+
+    Returns:
+        The override when it is a positive whole number, else ``default``.
+    """
+    raw = os.environ.get(name, "")
+    if raw.strip() == "":
         return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a whole number; using %r", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Isaac simulation: %s must be > 0, got %r; using %r", name, value, default)
+        return default
+    return value
 
 
 def _env_float(name: str, default: float) -> float:
@@ -2132,7 +2159,9 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             ``False``, uses the ``Dynamic*`` counterpart and participates in
             physics with ``mass``. ``None`` (the default) means unspecified;
             this backend derives nothing from ``shape``, so it resolves to
-            ``False``.
+            ``False``. A supplied value must be a boolean: it selects a
+            posture, so ``0`` and the truthy ``"false"`` are refused rather
+            than read by truthiness.
         mesh_path : str, optional
             Path to a custom mesh asset; required and only used when
             ``shape="mesh"`` (a ``mesh_path`` on a primitive shape is
@@ -2291,6 +2320,21 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                     "status": "error",
                     "content": [{"text": f"Object '{name}' already exists."}],
                 }
+
+            # ``is_static`` selects a posture, so it is checked rather than read by
+            # truthiness - the same domain the MuJoCo backend applies, so a spelling
+            # one backend refuses is refused by all of them. Every read of it here is
+            # a truthiness one, so ``"false"`` fixed a body asked to be dynamic and
+            # ``0`` was stored verbatim. ``None`` is the documented "unspecified"
+            # sentinel, resolved just below, so only a supplied value is graded.
+            if is_static is not None:
+                if err := self._validate_posture_flags("add_object", is_static=is_static):
+                    return err
+                # Normalized to a plain ``bool`` now it is known to be one: the
+                # ``numpy`` boolean this domain accepts would otherwise land on
+                # :class:`SimObject.is_static`, which is annotated ``bool``, and
+                # render as ``np.True_`` in the agent-visible object listing.
+                is_static = bool(is_static)
 
             # ``None`` means the caller did not specify, per
             # :meth:`~strands_robots.simulation.base.SimEngine.add_object`. This
@@ -5265,18 +5309,23 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
             if not self._world_created:
                 return {"status": "error", "content": [{"text": "No world created."}]}
 
-            # Refuse a name that cannot address the camera this call creates, on
-            # the shared ``entity_name_error`` domain the MuJoCo and Newton
-            # backends' ``add_camera`` already applies, so a name one backend
-            # refuses is refused by all three - the same invariant this method
-            # already honours for ``position`` / ``target`` / ``fov`` / ``width``
-            # / ``height`` below. An empty name is worse than unaddressable for a
-            # camera: ``render`` routes ``camera_name in (None, "", "default",
-            # "free")`` to the free camera by an explicit token check, so a
-            # camera created as ``""`` could never be rendered from, while the
-            # prim landed at ``/World/Cameras/`` - the container scope shared by
-            # every camera on the stage.
-            if (name_err := entity_name_error("add_camera", "name", name)) is not None:
+            # Refuse a name that cannot address the camera this call creates, or
+            # cannot key its frames at the consumers that read the name as
+            # structure, on the shared ``camera_name_error`` rule every backend's
+            # ``add_camera`` reads, so a name one backend refuses is refused by
+            # all three - the same invariant this method already honours for
+            # ``position`` / ``target`` / ``fov`` / ``width`` / ``height``
+            # below. An empty name is worse than unaddressable for a camera: the
+            # prim would land at ``/World/Cameras/``, the container scope shared
+            # by every camera on the stage.
+            #
+            # ``routes_free_camera_tokens=False``: unlike the MuJoCo and Newton
+            # backends, this one's ``get_frame`` looks a camera up in
+            # ``self._cameras`` directly with no token check, so ``"default"``
+            # here is an ordinary addressable name - and is this signature's
+            # documented default. Stating the flag keeps that divergence a
+            # property of the call rather than a guard this site omits.
+            if (name_err := camera_name_error("add_camera", "name", name, routes_free_camera_tokens=False)) is not None:
                 return {"status": "error", "content": [{"text": name_err}]}
 
             # Validate the pose and the field of view on the shared domains the
@@ -7514,7 +7563,7 @@ class IsaacSimulation(IsaacMotionPrimitivesMixin, IsaacRecordingMixin, SimEngine
                 # move_to, Isaac half of the GH #1645 vocabulary; shared
                 # contract in strands_robots.simulation.motion_primitives_base).
                 "move_to": (
-                    "(robot_name=None, position=[x,y,z], orientation=None, tol=0.01, "
+                    "(robot_name=None, position=[x,y,z], orientation=None, tol=0.015, "
                     "max_steps=200, orientation_tol=None) -> dict  # IK-solve (shared mink "
                     "bridge on the registry MJCF) then servo the end-effector to a world-frame "
                     "Cartesian target; position-only when orientation is omitted, otherwise "

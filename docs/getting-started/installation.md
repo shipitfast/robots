@@ -20,7 +20,7 @@ Requires **Python >= 3.12**. Examples use [`uv`](https://docs.astral.sh/uv/) (`c
 | `[ur]` | `ur-rtde>=1.6.0,<2.0.0` | `Robot("ur5e", mode="real", driver="strands")` - RTDE to a UR controller |
 | `[mesh]` | `eclipse-zenoh>=1.6.1,<2.0.0`, `json5` | Multi-robot mesh discovery + RPC |
 | `[mesh-iot]` | `mesh` + `awsiotsdk`, `awscrt`, `boto3` | AWS IoT Core transport for mesh |
-| `[all]` | 21 of the 33 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[ur]` (compiled binding) stay opt-in | Demos, CI, exploration |
+| `[all]` | 20 of the 32 extras - **not** a union. `[cosmos3-diffusers]`, `[cosmos3-service]`, `[cosmos3-sim]`, `[crazyflie]` (GPLv3), `[curobo]`, `[microduck]`, `[ros2]`, `[sim-gs]`, `[sim-isaac]`, `[sim-newton]` and `[ur]` (compiled binding) stay opt-in | Demos, CI, exploration |
 | `[dev]` | `pytest`, `pytest-cov`, `ruff`, `mypy`, `pytest-timeout` | Contributing |
 
 ```bash
@@ -108,6 +108,16 @@ from strands_robots import Robot
 ```
 
 ## Verify
+
+`doctor` checks this machine the way the runtime will read it - the interpreter
+and package, each extra, the GL backend, the torch/torchcodec pair, the GPU, the
+serial and Hub credentials, and the device-connect and mesh postures - and exits
+non-zero if any row fails:
+
+```bash
+python -m strands_robots doctor           # run every check
+python -m strands_robots doctor --list    # print the check names, probe nothing
+```
 
 ```python
 from strands_robots import Robot

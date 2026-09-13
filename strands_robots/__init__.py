@@ -62,14 +62,6 @@ if TYPE_CHECKING:
     from strands_robots.streaming_dataset import StreamingDatasetReader, stream_dataset
     from strands_robots.teleoperator import Teleoperator
     from strands_robots.tools.download_assets import download_assets
-    from strands_robots.tools.earthrover import (
-        rover_camera,
-        rover_lamp,
-        rover_move,
-        rover_speak,
-        rover_state,
-        rover_stop,
-    )
     from strands_robots.tools.episode_judge import (
         create_judge_agent,
         load_episode,
@@ -148,12 +140,6 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "lerobot_teleoperate": ("strands_robots.tools.lerobot_teleoperate", "lerobot_teleoperate"),
     "lerobot_train": ("strands_robots.tools.lerobot_train", "lerobot_train"),
     "pose_tool": ("strands_robots.tools.pose_tool", "pose_tool"),
-    "rover_camera": ("strands_robots.tools.earthrover", "rover_camera"),
-    "rover_lamp": ("strands_robots.tools.earthrover", "rover_lamp"),
-    "rover_move": ("strands_robots.tools.earthrover", "rover_move"),
-    "rover_speak": ("strands_robots.tools.earthrover", "rover_speak"),
-    "rover_state": ("strands_robots.tools.earthrover", "rover_state"),
-    "rover_stop": ("strands_robots.tools.earthrover", "rover_stop"),
     "run_policy": ("strands_robots.tools.run_policy", "run_policy"),
     "serial_tool": ("strands_robots.tools.serial_tool", "serial_tool"),
     "train_policy": ("strands_robots.tools.train_policy", "train_policy"),
@@ -224,12 +210,6 @@ __all__ = [
     "use_rtps",
     "pose_tool",
     "robot_mesh",
-    "rover_camera",
-    "rover_lamp",
-    "rover_move",
-    "rover_speak",
-    "rover_state",
-    "rover_stop",
     "init_device_connect",
     "init_device_connect_sync",
     "RobotDeviceDriver",
@@ -270,7 +250,7 @@ if _importlib_util.find_spec("mujoco") is not None:
 # ffmpeg with zero user setup - making ``sim.stream_dataset(...)`` video decode
 # work out of the box. No-op off macOS, without torchcodec, or when already set.
 # May re-exec the interpreter ONCE on a plain script run (guarded; never in
-# Jupyter/REPL/pytest). Opt out with STRANDS_ROBOTS_NO_DYLD_SHIM=1. See _dyld.py.
+# Jupyter/REPL/pytest). Opt out with STRANDS_ROBOTS_NO_DYLD_SHIM=1. See :mod:`strands_robots._dyld`.
 try:
     from strands_robots._dyld import ensure_ffmpeg_on_dyld_path
 

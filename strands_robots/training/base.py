@@ -57,8 +57,13 @@ class TrainSpec:
             map-style datasets and drops the stream.
         base_model: HF model id or local checkpoint path to post-tune from.
         output_dir: Directory for checkpoints, logs and the final artifact.
-        embodiment: Embodiment tag / robot id. Required by GR00T; LeRobot
-            infers it from dataset features.
+        embodiment: Embodiment tag / robot id - which state/action projector
+            head the run trains. Required by GR00T. On LeRobot it is read by
+            the policies whose config declares ``embodiment_tag`` (GR00T's
+            native port); every other LeRobot policy takes its state/action
+            shape from the dataset features and has no such field, so a
+            backend MUST refuse the request rather than train the default head
+            while reporting success.
         steps: Total optimizer steps. A positive ``int``.
         global_batch_size: Batch summed across GPUs before grad accumulation.
             A positive ``int``.
@@ -85,7 +90,12 @@ class TrainSpec:
         lora_target_modules: Target modules, or ``None`` for the policy's
             built-in defaults.
         tune: Component toggles for backends that expose them (GR00T:
-            ``{"llm", "visual", "projector", "diffusion"} -> bool``).
+            ``{"llm", "visual", "projector", "diffusion"} -> bool``, both
+            through Isaac-GR00T's ``--tune_*`` flags and through LeRobot's
+            native ``GrootConfig.tune_*`` fields). A key naming no component,
+            or a component the policy cannot freeze, MUST be refused: an
+            unforwarded toggle trains the config default, which is
+            indistinguishable from never having asked.
         val_episodes: Hold out the last N episodes as a validation set, or
             ``None`` to train on every episode. A positive ``int`` below the
             dataset's episode count, which comes from a local
@@ -248,6 +258,18 @@ class Trainer(ABC):
 
         return rl_replay_problems(spec, context=self.provider_name)
 
+    def _rl_warmup_reachability_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight that ``learning_starts`` is a replay fill the run can reach.
+
+        The step budget ``total_timesteps`` collects and the ``buffer_size``
+        capacity each bound the fill a run ever reaches; either below the
+        threshold takes zero gradient steps for the whole run and still reports
+        success with a written checkpoint.
+        """
+        from strands_robots.training._validate import warmup_reachability_problems
+
+        return warmup_reachability_problems(spec, context=self.provider_name)
+
     def _learning_rate_problems(self, spec: TrainSpec) -> list[str]:
         """Preflight ``learning_rate`` when supplied: a positive finite number."""
         from strands_robots.training._validate import learning_rate_problems
@@ -304,6 +326,31 @@ class Trainer(ABC):
         from strands_robots.training._validate import streaming_problems
 
         return streaming_problems(spec, context=self.provider_name)
+
+    def _observation_normalization_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``normalize_obs``: a ``bool``."""
+        from strands_robots.training._validate import observation_normalization_problems
+
+        return observation_normalization_problems(spec, context=self.provider_name)
+
+    def _advantage_normalization_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``normalize_advantage``: a ``bool``."""
+        from strands_robots.training._validate import advantage_normalization_problems
+
+        return advantage_normalization_problems(spec, context=self.provider_name)
+
+    def _temperature_autotune_problems(self, spec: TrainSpec) -> list[str]:
+        """Preflight ``autotune_alpha``: a ``bool``.
+
+        A backend whose ``validate`` consults
+        :meth:`_temperature_learning_rate_problems` MUST consult this one first,
+        since that gate reads ``alpha_lr`` only on the branch this flag selects
+        - so a misread posture is refused by the flag's own name rather than as
+        the rate it would have selected.
+        """
+        from strands_robots.training._validate import temperature_autotune_problems
+
+        return temperature_autotune_problems(spec, context=self.provider_name)
 
     def _lora_hyperparameter_problems(self, spec: TrainSpec) -> list[str]:
         """Preflight ``lora_r`` and ``lora_alpha``, each a positive ``int`` or ``None``.

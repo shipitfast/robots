@@ -38,14 +38,15 @@ if TYPE_CHECKING:
 
 # PolicyRunner and VideoConfig are used by run_policy / replay / eval_policy.
 # We could defer these with inline lazy imports (and historically did), but
-# policy_runner.py only imports `SimEngine` from base under TYPE_CHECKING so
+# ``simulation.policy_runner`` only imports `SimEngine` from base under
+# TYPE_CHECKING so
 # the runtime cycle doesn't actually exist. Keep the imports at module level
 # to break the AST-visible cycle that static analysers flag.
 #
 # Note (#191): we deliberately do NOT import ``OnFrame`` here, even under
 # ``TYPE_CHECKING`` - CodeQL's ``py/unsafe-cyclic-import`` rule walks
 # ``TYPE_CHECKING`` blocks too and would flag the static cycle (
-# policy_runner.py imports SimEngine from base under TYPE_CHECKING,
+# ``simulation.policy_runner`` imports SimEngine from base under TYPE_CHECKING,
 # so importing OnFrame from policy_runner here closes the loop in the
 # AST). Instead, we reference ``OnFrame`` in the ``evaluate_benchmark``
 # signature as a *string* annotation; ``from __future__ import
@@ -1232,6 +1233,17 @@ class SimEngine(ABC):
         ``False`` would state a value the default backend does not deliver, and
         would make restating that declared default a hard error for the one
         shape whose whole point is being static.
+
+        The two chosen values select a *posture* -- welded to the world, or a
+        free body the solver integrates -- so a supplied ``is_static`` is
+        checked rather than read by truthiness: anything that is neither a
+        boolean nor ``None`` is refused. Reading it by truthiness inverts both
+        halves. ``0`` is the same value as the ``False`` a backend may refuse
+        for a shape it forces static, so it reaches the quiet override that
+        refusal exists to prevent, and every non-empty string is truthy, so
+        ``"false"`` welds a body the caller asked to be dynamic and lands on
+        :class:`SimObject.is_static`, which is annotated ``bool`` and read by
+        ``list_objects``, the scene rebuild and domain randomization.
 
         ``material`` (optional): backend-specific visual material/texture
         spec. ``None`` keeps the flat ``color`` rgba (unchanged); a backend
@@ -2512,6 +2524,41 @@ class SimEngine(ABC):
             return None
         return {"status": "error", "content": [{"text": f"{method}: {message}"}]}
 
+    @staticmethod
+    def _validate_policy_object(value: Any, method: str) -> dict[str, Any] | None:
+        """Reject a ``policy_object`` that is not a :class:`Policy` instance.
+
+        The counterpart of :meth:`_validate_policy_mapping` for the third opaque
+        policy parameter on this surface. ``policy_object`` hands the rollout a
+        pre-built policy, so it BYPASSES provider resolution and the provider's
+        ``preflight`` hook - the two checks that would otherwise have something
+        to say about it. Unguarded, the wrong shape surfaced as a bare
+        ``AttributeError`` from the first attribute the runner reached for
+        (``set_control_frequency`` on the rollout path,
+        ``set_robot_state_keys`` on the eval path), naming a library internal
+        instead of the parameter the caller got wrong.
+
+        On ``start_policy`` it was worse than a bad message: that raise happened
+        on the executor worker, whose result nothing reads, so the caller was
+        handed ``status="success"`` / "Policy started" for a rollout that
+        applied no action, and ``list_policies_running`` then reported nothing
+        running - the same reading a completed rollout gives.
+
+        Args:
+            value: The caller-supplied value, or ``None``.
+            method: Public method name, used to prefix the error message.
+
+        Returns:
+            A structured ``{"status": "error", ...}`` dict to surface, or
+            ``None`` when the value can be driven.
+        """
+        from strands_robots.policies import policy_object_error
+
+        message = policy_object_error(value)
+        if message is None:
+            return None
+        return {"status": "error", "content": [{"text": f"{method}: {message}"}]}
+
     def run_policy(
         self,
         robot_name: str | None = None,
@@ -2869,11 +2916,17 @@ class SimEngine(ABC):
             rebuilt the policy instead of reusing ``policy_object=``) and
             ``policy_resident_rss_mb``.
 
-            Async-RTC telemetry, so latency masking is provable from the
-            payload instead of from logs: ``rtc_async_enabled``,
-            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
-            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
-            ``rtc_max_inference_ms``.
+            Chunk-prefetch telemetry, so latency masking is provable from the
+            payload instead of from logs: ``chunk_prefetch_enabled`` (the
+            background chunk pipeline was on - this is NOT the policy's RTC
+            algorithm, which ``policy_rtc_enabled`` reports),
+            ``chunk_prefetch_chunks_acquired``, ``chunk_prefetch_hits``,
+            ``chunk_prefetch_blocks``, ``avg_inference_ms`` and
+            ``max_inference_ms``. The pre-rename spellings
+            ``rtc_async_enabled``, ``rtc_chunks_acquired``,
+            ``rtc_prefetch_hits``, ``rtc_prefetch_blocks``,
+            ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
+            one release with the same values.
 
             Across episodes (``n_episodes > 1``): the aggregate payload adds
             ``total_steps``, the per-episode ``episodes`` records,
@@ -2963,6 +3016,8 @@ class SimEngine(ABC):
             return err
 
         if err := self._validate_video_config(video, "run_policy"):
+            return err
+        if err := self._validate_policy_object(policy_object, "run_policy"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "run_policy"):
             return err
@@ -3366,22 +3421,105 @@ class SimEngine(ABC):
             return None, err
         return {r: int(action_horizon) for r in policies}, None
 
+    def _unresolvable_entity_error(
+        self,
+        entities: tuple[list[str], list[str], list[str | None]],
+        *,
+        subject: str,
+        consequence: str,
+        err: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Structured error if any entity in *entities* does not resolve in this sim.
+
+        The one owner of the four probes a predicate-DSL clause needs, shared
+        by :meth:`_stop_when_unresolved_error` (``run_policy``) and
+        :meth:`evaluate_benchmark`: whether the backend can look bodies up at
+        all, then each body, each joint, and each robot floating base, through
+        the SAME lookup path the predicates use at evaluation time
+        (:func:`~strands_robots.simulation.predicates.can_resolve_body` /
+        :func:`~strands_robots.simulation.predicates.can_resolve_joint` /
+        :func:`~strands_robots.simulation.predicates.can_resolve_base`,
+        including the LIBERO ``<name>_main`` body fallback).
+
+        Both callers admit the same DSL and both are undone by the same
+        mistake, so they share the wording rather than each spelling its own
+        copy of it - only the clause named and the consequence differ.
+
+        Args:
+            entities: ``(bodies, joints, robot_bases)`` as collected by
+                :func:`~strands_robots.simulation.benchmark_spec.stop_when_referenced_entities`.
+            subject: What references the entities, opening every message
+                (``"stop_when"``, ``"benchmark 'drawer-open' ..."``).
+            consequence: One capitalized sentence naming what the caller gets
+                if the clause is armed anyway. Slotted between the finding and
+                the remedy in each message.
+            err: Builds the caller's error envelope from a message, so each
+                surface keeps its own prefix and json block.
+
+        Returns:
+            ``None`` when every entity resolves, else *err*'s envelope.
+        """
+        from strands_robots.simulation.predicates import (
+            can_resolve_base,
+            can_resolve_body,
+            can_resolve_joint,
+            supports_body_lookup,
+        )
+
+        bodies, joints, robot_bases = entities
+
+        if bodies and not supports_body_lookup(self):
+            return err(
+                f"{subject} references bodies {bodies} but this backend has no body lookup "
+                f"(get_body_state). {consequence} Use a clause without body-referencing "
+                "predicates, or a backend that supports body lookups."
+            )
+        missing_bodies = [b for b in bodies if not can_resolve_body(self, b)]
+        if missing_bodies:
+            return err(
+                f"{subject} references bodies not present in the scene: {missing_bodies}. "
+                f"{consequence} Check the names against the loaded scene (get_state lists "
+                "objects; describe() lists actions)."
+            )
+        missing_joints = [j for j in joints if not can_resolve_joint(self, j)]
+        if missing_joints:
+            return err(
+                f"{subject} references joints not present in the observation: {missing_joints}. "
+                f"{consequence} Check the names against get_observation()'s keys "
+                "(joint names are namespaced '<robot>/<joint>')."
+            )
+        unresolved_bases = [r for r in robot_bases if not can_resolve_base(self, r)]
+        if unresolved_bases:
+            try:
+                known = self.list_robots()
+            except Exception:  # noqa: BLE001 - the refusal must not depend on the listing
+                known = []
+            named = [r for r in unresolved_bases if r is not None and r not in known]
+            spelled = [r if r is not None else "<the sole robot>" for r in unresolved_bases]
+            cause = (
+                f"no robot in the scene is named {named} (robots: {known})"
+                if named
+                else f"{spelled} has no floating base - a fixed-base arm reports no base_pos/base_quat"
+            )
+            return err(
+                f"{subject} arms a base_* predicate on {spelled}, but {cause}. Base predicates "
+                f"read the floating-base signals. {consequence} Use a body/joint predicate for "
+                "a fixed-base robot, or name a robot that has a floating base."
+            )
+        return None
+
     def _stop_when_unresolved_error(self, stop_when: dict[str, Any]) -> dict[str, Any] | None:
         """Structured error if a ``stop_when`` clause references unresolvable entities.
 
-        Probes every body/joint name in the clause through the SAME lookup
-        path the predicates use at evaluation time
-        (:func:`~strands_robots.simulation.predicates.can_resolve_body` /
-        :func:`~strands_robots.simulation.predicates.can_resolve_joint`,
-        including the LIBERO ``<name>_main`` fallback), against the live
-        scene, once, before the rollout starts. Returns ``None`` when every
-        referenced entity resolves. Bodies added to the scene AFTER this
-        check are out of contract - a rollout does not create bodies.
+        Probes every body/joint/robot-base name in the clause against the live
+        scene, once, before the rollout starts, through
+        :meth:`_unresolvable_entity_error` - the prober
+        :meth:`evaluate_benchmark` shares for a benchmark spec's clauses, which
+        are authored in the same DSL. Returns ``None`` when every referenced
+        entity resolves. Bodies added to the scene AFTER this check are out of
+        contract - a rollout does not create bodies.
         """
         from strands_robots.simulation.benchmark_spec import stop_when_referenced_entities
-        from strands_robots.simulation.predicates import can_resolve_body, can_resolve_joint, supports_body_lookup
-
-        bodies, joints = stop_when_referenced_entities(stop_when)
 
         def _err(text: str) -> dict[str, Any]:
             return {
@@ -3392,30 +3530,12 @@ class SimEngine(ABC):
                 ],
             }
 
-        if bodies and not supports_body_lookup(self):
-            return _err(
-                f"stop_when references bodies {bodies} but this backend has no body lookup "
-                "(get_body_state), so the clause could never fire and the rollout would "
-                "silently run to its step budget. Use a clause without body-referencing "
-                "predicates, or a backend that supports body lookups."
-            )
-        missing_bodies = [b for b in bodies if not can_resolve_body(self, b)]
-        if missing_bodies:
-            return _err(
-                f"stop_when references bodies not present in the scene: {missing_bodies}. "
-                "The clause would never fire and the rollout would silently run to its "
-                "step budget. Check the names against the loaded scene (get_state lists "
-                "objects; describe() lists actions)."
-            )
-        missing_joints = [j for j in joints if not can_resolve_joint(self, j)]
-        if missing_joints:
-            return _err(
-                f"stop_when references joints not present in the observation: {missing_joints}. "
-                "The clause would never fire and the rollout would silently run to its "
-                "step budget. Check the names against get_observation()'s keys "
-                "(joint names are namespaced '<robot>/<joint>')."
-            )
-        return None
+        return self._unresolvable_entity_error(
+            stop_when_referenced_entities(stop_when),
+            subject="stop_when",
+            consequence="The clause would never fire and the rollout would silently run to its step budget.",
+            err=_err,
+        )
 
     def _run_episodes(
         self,
@@ -3833,7 +3953,7 @@ class SimEngine(ABC):
                 ],
             }
 
-        from strands_robots.dataset_recorder import read_dataset_episode_indices
+        from strands_robots.verify_dataset import read_dataset_episode_indices
 
         try:
             info = read_dataset_episode_indices(root)
@@ -4316,6 +4436,11 @@ class SimEngine(ABC):
         own process. Two evals at the same seed replay identically; ``None``
         leaves RNG state untouched. Only a non-negative integer can seed those
         RNGs, so anything else is refused here rather than at the first draw.
+        Each episode's record in the returned ``episodes`` list reports the
+        ``seed`` that attempt ran on, so a caller reading a single failed
+        episode out of a batch can replay that one rather than the whole eval;
+        it is ``None`` when no ``seed`` was given, because an unseeded eval
+        derives no per-episode seed to report.
 
         ``policy_object`` mirrors :meth:`run_policy`: pass an already-built
         ``Policy`` to skip the ``create_policy`` round-trip (e.g. a loaded
@@ -4362,7 +4487,11 @@ class SimEngine(ABC):
         eval. Raising :class:`~strands_robots.simulation.policy_runner.CooperativeStop`
         stops the evaluation gracefully after the episodes completed so far
         (the result carries ``stopped_early=True`` and ``episodes_completed``),
-        matching :meth:`run_policy`.
+        matching :meth:`run_policy`. That best-effort posture covers a hook that
+        FAILS, not one that cannot be called at all: a non-callable ``on_frame``
+        is a caller error, refused up front with a structured error like
+        :meth:`run_policy`'s ``observer``, because absorbing it per frame would
+        return a success rate the caller's telemetry had watched none of.
 
         ``n_episodes`` and ``max_steps`` must be positive integers and
         ``control_frequency`` must be ``> 0``; a non-positive value is
@@ -4445,10 +4574,15 @@ class SimEngine(ABC):
             Policy load: ``policy_load_time_s``, ``policy_load_cache_hit`` and
             ``policy_resident_rss_mb``.
 
-            Async-RTC telemetry: ``rtc_async_enabled``,
-            ``rtc_chunks_acquired``, ``rtc_prefetch_hits``,
-            ``rtc_prefetch_blocks``, ``rtc_avg_inference_ms`` and
-            ``rtc_max_inference_ms``.
+            Chunk-prefetch telemetry: ``chunk_prefetch_enabled`` (the
+            background chunk pipeline, not the policy's RTC algorithm, which
+            ``policy_rtc_enabled`` reports), ``chunk_prefetch_chunks_acquired``,
+            ``chunk_prefetch_hits``, ``chunk_prefetch_blocks``,
+            ``avg_inference_ms`` and ``max_inference_ms``; the pre-rename
+            ``rtc_async_enabled``, ``rtc_chunks_acquired``,
+            ``rtc_prefetch_hits``, ``rtc_prefetch_blocks``,
+            ``rtc_avg_inference_ms`` and ``rtc_max_inference_ms`` are kept for
+            one release with the same values.
         """
         # Same posture-flag rule as run_policy, ahead of robot resolution: an
         # evaluation is the one place a misread here would be trusted as a
@@ -4456,6 +4590,16 @@ class SimEngine(ABC):
         # produced it.
         if err := self._validate_posture_flags("eval_policy", async_rtc=async_rtc):
             return err
+        # A hook that cannot be called is configuration, not telemetry, and is
+        # knowable before the first step - so it is refused here, ahead of robot
+        # resolution, exactly as run_policy refuses its observer. The eval loop
+        # treats a hook exception as best-effort telemetry (logged, never
+        # fatal), which is right for a hook that fails at frame 700 and wrong
+        # for one that can never run: every frame raised the same TypeError, the
+        # caller's telemetry recorded nothing, and the returned success rate was
+        # byte-identical to the healthy call.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "eval_policy"):
+            return {"status": "error", "content": [{"text": hook_error}]}
 
         robots = self.list_robots()
         if not robots:
@@ -4471,6 +4615,8 @@ class SimEngine(ABC):
             }
 
         if err := self._validate_video_config(video, "eval_policy"):
+            return err
+        if err := self._validate_policy_object(policy_object, "eval_policy"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "eval_policy"):
             return err
@@ -4623,7 +4769,8 @@ class SimEngine(ABC):
                 :class:`~strands_robots.dataset_recorder.RecordingFrameError` is
                 logged at WARN and never aborts the eval; a
                 ``RecordingFrameError`` is data loss rather than telemetry and
-                propagates on the first occurrence.
+                propagates on the first occurrence. A value that is not callable
+                at all is refused up front instead, as in :meth:`eval_policy`.
             policy_kwargs: Per-call goal payload forwarded verbatim to every
                 ``policy.get_actions(obs, instruction, **policy_kwargs)`` call
                 (same contract as :meth:`run_policy` / :meth:`eval_policy`).
@@ -4681,7 +4828,13 @@ class SimEngine(ABC):
         from strands_robots.policies import create_policy
         from strands_robots.simulation.benchmark import get_benchmark
 
+        # Same rule as eval_policy: an uncallable hook is refused before any
+        # other work, not absorbed frame by frame inside the shared eval loop.
+        if hook_error := optional_callable_error(on_frame, "on_frame", "evaluate_benchmark"):
+            return {"status": "error", "content": [{"text": hook_error}]}
         if err := self._validate_video_config(video, "evaluate_benchmark"):
+            return err
+        if err := self._validate_policy_object(policy_object, "evaluate_benchmark"):
             return err
         if err := self._validate_policy_mapping(policy_config, "policy_config", "evaluate_benchmark"):
             return err
@@ -4753,6 +4906,38 @@ class SimEngine(ABC):
                 "status": "error",
                 "content": [{"text": self._unknown_robot_msg(resolved_robot)}],
             }
+
+        # Probe the entities the spec's clauses name against the LIVE scene,
+        # before any policy is built. A benchmark clause is authored in the
+        # same predicate DSL as ``stop_when`` and compiles the same way, so it
+        # fails the same way: a body the scene does not have makes its term a
+        # constant (predicates never raise), which for a success clause means
+        # every episode scores a miss. The eval then reports success_rate 0.0
+        # under status="success" - the number a caller publishes, and
+        # indistinguishable from an honest policy failure. ``run_policy``
+        # refuses the identical clause up front; this is that guard on the
+        # surface whose entire output is that rate. Benchmarks that cannot be
+        # probed (their own ``scene``, or opaque compiled clauses) report no
+        # entities and are evaluated unchanged.
+        referenced = getattr(spec, "referenced_entities", None)
+        if callable(referenced):
+
+            def _benchmark_err(text: str) -> dict[str, Any]:
+                return {"status": "error", "content": [{"text": f"evaluate_benchmark: {text}"}]}
+
+            probe_error = self._unresolvable_entity_error(
+                referenced(),
+                subject=f"benchmark {benchmark_name!r} (success / failure / dense_reward)",
+                consequence=(
+                    "Each referencing term degrades to a constant, so no success or failure "
+                    "clause built on it can ever fire and no dense_reward term built on it can "
+                    "ever be non-zero: every episode would score a miss and the benchmark would "
+                    "report a 0% success rate that reads as an honest policy failure."
+                ),
+                err=_benchmark_err,
+            )
+            if probe_error is not None:
+                return probe_error
 
         if policy_object is None:
             policy = create_policy(policy_provider, **(policy_config or {}))

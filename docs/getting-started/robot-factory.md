@@ -270,6 +270,28 @@ The same reason arrives as `connect_error` in `get_status`, so a mesh peer for a
 whose transport will not load is still constructible and still reports why it is not
 connected.
 
+A bring-up that reaches the daemon but whose real-time link never finishes its
+handshake is reported the same way, and the link is not left behind. The driver
+cancels the handshake and asks the link to stop before returning, so nothing stays
+subscribed to a Mini the caller has just been told it is not connected to:
+
+```python
+>>> Robot("reachy_mini", mode="real").connect_eagerly()
+"link to reachy-a.local:8000 did not finish its handshake within 10s"
+```
+
+The reason names the budget that expired rather than the timeout's own message,
+which is empty.
+
+Either way the loop the bring-up opened is closed, not merely stopped. The link runs
+on a background asyncio loop, and `loop.stop()` only asks it to return from
+`run_forever` - the selector and self-pipe it opened are released by `loop.close()`.
+So teardown waits for that thread (up to 5s) and then closes the loop, on the success
+path through `cleanup()` and on both give-up paths, rather than leaving one open loop
+per connect cycle for the garbage collector to complain about later. A thread that
+outlasts the wait keeps its loop, because closing a running loop raises, and that
+outcome is logged instead of reported as a teardown that finished.
+
 `hardware.driver` is optional and validated when the registry loads: a value that is not a
 driver name is refused there, naming the robot, rather than being read as "no preference".
 

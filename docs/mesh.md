@@ -13,6 +13,17 @@ description: Two Robot() instances coordinating over the Zenoh mesh - peer disco
 !!! info "Device Connect is the recommended networking layer"
     What's described here is the built-in **Zenoh mesh** — the automatic fallback. When the [`device-connect`](device-connect.md) extra is installed, `Robot().run()` and `robot_mesh()` use [**Device Connect**](device-connect.md) (structured RPC, presence, registry, safety) and fall back to this mesh only when it's unavailable. Both ride on Zenoh.
 
+On a fresh install the mesh refuses to start until you choose a security
+posture: with no ACL configured, `Robot(..., mesh=True)` logs `Mesh did NOT
+start` and leaves `robot.mesh.alive` as `False`. For localhost experiments set
+the developer preset in every process that joins; the lab and production
+postures (`STRANDS_MESH_ACCEPT_PERMISSIVE_ACL`, `STRANDS_MESH_ACL_FILE`) are on
+the [Security](security.md) page.
+
+```bash
+export STRANDS_MESH_LOCAL_DEV=1   # both processes below; localhost only
+```
+
 ```python
 # process A
 from strands_robots import Robot
@@ -51,14 +62,18 @@ sim_a.mesh.emergency_stop()   # STRANDS_MESH_AUDIT_DIR overrides log location
 
 ## What a fleet e-stop reaches
 
-`emergency_stop()` broadcasts `{"action": "stop"}` with no `robot_name`, so each
-peer decides which of its own robots that reaches. A hardware peer stops its
-task. A simulation peer asks every rollout it could be running: the rollouts its
-backend reports as in flight where it keeps such a registry (MuJoCo prunes
-finished ones), and otherwise every robot the engine lists. `stop_policy` is
-idempotent and reports `was_running` itself, so asking an idle robot costs
-nothing and the verdict is read rather than guessed - `stopped` names only the
-robots whose answer did not say they were idle.
+`emergency_stop()` stops the robot registered in the issuing process first, then
+broadcasts `{"action": "stop"}` with no `robot_name`, so each peer decides which
+of its own robots that reaches. The local stop is not an optimisation: a
+broadcast never returns to its sender, so without it the robot the operator is
+standing next to is the only one an e-stop never halts. Its answer leads the
+returned `responses` list under this peer's own id and is graded like any other.
+A hardware peer stops its task. A simulation peer asks every rollout it could be
+running: the rollouts its backend reports as in flight where it keeps such a
+registry (MuJoCo prunes finished ones), and otherwise every robot the engine
+lists. `stop_policy` is idempotent and reports `was_running` itself, so asking
+an idle robot costs nothing and the verdict is read rather than guessed -
+`stopped` names only the robots whose answer did not say they were idle.
 
 The peer's `ok` is derived from those per-robot answers, never assumed:
 
@@ -80,9 +95,11 @@ it as soon as the world reaches a state.
 ## Recovering from an emergency stop
 
 `emergency_stop()` latches a **lockout** on every peer that receives it. While a
-peer is locked out it refuses every command except `status` and `resume`, and
-nothing clears it on a timer - an e-stop that expired by itself would not be an
-e-stop. Recovery is always an explicit `resume`:
+peer is locked out it refuses every command except `status`, `resume` and
+`stop`; a second e-stop must still halt a rollout the first one missed, and a
+stop only ever de-energizes. Nothing clears the lockout on a timer - an e-stop
+that expired by itself would not be an e-stop. Recovery is always an explicit
+`resume`:
 
 ```python
 sim_a.mesh.send(peer_id, {"action": "resume", "override_code": OPERATOR_CODE})
@@ -305,6 +322,13 @@ change, or a hub that went away and came back. The peer keeps its identity
 across it: the `peer_id` is unchanged, and an engaged e-stop lockout stays
 engaged, so a network blip is not a way to forget a stop.
 
+`stop()` waits for the sensor loops before it releases anything they publish
+through, so by the time it returns the peer really is off the wire rather than
+merely flagged as gone. The wait is bounded and shared across the loops: a sensor
+read that blocks - a serial bus that stopped answering is the ordinary cause -
+holds one tick open past the budget, and that loop is then named at WARNING as
+still able to publish once more, instead of the stop being reported as complete.
+
 What does not survive is your own `subscribe()` topics. `start()` re-declares
 the peer's built-in topics from the table above; the subscribers `subscribe()`
 returned are undeclared with the session reference and their callbacks are not
@@ -332,6 +356,9 @@ agent = Agent(tools=[sim_a, robot_mesh])
 agent("Find every robot on the mesh and ask each one to report its status")
 agent("E-STOP all peers")
 ```
+
+!!! warning "A single-peer stop is graded by the answer, not by delivery"
+    `robot_mesh(action="stop", target=...)` reads the envelope `Mesh.send` returns rather than whether the send raised. A peer whose handler reports it did not stop (the same rule `emergency_stop` grades with), a peer-level `type: error` (a lockout, replay or authorization rejection), a `send` precondition error, or no answer inside the budget (the caller's `timeout`, capped at 5s) each make the result `status="error"` naming the peer and its answer, audit the verdict as a failure, and log at `CRITICAL`. A response that reports no verdict either way is not read as a refusal. The timeout reading is deliberately this action's own: a fleet-wide `emergency_stop` keeps counting a silent peer as a gap in its count rather than a refusal.
 
 ## Mesh teleop
 
@@ -424,12 +451,12 @@ without the extra selects a backend whose client is not importable.
 
 | Value | Transport | Extra needed | Notes |
 |-------|-----------|--------------|-------|
-| `zenoh` (default) | Local Zenoh peer discovery over UDP multicast. | none - ships with `strands-robots`. | What every unset value resolves to. |
+| `zenoh` (default) | Zenoh. The first process on a host listens on `tcp/127.0.0.1:7447` (`STRANDS_MESH_PORT`) and later ones dial it; cross-host peers need `ZENOH_CONNECT=tcp/<host>:7447`. Multicast scouting is off by default. | none - ships with `strands-robots`. | `STRANDS_MESH_MULTICAST=true` opts into LAN scouting on `224.0.0.224:7446` - a group shared with every other Zenoh application on the LAN, not just this fleet, so any of them sees this peer's presence. |
 | `iot` | AWS IoT Core MQTT with X.509 mutual TLS. | `strands-robots[mesh-iot]` (adds `awsiotsdk`). | Requires `STRANDS_IOT_ENDPOINT`, `STRANDS_IOT_THING_NAME`, `STRANDS_IOT_CERT_DIR`. See [Security](security.md). |
 | `bridge` | Zenoh locally, mirrored to AWS IoT for fleet-wide fan-out. | `strands-robots[mesh-iot]`. | A peer speaks Zenoh to its lab neighbours and IoT to the cloud on the same publish. |
 
 ```bash
-# Local dev, nothing to set - the mesh joins a Zenoh peer group.
+# Local dev, nothing to set - peers on this host find each other through the local hub port.
 export STRANDS_MESH_BACKEND=zenoh   # or leave unset
 
 # AWS IoT Core - the peers are on different networks.

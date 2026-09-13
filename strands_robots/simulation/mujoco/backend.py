@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import warnings
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -487,6 +488,87 @@ def mj_name_to_id(model: Any, obj_type: int, name: Any) -> int:
     return int(_mj.mj_name2id(model, obj_type, name))
 
 
+def pose_qpos_components(
+    position: "list[float] | None", orientation: "list[float] | None"
+) -> "list[tuple[str, float]]":
+    """Label the pose components a dynamic body's freejoint writes into ``qpos``.
+
+    A freejoint's ``qpos`` slice is ``[x, y, z, qw, qx, qy, qz]``, so both
+    vectors land there verbatim and both are held to
+    :func:`qpos_ceiling_error`'s ceiling. An omitted component (``None``) leaves
+    that part of the pose unchanged and contributes no value to check.
+
+    Args:
+        position: ``[x, y, z]`` in meters, already coerced to finite floats, or
+            ``None`` when omitted.
+        orientation: A wxyz quaternion, already coerced to finite floats, or
+            ``None`` when omitted. Its magnitude is NOT normalized on write, so
+            a huge component reaches ``qpos`` as written.
+
+    Returns:
+        ``(label, value)`` pairs naming each component for the caller, e.g.
+        ``("position[0]", 1.0)`` / ``("orientation[3]", 0.0)``.
+    """
+    labelled: list[tuple[str, float]] = []
+    for param, vector in (("position", position), ("orientation", orientation)):
+        if vector is None:
+            continue
+        labelled.extend((f"{param}[{i}]", float(v)) for i, v in enumerate(vector))
+    return labelled
+
+
+def qpos_ceiling_error(method: str, values: "Iterable[tuple[str, float]]") -> str | None:
+    """Refusal message if a caller value is too large to be a joint coordinate.
+
+    ``mj_step`` runs ``mj_checkPos`` before it integrates: a ``qpos`` entry
+    whose magnitude exceeds ``mjMAXVAL`` makes MuJoCo declare the simulation
+    unstable and ``mj_resetData`` the ENTIRE state - every joint of every robot
+    and every object, back to its initial value - reporting that only as a
+    ``WARNING`` line on stderr. So a scene the caller spent a rollout building
+    is destroyed by the next ``step`` while the write that doomed it reported
+    success.
+
+    Finite is therefore not enough to be writable, which is the same reason
+    :meth:`~strands_robots.simulation.mujoco.physics.PhysicsMixin.set_joint_velocities`
+    holds ``qvel`` to this ceiling. A joint's declared range bounds the values a
+    limited joint accepts, but a joint that declares NO range - a floating
+    base's free joint, a continuous hinge - has nothing else bounding it, and a
+    free joint's quaternion components are not renormalized on write either.
+
+    Shared by every MuJoCo surface that writes a caller-supplied value into
+    ``qpos``, defined in this low-level module for the reason
+    :data:`_NO_WORLD_MSG` is (the facade and its mixins can both source it
+    without a circular import), so their accepted domains cannot diverge.
+
+    Only a value that really reaches ``qpos`` is held to the ceiling. A static
+    object is welded to the worldbody with no free joint, so it owns no ``qpos``
+    entry and a far-away static body is stable - callers of this helper gate it
+    on the dynamic path rather than refusing a pose that works.
+
+    Args:
+        method: Calling method name, opening the message.
+        values: ``(label, value)`` pairs already coerced to finite floats, where
+            *label* names the component for the caller (``"position[0]"``, a
+            joint name).
+
+    Returns:
+        ``None`` when every value is within the ceiling, else the message naming
+        the method, each offending component and the consequence avoided.
+    """
+    import mujoco as _mj
+
+    ceiling = float(_mj.mjMAXVAL)
+    beyond = [f"{label}={value:.4g}" for label, value in values if abs(value) > ceiling]
+    if not beyond:
+        return None
+    return (
+        f"{method}: value too large to be a joint coordinate, nothing written: "
+        + "; ".join(beyond)
+        + ". The next step would report the simulation unstable and reset every joint and object "
+        f"to its initial state. MuJoCo's ceiling is mjMAXVAL={ceiling:.0e} on qpos."
+    )
+
+
 # One-shot guard so the software-rendering warning fires at most once per
 # process. A set (mutated via .add, never reassigned) avoids a `global`
 # rebind so static analysis sees it as used.
@@ -502,17 +584,65 @@ _SOFTWARE_RENDERERS: tuple[str, ...] = (
 )
 
 
+# Remedies for a software-rasterizer fallback, keyed on what is actually
+# installed. glvnd reports every cause of the fallback the same way - as Mesa
+# answering instead of NVIDIA - so the cause has to be narrowed from the host
+# rather than read off the renderer string.
+_REMEDY_NO_NVIDIA_LIBRARY = (
+    "No NVIDIA EGL library (libEGL_nvidia.so.*) is installed, so Mesa is the "
+    "expected backend here; a GPU render needs the NVIDIA driver's EGL library "
+    "(in a container, NVIDIA_DRIVER_CAPABILITIES must include 'graphics')."
+)
+_REMEDY_ICD_MISSING = (
+    "libEGL_nvidia is installed but no NVIDIA EGL vendor ICD is registered - "
+    "write /usr/share/glvnd/egl_vendor.d/10_nvidia.json containing "
+    '{"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}} '
+    "(in a container, NVIDIA_DRIVER_CAPABILITIES must include 'graphics')."
+)
+_REMEDY_DRIVER_UNREACHABLE = (
+    "An NVIDIA EGL vendor ICD is already registered and libEGL_nvidia is "
+    "installed, so a missing ICD is NOT the cause - the driver is installed but "
+    "unreachable from this process. Check that 'nvidia-smi' works here: a "
+    "container can expose /dev/nvidia* and still deny opening it (device cgroup), "
+    "which glvnd can only report as this fallback."
+)
+
+
+def _software_rendering_remedy() -> str:
+    """The remedy for a software-rasterizer fallback, chosen from what is installed.
+
+    A missing vendor ICD is the most common cause of the fallback but not the
+    only one: an NVIDIA host whose driver is installed and registered can still
+    be unable to reach the GPU, and a host with no NVIDIA EGL library at all is
+    running Mesa correctly. Prescribing the ICD unconditionally sends the first
+    case to re-apply a fix it already has and tells the second to install an ICD
+    it does not want, so narrow the advice with the same two facts
+    :func:`_ensure_nvidia_egl_vendor_icd` decides on.
+
+    Returns:
+        One sentence naming the cause that is still standing, and what to do.
+    """
+    if not _nvidia_egl_library_present():
+        return _REMEDY_NO_NVIDIA_LIBRARY
+    if not _nvidia_egl_icd_registered():
+        return _REMEDY_ICD_MISSING
+    return _REMEDY_DRIVER_UNREACHABLE
+
+
 def _warn_if_software_rendering(probe_stdout: str) -> None:
     """Warn once when the active GL renderer is a CPU software rasterizer.
 
-    MuJoCo's EGL backend silently routes to Mesa ``llvmpipe`` when no GPU EGL
-    vendor ICD is registered - e.g. an NVIDIA container missing
-    ``/usr/share/glvnd/egl_vendor.d/10_nvidia.json``. Offscreen rendering still
-    works but runs on the CPU at roughly two orders of magnitude lower
+    MuJoCo's EGL backend routes to Mesa ``llvmpipe`` whenever NVIDIA's EGL
+    vendor does not answer - because no vendor ICD is registered (e.g. an NVIDIA
+    container missing ``/usr/share/glvnd/egl_vendor.d/10_nvidia.json``), because
+    no NVIDIA EGL library is installed, or because the driver is installed and
+    registered but the GPU is unreachable from this process. Offscreen rendering
+    still works but runs on the CPU at roughly two orders of magnitude lower
     throughput, which silently throttles every policy observation, rollout
     video, and dataset recording. The render probe reports ``GL_RENDERER`` via
-    the ``__GL_RENDERER__=`` marker; surface a software rasterizer as an
-    actionable warning instead of a silent performance cliff.
+    the ``__GL_RENDERER__=`` marker; surface a software rasterizer as a warning
+    that names the cause still standing, via :func:`_software_rendering_remedy`,
+    instead of a silent performance cliff.
 
     Args:
         probe_stdout: Captured stdout of the render probe subprocess. When it
@@ -534,11 +664,9 @@ def _warn_if_software_rendering(probe_stdout: str) -> None:
         logger.warning(
             "MuJoCo is rendering on a CPU software rasterizer (GL_RENDERER=%r); "
             "offscreen renders will be ~100x slower than GPU and the GPU EGL "
-            "backend is NOT active. On an NVIDIA host/container, register the "
-            "NVIDIA EGL vendor ICD - write /usr/share/glvnd/egl_vendor.d/10_nvidia.json "
-            'containing {"file_format_version":"1.0.0","ICD":{"library_path":"libEGL_nvidia.so.0"}} '
-            "and ensure NVIDIA_DRIVER_CAPABILITIES includes 'graphics'.",
+            "backend is NOT active. %s",
             renderer,
+            _software_rendering_remedy(),
         )
 
 

@@ -92,7 +92,8 @@ _lock = threading.RLock()
 # process that repoints SETTINGS_FILE is served the tree resolved from the
 # previous file, and a stale hit is indistinguishable from a fresh one. Keyed
 # this way they cannot, because the path is the dict's key, so a tree is only
-# reachable through the file it came from. `auth.py` keys its store cache on a
+# reachable through the file it came from. ``strands_robots.dashboard.auth``
+# keys its store cache on a
 # file identity for the same reason. Cleared before each insert, so it holds at
 # most one entry.
 _cache: dict[str, dict[str, dict[str, Any]]] = {}
@@ -123,6 +124,7 @@ def _as_bool(value: Any) -> bool:
 #: Public alias - other dashboard modules parse comma-separated endpoint
 #: strings with the same rules the settings store uses.
 def as_list(value: Any) -> list[str]:
+    """Split a comma-separated string - or a sequence - into non-empty entries."""
     return _as_list(value)
 
 
@@ -322,6 +324,17 @@ def load(refresh: bool = False) -> dict[str, dict[str, Any]]:
 
 
 def get(section: str, key: str | None = None, default: Any = None) -> Any:
+    """One settings value, or a whole section, with a default for what is unset.
+
+    Args:
+        section: Settings section name.
+        key: A key within that section; omit it for the whole section.
+        default: Returned when the section, the key or its value is absent - an
+            empty string and an empty list count as absent.
+
+    Returns:
+        The stored value, the section mapping, or *default*.
+    """
     tree = load()
     if section not in tree:
         return default
@@ -440,7 +453,8 @@ def _write_file(data: dict[str, Any]) -> None:
 # Mesh env application
 # ----------------------------------------------------------------------
 
-#: Settings key -> env var read by ``mesh/session.py`` / the transport factory.
+#: Settings key -> env var read by ``strands_robots.mesh.session`` / the
+#: transport factory.
 MESH_ENV = {
     "connect": "ZENOH_CONNECT",
     "listen": "ZENOH_LISTEN",

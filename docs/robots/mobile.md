@@ -16,25 +16,9 @@ sim = Robot("crazyflie")        # Bitcraze Crazyflie 2 quadcopter
 
 ## Catalog
 
-| Name | Description | Joints | Aliases |
-|------|-------------|-------:|---------|
-| `aliengo` | Unitree Aliengo Quadruped (12-DOF) | 13 | `unitree_aliengo` |
-| `anymal_b` | ANYbotics ANYmal B Quadruped (12-DOF) | 13 | `anybotics_anymal_b` |
-| `anymal_c` | ANYbotics ANYmal C Quadruped (12-DOF) | 13 | `anybotics_anymal_c` |
-| `crazyflie` | Bitcraze Crazyflie 2 Nano-Quadcopter | 1 | `cf2`, `bitcraze_crazyflie` |
-| `earthrover` | EarthRover Mini Plus (mobile outdoor navigation) _(hardware-only, no sim asset)_ | ? | `earth_rover`, `earthrover_mini_plus`, `frodobots` |
-| `go1` | Unitree Go1 Quadruped (12-DOF) | 13 | `unitree_go1` |
-| `google_robot` | Google Robot (mobile base + arm, RT-X) | 10 | `oxe_google` |
-| `lekiwi` | LeKiwi mobile manipulator (6-DOF arm on 3-omniwheel base, 9 actuators) | 9 | - |
-| `lekiwi_client` | LeKiwi networked client (drives a remote LeKiwi host over ZMQ) _(hardware-only, no sim asset)_ | ? | `lekiwi_remote`, `lekiwi_net` |
-| `robot_soccer_kit` | Robot Soccer Kit (multi-robot soccer, 65-DOF total) | 65 | `rsk` |
-| `skydio_x2` | Skydio X2 Autonomous Drone | 1 | - |
-| `spot` | Boston Dynamics Spot (with arm) | 20 | `boston_dynamics_spot` |
-| `stretch` | Hello Robot Stretch (original, mobile manipulator) | 18 | `hello_robot_stretch_original` |
-| `stretch3` | Hello Robot Stretch 3 (mobile manipulator) | 41 | `hello_robot_stretch`, `hello_robot_stretch_3` |
-| `tiago_dual` | PAL Robotics TIAGo++ Dual-Arm Mobile (26-DOF) | 26 | `tiago++`, `pal_tiago_dual` |
-| `unitree_a1` | Unitree A1 Quadruped | 13 | `a1` |
-| `unitree_go2` | Unitree Go2 Quadruped | 40 | `go2` |
+Every robot in this family, generated from `robots.json` at build time. Renders are MuJoCo sim renders, never hardware photos.
+
+{{robot_cards:mobile, mobile_manip, aerial}}
 
 ## Flying a real Crazyflie
 
@@ -96,26 +80,6 @@ Commands go through `send_action` / `set_twist` / `takeoff` / `land`; `start_tas
 quadcopter has no joints for a manipulation policy's action to land on. Telemetry
 (`stateEstimate` position, `stabilizer` attitude, `pm.vbat`) is cached for the mesh; a bare
 Crazyflie has no ranger deck, so no lidar topic is published.
-
-## Featured renders
-
-### `spot`
-
-![spot](../assets/sim_render_spot.png){ width=400 }
-
-_Boston Dynamics Spot (with arm)_
-
-### `stretch3`
-
-![stretch3](../assets/sim_render_stretch3.png){ width=400 }
-
-_Hello Robot Stretch 3 (mobile manipulator)_
-
-### `unitree_go2`
-
-![unitree_go2](../assets/sim_render_unitree_go2.png){ width=400 }
-
-_Unitree Go2 Quadruped_
 
 ## Real hardware: the Go2 native driver
 
@@ -206,6 +170,28 @@ if (reason := rover.connect_eagerly()) is not None:   # proves GET /data answers
 rover.send_action({"linear": 0.4, "angular": -0.2})    # each axis normalised to [-1, 1]
 rover.cleanup()                                        # sends a parting zero twist
 ```
+
+The driver *is* the agent's tool, so an agent gets the rover's whole surface by holding it:
+
+```python
+from strands import Agent
+
+Agent(tools=[rover])("drive forward for two seconds, then show me the front camera")
+```
+
+| `action` | Parameters | Does |
+|---|---|---|
+| `sensors` | - | Telemetry snapshot: a one-line summary block plus the whole `/data` JSON. Refuses when the SDK has never answered, rather than reporting an empty rover. |
+| `status` | - | Connection state, the SDK URL and the last commanded twist. |
+| `camera` | `camera` (`front`/`rear`) | One frame, as an image block the model can see. |
+| `move` | `linear`, `angular`, `duration_s` | One twist. With `duration_s` (at most 30 s) the twist is held and a zero twist follows; the answer reports both halves, so a lost trailing stop is an error and not a completed move. |
+| `lamp` | `on` | Switches the headlamp - and stops, because the SDK carries `lamp` inside the one `/control` twist frame. |
+| `speak` | `text` | Says `text` through the rover's speaker. |
+| `stop` | - | A zero twist, and the envelope says whether it reached the SDK. |
+
+An `action` outside that enum is refused naming the declared verbs, never dispatched onto
+the halt. Writes are judged on the driver's own write path, so `move` and `send_action` are
+refused by the same sentence.
 
 Both axes are a fraction of full speed, so `1.0` is already the fastest value there is and
 a magnitude above it is **refused by name**, never clamped - the same disposition as the

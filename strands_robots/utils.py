@@ -5,6 +5,7 @@ import logging
 import math
 import numbers
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
@@ -1375,7 +1376,7 @@ def declared_count(value: object) -> int | None:
     answers a reader can act on are the count itself and the absence of one.
     Every reader of a LeRobot header count asks that question of the same file -
     the parquet cross-check in
-    :func:`~strands_robots.dataset_recorder.read_dataset_episode_indices`, the
+    :func:`~strands_robots.verify_dataset.read_dataset_episode_indices`, the
     metadata-drift check in
     :func:`~strands_robots.verify_dataset.verify_dataset`, the validation-split
     denominator in ``strands_robots.training.lerobot``, the episode count the
@@ -1608,6 +1609,53 @@ def dds_domain_id_error(value: Any, param: str, context: str) -> str | None:
     return None
 
 
+#: Isaac-GR00T releases :class:`~strands_robots.policies.groot.Gr00tPolicy` loads.
+#:
+#: The domain of its ``groot_version=``, which selects a loader rather than
+#: naming a package version: each spelling has a branch in
+#: ``Gr00tPolicy._load_local_policy`` that imports that release's own entry
+#: point. The tuple is the loaders the policy has, not the releases NVIDIA
+#: ships, which is why it is stated once here and graded against the dispatch.
+SUPPORTED_GROOT_VERSIONS = ("n1.5", "n1.6", "n1.7")
+
+
+def groot_version_error(value: Any, param: str, context: str) -> str | None:
+    """Error text when ``value`` names no Isaac-GR00T release with a loader.
+
+    ``groot_version=`` overrides Isaac-GR00T auto-detection and is read as a
+    loader selector, so only the spellings in :data:`SUPPORTED_GROOT_VERSIONS`
+    name anything. A value outside that set used to match no dispatch branch and
+    fall through to the same ``ImportError`` a missing package raises, reporting
+    the environment as lacking Isaac-GR00T even when the release was installed
+    and auto-detected - so a misspelling was answered with an install
+    instruction for a package the caller already had, and the parameter that
+    caused it was not named. Grading the value here names the typo instead.
+
+    ``None`` is the not-supplied sentinel, as it is for every other optional
+    parameter on that policy: it means "auto-detect the installed release", and
+    passes. Every other value is a claim about which loader to run, so a blank
+    or mis-cased one (``""``, ``"N1.7"``) is a claim that cannot be honoured
+    rather than an absent one - and ``""`` in particular is what an unset
+    environment variable interpolates to.
+
+    Args:
+        value: The caller-supplied release selector.
+        param: The parameter name it came from, used in the message.
+        context: Message prefix identifying the surface that received it,
+            usually the class name for a constructor parameter.
+
+    Returns:
+        An error message, or ``None`` when the value is usable.
+    """
+    if value is None or value in SUPPORTED_GROOT_VERSIONS:
+        return None
+    return (
+        f"{context}: invalid {param}: {refusal_repr(value)} names no Isaac-GR00T release "
+        f"this policy has a loader for (expected one of {list(SUPPORTED_GROOT_VERSIONS)}, "
+        "or None to auto-detect the installed release)"
+    )
+
+
 MAX_ZMQ_TIMEOUT_MS = 2**31 - 1
 
 
@@ -1798,10 +1846,10 @@ def name_list_error(value: Any, param: str, context: str) -> str | None:
     above, reached twice over: the emitted action dict is keyed by these names,
     so a three-entry list with one repeat emits two commands, and the
     ``lerobot_async`` hardware-feature map declares fewer columns than the
-    action aligner is handed. Note that the two providers resolving these names
-    by membership rather than by position (WBC, MotionBricks) deliberately
-    tolerate a repeat - it resolves to its first occurrence - so they are not
-    callers of this function.
+    action aligner is handed. Note that the provider resolving these names by
+    membership rather than by position (WBC) deliberately tolerates a repeat -
+    it resolves to its first occurrence - so it is not a caller of this
+    function.
 
     The mistake this exists for is a single name passed as a bare string.
     ``str`` is iterable, so ``list("wrist")`` yields ``['w', 'r', 'i', 's', 't']``
@@ -2637,8 +2685,9 @@ def coerce_size_vector(method: str, param_name: str, size: Any) -> tuple[list[fl
 #: because it is read from two sides that must agree: the render entry points
 #: that route it, and the ``add_camera`` guard that refuses it as a *name*. Those
 #: two lived as eleven separate copies of the same tuple literal across
-#: ``mujoco/rendering.py``, ``mujoco/simulation.py``, ``newton/simulation.py`` and
-#: ``base.py`` - one of them written in a different order - and the MuJoCo
+#: ``simulation.mujoco.rendering``, ``simulation.mujoco.simulation``,
+#: ``simulation.newton.simulation`` and ``simulation.base`` - one of them
+#: written in a different order - and the MuJoCo
 #: ``add_camera`` had the set in a comment but not in code, which is exactly the
 #: drift that made a reserved name accepted there while Newton refused it.
 FREE_CAMERA_TOKENS: Final[tuple[str | None, ...]] = (None, "", "default", "free")
@@ -2702,6 +2751,43 @@ def reserved_camera_name_error(method: str, param_name: str, name: Any) -> str |
         f"render/get_frame resolve {param_name}={rendered} to the free camera by an "
         f"explicit token check, so a camera created under it could never be rendered from."
     )
+
+
+def free_camera_routing_rank(name: Any) -> int:
+    """Sort rank that orders the free view behind every real camera.
+
+    The routing-site counterpart to :func:`reserved_camera_name_error`. That
+    guard keeps a caller from *creating* a camera under a
+    :data:`FREE_CAMERA_TOKENS` name; this one keeps the free view a backend
+    creates for itself from outranking a camera the caller did create, wherever
+    cameras compete for a fixed number of slots.
+
+    ``create_world`` registers the built-in free view under ``"default"`` before
+    any ``add_camera`` call, so it is FIRST in ``list_cameras()`` and first among
+    the image entries of ``get_observation()``. Any consumer that fills N slots
+    from that sequence therefore hands slot 0 to a fixed three-quarter debug
+    view of the whole scene - a view no checkpoint was trained on and no caller
+    asked to be an input - and, when the slots run out, drops one of the
+    caller's real cameras to make room for it.
+
+    Used as a ``list.sort`` / ``sorted`` key, this sinks the token names to the
+    end while leaving the real cameras in their existing relative order (both
+    are stable), so it changes which camera a *guess* picks and nothing else. It
+    does not remove the free view from the candidates: a scene whose only camera
+    is the free view still fills the slot it would have filled.
+
+    Args:
+        name: An observation camera key. Membership is the whole rule, so the
+            answer agrees with :data:`FREE_CAMERA_TOKENS` for every member
+            (including the ``None`` / ``""`` spellings a render call site uses,
+            which no observation key can carry). A name that is not a token at
+            all is ranked with the real cameras; judging whether it is a usable
+            name belongs to the caller's own guard, not to an ordering.
+
+    Returns:
+        ``1`` for a free-camera routing token, ``0`` for every other name.
+    """
+    return 1 if name in FREE_CAMERA_TOKENS else 0
 
 
 def camera_fov_error(method: str, param_name: str, value: Any) -> str | None:
@@ -2852,6 +2938,220 @@ def entity_name_error(method: str, param_name: str, name: Any) -> str | None:
     return None
 
 
+def camera_name_error(method: str, param_name: str, name: Any, *, routes_free_camera_tokens: bool) -> str | None:
+    """Return an error message if ``name`` cannot address the camera it claims.
+
+    The whole name rule for a camera creation site, in one place and in one
+    order: :func:`entity_name_error` first (a value that cannot be a registry
+    key at all), then :func:`reserved_camera_name_error` (a ``str`` this
+    backend's own render entry points resolve past), then
+    :func:`scoped_camera_name_error` (a ``str`` this backend registers happily
+    and the consumers that key frames by it read as structure). Every
+    ``add_camera`` reads it, so the order is a property of the rule rather than
+    of whichever body a caller reached.
+
+    That order was the defect this composition removes. The two guards had been
+    applied separately at each site, and the sites disagreed about where the
+    name rule sits relative to the *value* rules: MuJoCo refused a routing token
+    before validating ``position`` / ``target`` / ``fov`` / the pixel
+    dimensions, Newton refused it after all four. Both refused the same request
+    -- which is all the cross-backend parity test compared -- while naming
+    different causes. Measured on this tree, one ``create_world`` on each
+    backend::
+
+        add_camera("default", fov=0.0)          mujoco: 'default' is reserved
+                                                newton: 'fov' must be in (0, 180)
+        add_camera("default", position=[nan,1,1]) mujoco: 'default' is reserved
+                                                newton: 'position' must contain finite numbers
+        add_camera("free", width=0)             mujoco: 'free' is reserved
+                                                newton: width must be a positive integer
+
+    A caller fixing what the message names learns the name is unusable only on
+    the round trip after it, and the reserved-name refusal is the one fault no
+    change of value can clear. :func:`reserved_camera_name_error` documents its
+    own dependence on the order ("that guard runs first at every call site, so
+    this one is only ever reached with a genuine ``str``") - an assumption no
+    single site owned until this one did.
+
+    Args:
+        method: The calling method, for the message prefix (e.g. ``"add_camera"``).
+        param_name: The parameter being validated, for the message.
+        name: The claimed camera name. Anything at all; a value that is not a
+            ``str`` is refused by the first guard.
+        routes_free_camera_tokens: Whether this backend's render entry points
+            resolve :data:`FREE_CAMERA_TOKENS` to the free camera. Only a backend
+            that routes them may refuse them as names - the Isaac backend's
+            ``get_frame`` looks a name up directly, so ``"default"`` there is an
+            ordinary camera name and is that backend's documented signature
+            default. Passing the flag makes that divergence a stated property of
+            the call rather than a guard one site happens to omit.
+
+    Returns:
+        The first refusal in the documented order, or ``None`` when *name* can
+        address a camera on this backend *and* key that camera's frames at the
+        consumers which read the name as structure.
+    """
+    if (err := entity_name_error(method, param_name, name)) is not None:
+        return err
+    if routes_free_camera_tokens and (err := reserved_camera_name_error(method, param_name, name)) is not None:
+        return err
+    return scoped_camera_name_error(method, param_name, name)
+
+
+#: The alphabet a camera token is written in: letters, digits, ``_`` and ``-``,
+#: opening on a letter or a digit. Both camera-name shapes below are built from
+#: this one string, so the door that takes a bare token and the door that takes a
+#: scoped one cannot come to accept different alphabets.
+_CAMERA_TOKEN_ALPHABET: Final = r"[A-Za-z0-9][A-Za-z0-9_-]*"
+
+#: What a camera's name in a ``cameras`` mapping may be: one bare token. Every
+#: consumer keys the camera's frames by this name, and each of them reserves
+#: punctuation of its own - see :func:`camera_token_error`.
+_CAMERA_TOKEN: Final = re.compile(rf"\A{_CAMERA_TOKEN_ALPHABET}\Z")
+
+#: What a camera's name in a sim scene may be: a bare token, optionally scoped to
+#: one robot as ``<robot>/<camera>``. One optional level, because that is the one
+#: namespace ``add_robot`` gives what it spawns and the only one the mesh strips -
+#: see :func:`scoped_camera_name_error`.
+_SCOPED_CAMERA_NAME: Final = re.compile(rf"\A{_CAMERA_TOKEN_ALPHABET}(?:/{_CAMERA_TOKEN_ALPHABET})?\Z")
+
+
+def camera_token_error(method: str, param_name: str, name: Any) -> str | None:
+    """Return an error message if ``name`` cannot key the camera it names.
+
+    A camera's name in a ``cameras`` mapping is not just a label: it is the
+    identity every downstream consumer keys that camera's frames by, and each of
+    them reserves punctuation of its own. So the name has to be a bare token
+    (:data:`_CAMERA_TOKEN`) at every door that accepts one - the
+    :class:`~strands_robots.hardware_robot.Robot` factory's ``cameras`` mapping
+    and the ``robot_cameras`` of
+    :func:`~strands_robots.tools.lerobot_teleoperate.lerobot_teleoperate` - and
+    the rule lives here, beside :func:`entity_name_error`, for the same reason
+    that one does: two doors onto one name must not accept different alphabets.
+
+    Three consumers, each of which reads a character it reserves as structure
+    rather than as part of the name:
+
+    * **The mesh topic.**
+      :meth:`~strands_robots.mesh.core.Mesh._encode_and_publish_frames`
+      publishes each frame on ``strands/<peer_id>/camera/<name>``. A ``/`` in
+      the name adds a topic level, so the frame lands under a key no
+      ``strands/*/camera/*`` subscription matches, and ``*`` / ``**`` are Zenoh
+      wildcards, which a ``put`` is routed by intersection - the frame is
+      delivered to every peer that subscribes to any camera rather than to the
+      one asking for this camera. Measured on this tree, a camera named
+      ``'wrist/ref'`` published its 274054-byte inline frame on
+      ``strands/rover-01/camera/wrist/ref``, which is the shape of the small S3
+      *pointer* the IoT transport exempts from its camera-frame drop
+      (:func:`~strands_robots.mesh.transport.iot_transport._is_camera_ref`), so
+      the whole frame was forwarded to the broker the drop exists to spare.
+    * **The S3 key.**
+      :meth:`~strands_robots.mesh.iot.camera_offload.CameraOffloader.s3_key_for`
+      joins the name into ``<prefix>/<peer_id>/<name>/<ts>.jpg``, so ``..``
+      walks out of the peer's own prefix.
+    * **The argv.** ``lerobot_teleoperate`` renders the entry into the nested
+      ``--robot.cameras`` dict lerobot's draccus CLI parses, where ``,``, ``:``,
+      ``{``, ``}``, ``=`` and whitespace are structure - a name carrying one
+      changes the shape of that dict rather than the value in it, and is
+      reported minutes later in a detached subprocess's log.
+
+    The name is additionally the dataset feature key a recording writes it under
+    (``observation.images.<name>``, see
+    :meth:`~strands_robots.dataset_recorder.DatasetRecorder.add_frame`), whose
+    ``.`` separator is the same kind of structure.
+
+    Args:
+        method: The surface being called, for the message prefix (e.g.
+            ``"Robot(cameras=...)"``).
+        param_name: What is being named, for the message (e.g.
+            ``"camera name"``).
+        name: The claimed camera name. Anything at all; a value that cannot be a
+            key of any kind is refused first by :func:`entity_name_error`.
+
+    Returns:
+        An error message naming the value and the alphabet, or ``None`` when
+        *name* is a bare token.
+    """
+    if (err := entity_name_error(method, param_name, name)) is not None:
+        return err
+    if _CAMERA_TOKEN.match(name) is not None:
+        return None
+    rendered = refusal_repr(name)
+    return (
+        f"{method}: {param_name}={rendered} is not a bare token. A camera's name is the "
+        "identity every consumer keys its frames by, and each reserves punctuation of its "
+        "own: the mesh publishes them on 'strands/<peer_id>/camera/<name>', where '/' adds a "
+        "topic level and '*' is a wildcard a put is routed by; the S3 offload joins it into "
+        "the object key, where '..' walks out of the peer's prefix; a recording writes it as "
+        "the 'observation.images.<name>' dataset feature key; and lerobot parses "
+        "--robot.cameras as a nested dict, where ',', ':', '{', '}', '=' and whitespace are "
+        "structure. Use letters, digits, '_' or '-'."
+    )
+
+
+def scoped_camera_name_error(method: str, param_name: str, name: Any) -> str | None:
+    """Return an error message if a sim camera's *name* cannot key its own frames.
+
+    The sim-scene counterpart to :func:`camera_token_error`. That rule holds a
+    camera's name to one bare token, because the name is the identity every
+    downstream consumer keys the camera's frames by and each of them reserves
+    punctuation of its own; this one applies the same alphabet to a sim scene,
+    where a name may additionally carry one namespace level.
+
+    One level, and not a free path, because a robot's namespace is one level:
+    ``add_robot`` registers every robot it spawns with
+    ``SimRobot.namespace = "<robot>/"`` and namespaces its bodies, joints and
+    actuators under it, so ``add_camera("alice/wrist_cam", ...)`` is how a wrist
+    camera is scoped to the robot ``alice``. That prefix is also the only one the
+    mesh removes: :meth:`~strands_robots.mesh.core.Mesh._publish_sim_cameras`
+    strips exactly ``r.namespace`` from each MuJoCo camera name before handing
+    the short name to
+    :meth:`~strands_robots.mesh.core.Mesh._encode_and_publish_frames`, so a
+    one-level scoped name reaches the topic as the bare token that function's
+    consumers require. A second level survives the strip, and is structure again.
+
+    Everything else is refused for the reasons :func:`camera_token_error`
+    documents: the mesh topic (a ``/`` adds a level no ``strands/*/camera/*``
+    subscription matches, and ``*`` / ``**`` are Zenoh wildcards a ``put`` is
+    routed by intersection), the S3 object key (``..`` walks out of the peer's
+    own prefix), the ``observation.images.<name>`` dataset feature key, and the
+    nested ``--robot.cameras`` dict lerobot's CLI parses. Measured on one
+    ``create_world`` before this guard, ``add_camera`` returned
+    ``status="success"`` for ``'..'``, ``'sub/../etc'``, ``'a b'``, ``'cam#1'``,
+    ``'*'``, ``'**'``, ``'a//b'``, ``'/lead'`` and ``'trail/'``, and
+    ``list_cameras`` reported every one of them.
+
+    Args:
+        method: The surface being called, for the message prefix (e.g.
+            ``"add_camera"``).
+        param_name: The parameter being validated, for the message.
+        name: The claimed camera name. Anything at all; a value that cannot be a
+            registry key of any kind is refused first by
+            :func:`entity_name_error`.
+
+    Returns:
+        An error message naming the value and the alphabet, or ``None`` when
+        *name* is a camera token optionally scoped to one robot.
+    """
+    if (err := entity_name_error(method, param_name, name)) is not None:
+        return err
+    if _SCOPED_CAMERA_NAME.match(name) is not None:
+        return None
+    rendered = refusal_repr(name)
+    return (
+        f"{method}: {param_name}={rendered} cannot key a camera's frames. A sim camera's name "
+        "is a bare token of letters, digits, '_' or '-', opening on a letter or a digit, "
+        "optionally scoped to one robot as '<robot>/<camera>' (the namespace add_robot gives "
+        "what it spawns, and the one the mesh strips). Every other character is structure to "
+        "a consumer that keys frames by this name: the mesh publishes them on "
+        "'strands/<peer_id>/camera/<name>', where a further '/' adds a topic level no "
+        "'strands/*/camera/*' subscription matches and '*' / '**' are wildcards a put is "
+        "routed by intersection; the S3 offload joins it into the object key, where '..' "
+        "walks out of the peer's prefix; and a recording writes it as the "
+        "'observation.images.<name>' dataset feature key."
+    )
+
+
 def published_string_error(value: Any, param: str, context: str) -> str | None:
     """Return an error message if a field published as a string did not arrive as one.
 
@@ -2939,6 +3239,144 @@ def stale_output_dir_is_clearable(output_dir: str) -> bool:
     if not path.is_dir():
         return False
     return not any(path.iterdir())
+
+
+def _episode_indices(value: Any) -> list[int] | None:
+    """Episode indices a passthrough value carries, or ``None`` for no restriction.
+
+    Text is read with lerobot's own CLI decoder, the decoder both the
+    ``--dataset.episodes=[0,1,2]`` argv and the in-process config assignment
+    already travel, so a subset spelled as text is counted exactly as it will be
+    configured.
+
+    The read is guarded element by element, in the shape :func:`_read_name_list`
+    uses and for its reason: this feeds a preflight that must return a verdict
+    rather than raise, and a ``Sequence`` whose ``__iter__`` or whose element
+    production raises would otherwise escape through it. ``next()`` is called
+    explicitly because a ``for`` cannot guard the call it makes.
+
+    Anything that is not a sequence of plain ints counts as no restriction -
+    including a ``bool``, which is an ``int`` in Python and would otherwise read
+    ``True`` as "episode 1". The config field itself refuses such a value with the
+    accepted spellings named, so no run starts on it and there is no split to size.
+    """
+    if isinstance(value, str):
+        try:
+            from draccus import cfgparsing
+
+            value = cfgparsing.parse_string(value)
+        except Exception:  # noqa: BLE001
+            # Both stages are third-party and raise from disjoint hierarchies
+            # (ImportError with no lerobot installed, yaml.YAMLError for the
+            # scalar parse). Nothing is swallowed that a run could proceed on:
+            # the same text is refused again by the config field it targets.
+            return None
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
+        return None
+    try:
+        elements = iter(value)
+    except Exception:  # noqa: BLE001
+        return None
+    indices: list[int] = []
+    while True:
+        try:
+            entry = next(elements)
+        except StopIteration:
+            return indices
+        except Exception:  # noqa: BLE001
+            return None
+        if type(entry) is not int:
+            return None
+        indices.append(entry)
+
+
+def effective_episode_count(total_episodes: int, episodes: Any, exclude_episodes: Any = None) -> int:
+    """Episodes a run will actually train and validate over.
+
+    lerobot sizes its train/eval split from the episodes the DATASET was built
+    from - ``full_dataset.episodes``, the subset left by ``dataset.episodes`` and
+    ``dataset.exclude_episodes`` - not from the ``total_episodes`` its header
+    declares (``lerobot.datasets.factory.make_train_eval_datasets``). A caller
+    who divides a requested holdout by the header count while lerobot multiplies
+    by the subset reserves fewer episodes than asked: 3 episodes of the 15 an
+    episode filter kept becomes ``ceil(15 * (3 - 0.5) / 30) == 2``.
+
+    The subset is resolved by lerobot's own ``resolve_episode_indices`` when the
+    installed version has it, so the arithmetic cannot drift from the resolver
+    the run will use - including its rule that an index outside the dataset is
+    dropped with a warning rather than refused, which SHRINKS the subset.
+    lerobot 0.6.1, the declared floor, has neither that resolver nor
+    ``DatasetConfig.exclude_episodes`` (both landed in one commit) and hands
+    ``dataset.episodes`` to ``LeRobotDataset`` verbatim, which is what the
+    fallback counts.
+
+    Args:
+        total_episodes: What the dataset's ``meta/info.json`` declares.
+        episodes: The allowlist as the caller wrote it in their passthrough - a
+            sequence of indices, the text form lerobot's CLI decoder accepts, or
+            ``None`` for every episode.
+        exclude_episodes: The exclusion list, same accepted spellings.
+
+    Returns:
+        The size of the subset the run will carry, or ``total_episodes`` when no
+        usable restriction was asked for.
+    """
+    chosen = _episode_indices(episodes)
+    excluded = _episode_indices(exclude_episodes)
+    if chosen is None and not excluded:
+        return total_episodes
+    try:
+        from lerobot.datasets.utils import resolve_episode_indices
+    except ImportError:
+        return total_episodes if chosen is None else len(chosen)
+    resolved = resolve_episode_indices(chosen, total_episodes, excluded)
+    return total_episodes if resolved is None else len(resolved)
+
+
+def episode_subset_budget_error(
+    val_episodes: int,
+    total_episodes: int,
+    effective_episodes: int,
+    context: str,
+    *,
+    passthrough_param: str,
+) -> str | None:
+    """Error text when a holdout does not fit the SUBSET a passthrough left.
+
+    The holdout is bounded by the episodes the run actually loads, which an
+    episode allowlist or exclusion list narrows below the header count. Comparing
+    against the header instead let ``val_episodes=5`` past a bound check on a
+    30-episode dataset whose passthrough selected 4, and the fraction that was
+    then emitted held out 1 - a run that logs an eval loss over the wrong number
+    of episodes looks correct.
+
+    Args:
+        val_episodes: The requested held-out episode count.
+        total_episodes: What the dataset's ``meta/info.json`` declares.
+        effective_episodes: What :func:`effective_episode_count` measured.
+        context: Caller label the message is prefixed with.
+        passthrough_param: Name of the caller's own raw passthrough parameter,
+            interpolated into the remedy. Required rather than defaulted for the
+            reason :func:`validation_split_error` carries: the surfaces disagree
+            (``extra_flags`` on the tool, ``extra`` on :class:`TrainSpec`), so a
+            default would name a keyword one of them does not accept.
+
+    Returns:
+        The error text, or ``None`` when the holdout fits - and when no subset
+        narrowed the dataset, which is the caller's own whole-dataset refusal to
+        report because it already names the header count.
+    """
+    if effective_episodes >= total_episodes or val_episodes < effective_episodes:
+        return None
+    return (
+        f"{context}: val_episodes={val_episodes} cannot be reserved from the "
+        f"{effective_episodes} episode(s) {passthrough_param}['dataset.episodes'/"
+        f"'dataset.exclude_episodes'] selects, out of {total_episodes} in the dataset. "
+        "lerobot sizes the validation split against the episodes the dataset was built "
+        "from, not against the header count, so the subset is the budget. Either reserve "
+        f"fewer than {effective_episodes}, widen the subset, or pass the fraction directly, "
+        f"e.g. {passthrough_param}={{'dataset.eval_split': 0.1, 'eval_steps': 1000}}."
+    )
 
 
 def validation_split_fraction(val_episodes: int, total_episodes: int) -> float:

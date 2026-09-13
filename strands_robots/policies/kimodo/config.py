@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from strands_robots.utils import (
+    boolean_flag_error,
     positive_finite_number_error,
     positive_whole_number_error,
     refusal_repr,
@@ -273,7 +274,13 @@ class KimodoConfig:
             also opt in to executing a repository's code. Only a ``model_id``
             published in diffusers pipeline layout reaches the flag at all -
             NVIDIA's own Kimodo checkpoints are not, and are refused at load
-            time in favour of a ``motion_agent=`` sampler.
+            time in favour of a ``motion_agent=`` sampler. It selects a
+            posture rather than scaling a quantity, so a non-boolean is
+            refused at construction (:func:`~strands_robots.utils.boolean_flag_error`)
+            rather than forwarded: ``from_pretrained`` reads the flag by
+            truthiness, and ``"false"`` - the spelling a JSON ``policy_config``
+            reaches for to opt out - is truthy, so it would run the
+            checkpoint's code for the caller who asked it not to.
         seed: RNG seed for reproducible sampling. A whole number, of either
             sign and any width, or ``None`` for fresh entropy on every sample.
             :func:`sampling_seed_error` owns the domain and
@@ -295,7 +302,13 @@ class KimodoConfig:
     seed: int | None = None
 
     def __post_init__(self) -> None:
-        # Validate at construction so bad values fail loud.
+        # Validate at construction so bad values fail loud. The remote-code flag
+        # goes first: it is the one field whose misread runs someone else's code,
+        # and every route a caller has (``KimodoPolicy(trust_remote_code=)``,
+        # ``from_dict``, ``from_json``) is re-validated here, so this is the one
+        # site the check needs.
+        if error := boolean_flag_error(self.trust_remote_code, "trust_remote_code", "KimodoConfig"):
+            raise ValueError(error)
         if error := diffusion_steps_error(self.diffusion_steps, "KimodoConfig"):
             raise ValueError(error)
         _positive_float("guidance_scale", self.guidance_scale)
@@ -316,8 +329,7 @@ class KimodoConfig:
 
         Only recognised keys are consumed; unknown keys are ignored for forward
         compatibility, and no warning is emitted for a dropped key - the policy
-        :mod:`strands_robots.policies.motionbricks.config` and
-        :mod:`strands_robots.policies.wbc.config` state for their own
+        :mod:`strands_robots.policies.wbc.config` states for its own
         ``from_dict``.
 
         Args:
@@ -337,12 +349,11 @@ class KimodoConfig:
 
         A file that cannot supply fields is reported by name rather than
         reaching :meth:`from_dict`, which is the reporting the sibling
-        policy-config file loaders in
-        :mod:`strands_robots.policies.motionbricks.config` and
-        :mod:`strands_robots.policies.wbc.config` already give. ``~`` in
+        policy-config file loader in
+        :mod:`strands_robots.policies.wbc.config` already gives. ``~`` in
         ``path`` is expanded.
 
-        The extension is deliberately not checked, unlike those two loaders: a
+        The extension is deliberately not checked, unlike that loader: a
         JSON object stored under any name loads here today, and refusing one
         would stop a payload that currently works. Every refusal below names an
         input that already fails.

@@ -5,6 +5,7 @@ repo_url: https://github.com/strands-labs/robots
 repo_name: strands-labs/robots
 extra_css:
 - stylesheets/extra.css?v=2
+- stylesheets/robot-cards.css
 extra_javascript:
 - https://unpkg.com/mermaid@10/dist/mermaid.min.js
 - assets/mermaid-init.js
@@ -41,7 +42,6 @@ nav:
   - MoveIt2: policies/moveit2.md
   - WBC (Whole-Body-Control): policies/wbc.md
   - WBC Gait-Clock Variant: policies/wbc_gait.md
-  - MotionBricks (G1 generative motion): policies/motionbricks.md
   - Kimodo (G1 text-to-motion diffusion): policies/kimodo.md
   - ProtoMotions (G1 motion tracker): policies/protomotions.md
   - Microduck (Pollen 14-DOF biped): policies/microduck.md
@@ -64,17 +64,24 @@ nav:
 - Datasets:
   - Recording: recording.md
   - Steerable Annotation: data/annotation.md
-  - Augmentation Transforms: data/transforms.md
   - Episode Labels (VLM judge): data/episode-labels.md
 - Remote Inference: inference/remote.md
 - Examples:
   - Overview: examples/overview.md
 - Architecture: architecture.md
 - API Reference: api-reference.md
+- Configuration: reference/configuration.md
 - Security: security.md
 - Tool Result Contract: contracts.md
 - Contributing: contributing.md
 - Troubleshooting: troubleshooting.md
+hooks:
+  - docs/hooks/numbers.py
+  - docs/hooks/robot_cards.py
+validation:
+  links:
+    anchors: warn
+
 theme:
   name: material
   logo: assets/strands-logo.svg

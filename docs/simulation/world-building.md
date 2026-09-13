@@ -8,7 +8,7 @@ description: Compose non-trivial scenes - multiple robots, tables, obstacles, cu
 from strands_robots import Robot
 
 sim = Robot("so100")                              # one arm on flat ground plane
-sim.add_robot(name="so100", position=[0.0, 0.5, 0.0])   # second arm
+sim.add_robot(name="arm2", data_config="so100", position=[0.0, 0.5, 0.0])   # second arm
 
 sim.add_object(name="table", shape="box", size=[0.5, 0.5, 0.02],
                position=[0.0, 0.0, 0.0], color=[0.5, 0.3, 0.1, 1.0], mass=20.0)
@@ -128,8 +128,11 @@ those `position=[0, 0, 0]` spawns the robot standing rather than sunk into the
 floor, which is the reason the compose is the useful default. `add_robot`
 reports the *measured* world position of the robot's root body and names the
 request and the model's offset beside it whenever they differ, so a spawn that
-did not land where it was asked is visible in the result. This differs from
-`add_object`, whose `position` places its body at exactly that world point.
+did not land where it was asked is visible in the result. `list_robots` reports
+the same measured base pose, re-read from the physics on every call, so a robot
+that has since walked, driven or fallen is listed where it now is rather than
+where it spawned. This differs from `add_object`, whose `position` places its
+body at exactly that world point.
 
 ### Adding a robot does not disturb the scene it joins
 
@@ -216,10 +219,24 @@ below the nominal floor), and it is regenerated identically on every
 `reset()` (deterministic given the terrain kind), so a benchmark that
 evaluates a policy on rough ground is reproducible. `terrain` only applies
 when `ground_plane=True` (the default, which is the master floor switch);
-an unknown kind is rejected with an error listing the supported kinds. It
+an unknown kind is rejected with an error listing the supported kinds.
+`ground_plane` itself must be a boolean: it selects a posture (lay a floor or
+leave the world open), so a non-boolean is refused under the shared
+`boolean_flag_error` domain rather than read by truthiness - `"false"` does
+not lay a floor and `0` does not omit one (MuJoCo and Newton backends). It
 is the ground-generation primitive a terrain *curriculum* (progressive
 difficulty across resets) builds on. (MuJoCo backend; the Newton backend
 rejects `terrain=` as not-yet-supported.)
+
+Those guarantees - the field flush with `z=0` at its lowest cell, reaching the
+full elevation at its highest, with the declared plateau count for a stepped
+kind - are properties of the *grid* as much as of the kind, so each kind needs a
+minimum number of cells to draw its shape at all. `create_world()` always uses a
+40-cell grid and is comfortably above every minimum. A caller reaching for the
+generator directly (`generate_heightfield(kind, resolution=...)`) is refused
+below it, naming the kind and the count that works, rather than handed a field
+that is flat or short of its top plateau; the minimums are exported as
+`TERRAIN_MIN_RESOLUTION`.
 
 That curriculum knob is `difficulty`, which scales the terrain's peak
 elevation (the metre height its normalized `[0, 1]` field maps to) without

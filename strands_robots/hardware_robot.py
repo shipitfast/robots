@@ -11,6 +11,23 @@ Features:
 - Stop functionality to interrupt running tasks
 - Connection state management with proper error handling
 - Policy abstraction for any VLA provider
+
+Operator approval: this class is the ``mode="real"`` half of
+:func:`strands_robots.Robot`, so every ``execute`` or ``start`` the agent tool
+dispatches drives real actuators. Both stop for a human BEFORE the rollout is
+dispatched, through the same decision path the ROS transports and the serial
+tool use (:func:`~strands_robots.tools._command_gate.gate_motion`):
+``STRANDS_ROBOT_COMMAND_ALLOW`` (comma-separated ``execute``/``start``, or
+``*``) pre-approves, ``BYPASS_TOOL_CONSENT=true`` lifts the gate with a WARNING,
+otherwise the operator is asked through the agent's interrupt and, with no
+agent reachable, the call is refused and nothing is dispatched. The dashboard's
+:class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook` may already
+have asked; a grant it deposited for this exact call is spent instead of asking
+twice. ``status`` and ``stop`` are never gated - stopping must not get harder -
+and the simulation tool is a different class that never touches hardware.
+Before this gate the README's first path to metal, ``Agent(tools=[Robot("so100",
+mode="real")])``, dispatched unasked while the same robot commanded through
+``robot_mesh`` was gated (F-011, CWE-862).
 """
 
 from __future__ import annotations
@@ -33,16 +50,19 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from strands.interrupt import InterruptException
 from strands.tools.tools import AgentTool
-from strands.types._events import ToolResultEvent
-from strands.types.tools import ToolResult, ToolSpec, ToolUse
+from strands.types._events import ToolInterruptEvent, ToolResultEvent
+from strands.types.tools import ToolContext, ToolResult, ToolSpec, ToolUse
 
 from strands_robots._serial_discovery import describe_serial_candidates, scan_serial_devices
 from strands_robots.bus_access import read_observation, write_action
 from strands_robots.ros_telemetry import ROS2_SYSTEM_INSTALL_HINT
 from strands_robots.teleop_mixin import TeleopMixin, _stop_reported_stopped
+from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     boolean_flag_error,
+    camera_token_error,
     dds_domain_id_error,
     positive_count_error,
     positive_finite_number_error,
@@ -58,6 +78,14 @@ if TYPE_CHECKING:
     from .policies import Policy
 
 logger = logging.getLogger(__name__)
+
+# The agent-tool actions that dispatch a rollout to real actuators. ``status``
+# and ``stop`` only read or halt, so they are never gated.
+MOTION_ACTIONS = frozenset({"execute", "start"})
+
+# Pre-approve motion actions by name (comma-separated, ``*`` for all) for
+# headless runs. Read by the shared gate, which also honours BYPASS_TOOL_CONSENT.
+COMMAND_ALLOW_ENV = "STRANDS_ROBOT_COMMAND_ALLOW"
 
 
 # Remedy for a missing ``rclpy`` when the caller asked for the rclpy transport.
@@ -262,6 +290,58 @@ def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
         ) from None
 
 
+def _camera_option_vocabulary(camera_name: str, config: Mapping[str, Any]) -> tuple[type, dict[str, Any]]:
+    """Resolve the config class one camera entry names and the options it may state.
+
+    The one owner of the camera option vocabulary. ``type`` selects the class
+    through lerobot's ``CameraConfig`` choice registry, and the options an entry
+    may then name are that class's declared dataclass fields - so a backend
+    lerobot adds, or a field it renames, is admitted here by construction rather
+    than by a list kept in step by hand. Every surface that accepts the
+    serialized ``cameras`` shape reads it from here: the ``Robot`` factory
+    constructs the config, and ``lerobot_teleoperate`` renders the same entry
+    into the ``--robot.cameras`` argv of a detached subprocess, where an option
+    the class does not declare would be refused minutes later in that process's
+    log rather than here.
+
+    Args:
+        camera_name: The key this camera was registered under, named in every
+            refusal so a multi-camera rig reports which entry is at fault.
+        config: The per-camera options, already known to be a mapping.
+
+    Returns:
+        The resolved ``CameraConfig`` subclass and its declared fields by name.
+
+    Raises:
+        ValueError: If ``type`` is not a registered camera backend, or the entry
+            names an option the resolved class does not declare. An unknown
+            option is refused rather than dropped per AGENTS.md > Review
+            Learnings (#86): a silently discarded option reports success while
+            the camera streams at the default. The suggestion is drawn from the
+            resolved class's own fields: an ``index_or_path`` sent to a
+            RealSense is a real mistake, and pointing at
+            ``serial_number_or_name`` is what makes it fixable.
+    """
+    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
+    accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
+
+    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
+    if unknown:
+        hints = []
+        for key in unknown:
+            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
+            if close:
+                hints.append(f"{key!r} -> {close[0]!r}")
+        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
+        raise ValueError(
+            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
+            f"{ConfigClass.__name__} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
+            f"the camera backend). (If this is a typo, fix it.)"
+        )
+    return ConfigClass, fields
+
+
 def _build_camera_config(camera_name: str, config: Any) -> Any:
     """Build the lerobot camera config for one entry of a ``cameras`` dict.
 
@@ -278,42 +358,31 @@ def _build_camera_config(camera_name: str, config: Any) -> Any:
         names, ready for ``lerobot.cameras.make_cameras_from_configs``.
 
     Raises:
-        ValueError: If ``config`` is not a mapping, names a camera ``type``
-            lerobot does not register, carries a key that is not a declared
-            field of the resolved class, omits a field that has no default, or
-            holds a value lerobot's own config validation refuses. An unknown
-            key is refused rather than dropped per AGENTS.md > Review Learnings
-            (#86): a silently discarded option reports success while the camera
-            streams at the default.
+        ValueError: If ``camera_name`` is not a bare token
+            (:func:`~strands_robots.utils.camera_token_error`), or if ``config``
+            is not a mapping, names a camera ``type`` lerobot does not register,
+            carries a key that is not a declared field of the resolved class,
+            omits a field that has no default, or holds a value lerobot's own
+            config validation refuses. An unknown key is refused rather than
+            dropped per AGENTS.md > Review Learnings (#86): a silently discarded
+            option reports success while the camera streams at the default.
     """
+    # The name is graded before the options because it is what every consumer
+    # keys this camera's frames by -- a mesh topic level, an S3 object key, a
+    # dataset feature key -- so no option is worth checking under a name none of
+    # them can carry. ``lerobot_teleoperate`` holds its ``robot_cameras`` to the
+    # same rule at the same point, through the same owner.
+    if (name_err := camera_token_error("Robot(cameras=...)", "camera name", camera_name)) is not None:
+        raise ValueError(name_err)
     if not isinstance(config, Mapping):
         raise ValueError(
             f"Camera {camera_name!r} config must be a mapping of option name to value, "
             f"got {type(config).__name__}: {config!r}."
         )
 
-    ConfigClass = _resolve_camera_config_class(camera_name, config.get(_CAMERA_TYPE_KEY, "opencv"))
+    ConfigClass, fields = _camera_option_vocabulary(camera_name, config)
     class_name = ConfigClass.__name__
-
-    fields = {f.name: f for f in dataclasses.fields(ConfigClass)}
     accepted = sorted(set(fields) | {_CAMERA_TYPE_KEY})
-
-    unknown = sorted(set(config) - set(fields) - {_CAMERA_TYPE_KEY}, key=repr)
-    if unknown:
-        hints = []
-        for key in unknown:
-            close = difflib.get_close_matches(str(key), accepted, n=1, cutoff=0.7)
-            if close:
-                hints.append(f"{key!r} -> {close[0]!r}")
-        hint = f" Did you mean: {', '.join(hints)}?" if hints else ""
-        # The suggestion is drawn from the resolved class's own fields: an
-        # ``index_or_path`` sent to a RealSense is a real mistake, and pointing
-        # at ``serial_number_or_name`` is what makes it fixable.
-        raise ValueError(
-            f"Unknown option(s) for camera {camera_name!r}: {unknown}.{hint} "
-            f"{class_name} accepts: {accepted} (where {_CAMERA_TYPE_KEY!r} selects "
-            f"the camera backend). (If this is a typo, fix it.)"
-        )
 
     missing = sorted(
         name
@@ -582,6 +651,14 @@ class Robot(TeleopMixin, AgentTool):
             robot: LeRobot Robot instance, RobotConfig, or robot type string
             cameras: Camera configuration dict:
                 {"wrist": {"type": "opencv", "index_or_path": "/dev/video0", "fps": 30}}
+                Each key names one camera and must be a bare token of letters,
+                digits, ``_`` or ``-``: it is the identity every consumer keys
+                that camera's frames by - a level of the mesh topic they are
+                published on, a segment of the S3 key they are offloaded to, and
+                the ``observation.images.<name>`` feature key a recording writes
+                them under - so a name carrying punctuation any of those reserves
+                is refused here
+                (:func:`~strands_robots.utils.camera_token_error`).
             action_horizon: Actions consumed from each inferred policy chunk
                 before re-querying. Must be a positive integer - it is a lower
                 bound on the chunk slice the task loop applies
@@ -1812,7 +1889,7 @@ class Robot(TeleopMixin, AgentTool):
                 logger.info(f"Using policy: {policy_provider} on {policy_host}:{policy_port}")
 
             # Real-Time Chunking contract (mirror PolicyRunner._run_policy_rollout
-            # in strands_robots/simulation/policy_runner.py): tell the policy the
+            # in ``strands_robots.simulation.policy_runner``): tell the policy the
             # control rate ONCE before the rollout so RTC-capable providers
             # (pi0/pi0.5/SmolVLA/MolmoAct2) convert their inference latency into a
             # correct count of action steps and blend chunk seams identically to
@@ -1822,7 +1899,7 @@ class Robot(TeleopMixin, AgentTool):
 
             # Clear per-episode policy state before the rollout, mirroring the
             # per-episode reset PolicyRunner performs in
-            # strands_robots/simulation/policy_runner.py. A caller may drive one
+            # ``strands_robots.simulation.policy_runner``. A caller may drive one
             # policy object through several tasks (that is the documented
             # ``run_policy(policy_object=...)`` usage), and Policy.reset exists
             # to clear exactly the state that must not cross that boundary -
@@ -2676,7 +2753,8 @@ class Robot(TeleopMixin, AgentTool):
         """Stop the current task, including one that is still connecting.
 
         This is the interrupt an operator (or the fleet ``{"action": "stop"}``
-        dispatch, via ``mesh/core.py``) reaches for, so it has to hold for a
+        dispatch, via :class:`~strands_robots.mesh.core.Mesh`) reaches for, so
+        it has to hold for a
         task in ANY stage that can still command the arm - not only the one
         stage whose status happens to be ``RUNNING``.
 
@@ -2754,7 +2832,7 @@ class Robot(TeleopMixin, AgentTool):
             "name": self.tool_name_str,
             "description": f"Universal robot control with async task execution ({self.robot}). "
             f"Actions: execute (blocking), start (async), status, stop. "
-            f"For execute/start actions: instruction and policy_port are required. "
+            f"For execute/start actions: instruction is required; policy_port when the provider dials a server. "
             f"For status/stop actions: no additional parameters needed.",
             "inputSchema": {
                 "json": {
@@ -2772,7 +2850,7 @@ class Robot(TeleopMixin, AgentTool):
                         },
                         "policy_port": {
                             "type": "integer",
-                            "description": "Policy service port (required for execute/start actions)",
+                            "description": "Policy service port. Required by groot and moveit2, read by the other server-dialing providers, refused for providers that build in process (mock, lerobot_local).",
                         },
                         "policy_host": {
                             "type": "string",
@@ -2806,9 +2884,81 @@ class Robot(TeleopMixin, AgentTool):
         """Create a ToolResult dict with the given tool_use_id merged into result."""
         return cast(ToolResult, {"toolUseId": tool_use_id, **result})
 
+    def _dashboard_grant(self, tool_input: Mapping[str, Any]) -> bool:
+        """Spend a grant the dashboard's motion hook deposited for this exact call.
+
+        The dashboard registers :class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook`
+        on its agent, which asks the operator before the tool runs and records a
+        one-shot grant keyed on what they were shown. Asking again here would be
+        the same question twice, so a grant is consumed and the call proceeds.
+        The dashboard extra may be absent, and a missing module must read as
+        "no grant", never as a crash: the gate below then asks the operator.
+
+        Args:
+            tool_input: The call as the hook saw it - the tool's own input dict.
+
+        Returns:
+            True when a grant for this exact call existed and was spent.
+        """
+        try:
+            from strands_robots.dashboard import agent_hitl
+        except ImportError:
+            return False
+        return bool(agent_hitl.consume_grant(self.tool_name_str, tool_input))
+
+    def _gate_motion(
+        self, action: str, tool_input: Mapping[str, Any], tool_use: ToolUse, invocation_state: Mapping[str, Any]
+    ) -> str | None:
+        """Operator approval for one ``execute``/``start``, before it is dispatched.
+
+        An ``AgentTool`` receives no ``tool_context`` argument; the SDK builds
+        one from the invoking agent for decorated tools, and this builds the
+        same object from the same two inputs so the shared gate can raise the
+        same interrupt. With no agent in ``invocation_state`` (a direct call,
+        a headless script) there is no operator to ask and the gate refuses.
+
+        Args:
+            action: ``"execute"`` or ``"start"``.
+            tool_input: The tool's input dict, shown to the operator and used to
+                match a dashboard grant.
+            tool_use: The tool-use request carrying ``toolUseId``.
+            invocation_state: The agent runtime's kwargs; ``"agent"`` when the
+                call came through an :class:`strands.Agent`.
+
+        Returns:
+            A refusal message, or None to let the dispatch proceed.
+
+        Raises:
+            InterruptException: When the operator has not answered yet; the
+                caller turns it into a ``ToolInterruptEvent`` exactly as the
+                SDK does for a decorated tool.
+        """
+        if self._dashboard_grant(tool_input):
+            return None
+        agent = invocation_state.get("agent")
+        tool_context: ToolContext | None = None
+        if agent is not None:
+            tool_context = ToolContext(tool_use=tool_use, agent=agent, invocation_state=dict(invocation_state))
+        instruction = str(tool_input.get("instruction", ""))
+        provider = tool_input.get("policy_provider", "groot")
+        host = tool_input.get("policy_host", "localhost")
+        port = tool_input.get("policy_port")
+        # ``tool`` is the fixed word "robot" so the interrupt id and the audit
+        # source read the same for every robot; the target names which one.
+        return gate_motion(
+            "robot",
+            action,
+            self.tool_name_str,
+            f"{action!r} drives the real robot {self.tool_name_str!r} with {instruction!r} "
+            f"(policy {provider} at {host}:{port}); it needs operator approval before it is dispatched.",
+            tool_context,
+            allow_env=COMMAND_ALLOW_ENV,
+            allow_match=lambda allowed: "*" in allowed or action in allowed,
+        )
+
     async def stream(
         self, tool_use: ToolUse, invocation_state: dict[str, Any], **kwargs: Any
-    ) -> AsyncGenerator[ToolResultEvent, None]:
+    ) -> AsyncGenerator[ToolResultEvent | ToolInterruptEvent, None]:
         """Stream robot task execution with async actions."""
         try:
             tool_use_id = tool_use.get("toolUseId", "")
@@ -2825,14 +2975,34 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for execute action"}],
+                                "content": [{"text": "instruction is required for execute action"}],
                             },
+                        )
+                    )
+                    return
+
+                # Ask the operator before anything is dispatched: a refused or
+                # unanswered call is exactly as inert as one that never happened.
+                try:
+                    refusal = self._gate_motion(action, input_data, tool_use, invocation_state)
+                except InterruptException as exc:
+                    yield ToolInterruptEvent(tool_use, [exc.interrupt])
+                    return
+                if refusal is not None:
+                    yield ToolResultEvent(
+                        self._make_tool_result(
+                            tool_use_id,
+                            {"status": "error", "content": [{"text": f"{self.tool_name_str}: {refusal}"}]},
                         )
                     )
                     return
@@ -2849,14 +3019,32 @@ class Robot(TeleopMixin, AgentTool):
                 policy_provider = input_data.get("policy_provider", "groot")
                 duration = input_data.get("duration", 30.0)
 
-                if not instruction or not policy_port:
+                # Only ``instruction`` is judged here. Whether a ``policy_port``
+                # is missing, unusable or unread is the named provider's call
+                # (``mock`` and ``lerobot_local`` build without one), and the
+                # dispatcher below asks :meth:`_policy_port_error` that.
+                if not instruction:
                     yield ToolResultEvent(
                         self._make_tool_result(
                             tool_use_id,
                             {
                                 "status": "error",
-                                "content": [{"text": "instruction and policy_port are required for start action"}],
+                                "content": [{"text": "instruction is required for start action"}],
                             },
+                        )
+                    )
+                    return
+
+                try:
+                    refusal = self._gate_motion(action, input_data, tool_use, invocation_state)
+                except InterruptException as exc:
+                    yield ToolInterruptEvent(tool_use, [exc.interrupt])
+                    return
+                if refusal is not None:
+                    yield ToolResultEvent(
+                        self._make_tool_result(
+                            tool_use_id,
+                            {"status": "error", "content": [{"text": f"{self.tool_name_str}: {refusal}"}]},
                         )
                     )
                     return
@@ -2999,6 +3187,14 @@ class Robot(TeleopMixin, AgentTool):
 
     def __del__(self) -> None:
         """Destructor to ensure cleanup."""
+        if not hasattr(self, "_shutdown_event"):
+            # ``__init__`` refused a kwarg (``action_horizon``,
+            # ``control_frequency``) before the executor and this latch were
+            # created, so the instance holds nothing to release. ``cleanup()``
+            # would raise on the first attribute it never reached and log that
+            # name as a cleanup failure beside the ValueError the caller was
+            # owed. A bring-up that fails after this point still cleans up.
+            return
         try:
             self.cleanup()
         except Exception:
