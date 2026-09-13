@@ -196,11 +196,11 @@ POWER_STATES: tuple[str, ...] = ("battery", "charging", "charged", "low_power", 
 #: One block is one CRTP packet, and ``cflib`` refuses a block whose fetched
 #: bytes exceed ``LogConfig.MAX_LEN`` (26; the other four of the 30-byte
 #: payload are the block id and the timestamp) with ``AttributeError`` at
-#: ``add_config``. Eight variables all fetched as ``float`` would be 29 bytes,
-#: so the attitude is fetched as ``FP16`` - the type ``cflib`` provides for
-#: fitting a block into its packet - which keeps the position and the battery
-#: voltage at full width and lands the block at 23 bytes.
-#: :data:`LOG_VARIABLE_BYTES` is the size table a test grades this against.
+#: ``add_config``. Fetching the attitude as ``float`` alongside the position
+#: put this block at 29 bytes, so the attitude is fetched as ``FP16`` - the
+#: type ``cflib`` provides for fitting a block into its packet - which keeps
+#: the position and the battery voltage at full width and lands the block at
+#: 23 bytes.
 LOG_VARIABLES: tuple[tuple[str, str], ...] = (
     ("stateEstimate.x", "float"),
     ("stateEstimate.y", "float"),
@@ -211,15 +211,6 @@ LOG_VARIABLES: tuple[tuple[str, str], ...] = (
     ("pm.vbat", "float"),
     ("pm.state", "uint8_t"),
 )
-
-#: Fetched width in bytes of each ``fetch_as`` type :data:`LOG_VARIABLES` uses,
-#: transcribed from ``cflib.crazyflie.log.LogTocElement.types`` so the budget is
-#: gradable without the GPL dependency installed.
-LOG_VARIABLE_BYTES: dict[str, int] = {"uint8_t": 1, "FP16": 2, "float": 4}
-
-#: ``cflib.crazyflie.log.LogConfig.MAX_LEN``: the most fetched bytes one log
-#: block may carry.
-LOG_BLOCK_MAX_BYTES = 26
 
 #: Name of the telemetry log block, and its period.
 _LOG_NAME = "strands_state"
