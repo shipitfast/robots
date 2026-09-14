@@ -723,7 +723,7 @@ class LerobotLocalPolicy(Policy):
             logger.warning(
                 "LerobotLocalPolicy ignoring unexpected constructor kwarg(s) %s; "
                 "loading %s. See the LerobotLocalPolicy signature for the "
-                "options this provider reads (RTC is rtc_enabled=, not rtc=).",
+                "options this provider reads.",
                 sorted(ignored_kwargs),
                 pretrained_name_or_path or "no checkpoint yet",
             )

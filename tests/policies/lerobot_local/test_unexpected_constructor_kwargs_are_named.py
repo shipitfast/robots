@@ -21,8 +21,15 @@ def test_unexpected_constructor_kwargs_warn_not_raise(caplog: pytest.LogCaptureF
     with caplog.at_level(logging.WARNING):
         policy = LerobotLocalPolicy(rtc=True)
     assert isinstance(policy, LerobotLocalPolicy)
-    assert any("ignoring unexpected constructor kwarg" in r.message for r in caplog.records), caplog.text
-    assert "rtc" in caplog.text
+    named = [r for r in caplog.records if "ignoring unexpected constructor kwarg" in r.message]
+    assert len(named) == 1, caplog.text
+    # Grade the key off the record's own argument rather than searching the
+    # rendered text: prose that happens to contain the probe key satisfies a
+    # caplog.text search whatever the key list rendered as, which is the half
+    # this file is named for.
+    args = named[0].args
+    assert isinstance(args, tuple), args
+    assert args[0] == ["rtc"], caplog.text
 
 
 def test_known_kwargs_raise_no_warning(caplog: pytest.LogCaptureFixture) -> None:
