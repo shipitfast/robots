@@ -801,19 +801,37 @@ class EarthRoverDriver:
         moved = self.send_action({"linear": linear, "angular": angular})
         if duration_s is None or moved["status"] != "success":
             return moved
-        deadline = time.monotonic() + float(duration_s)
+        hold_start = time.monotonic()
+        deadline = hold_start + float(duration_s)
+        refresh_failed = False
         while (remaining := deadline - time.monotonic()) > 0:
             time.sleep(min(MOVE_REFRESH_PERIOD_S, remaining))
             if remaining <= MOVE_REFRESH_PERIOD_S:
                 break
-            if self.send_action({"linear": linear, "angular": angular})["status"] != "success":
+            refresh_result = self.send_action({"linear": linear, "angular": angular})
+            if refresh_result["status"] != "success":
+                refresh_failed = True
                 break
+        held_s = round(time.monotonic() - hold_start, 6)
         stopped = self.stop_task()
         outcome = {
             "commanded": moved["content"][0]["json"].get("commanded"),
-            "held_s": float(duration_s),
+            "held_s": held_s,
             "stopped": stopped["status"] == "success",
         }
+        if refresh_failed:
+            return {
+                "status": "error",
+                "content": [
+                    {
+                        "text": (
+                            f"move: a mid-hold refresh failed at {held_s:.2f}s of a "
+                            f"{float(duration_s):.1f}s hold - the rover was stopped early"
+                        )
+                    },
+                    {"json": outcome},
+                ],
+            }
         if stopped["status"] != "success":
             return {
                 "status": "error",
