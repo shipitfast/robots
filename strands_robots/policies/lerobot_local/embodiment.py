@@ -25,11 +25,12 @@ support ``_extends`` inheritance + ``aliases`` (same loader shape as
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import math
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,47 @@ def reconcile_dim(values: list[float], expected_dim: int, dim_policy: str, *, la
             raise ValueError(f"{label} dim {n} > model expected {expected_dim}; cannot pad. Use dim_policy='truncate'.")
         return values + [0.0] * (expected_dim - n)
     raise ValueError(f"Unknown dim_policy {dim_policy!r}; expected 'strict'|'pad'|'truncate'.")
+
+
+# Unit frames
+
+# The closed unit-frame vocabulary this module can convert between. Every
+# conversion site compares against "degrees" (sim_state_to_model,
+# model_action_to_sim, PackStateProcessorStep.observation), so a spelling outside
+# this set means "no conversion" -- which is why both holders of a frame refuse
+# one instead of storing it.
+UNIT_FRAMES: frozenset[str] = frozenset({"native", "degrees"})
+
+
+def _require_unit_frame(frame: str, *, field_name: str, owner: str) -> None:
+    """Refuse a unit frame no conversion site can honor.
+
+    A frame is held in two places: :class:`EmbodimentMap` declares it, and the
+    ``strands_pack_state`` pipeline step is handed it - directly by
+    :meth:`~strands_robots.policies.lerobot_local.processor.ProcessorBridge.apply_embodiment`
+    from a graded map, but also by LeRobot's own ``from_pretrained``, which
+    rebuilds the step from the ``policy_preprocessor.json`` a checkpoint ships.
+    One refusal, called from both, so the reconstructed step is graded like the
+    map that normally fills it.
+
+    Args:
+        frame: The declared frame.
+        field_name: Name of the field being graded, quoted in the message.
+        owner: What declared it, quoted in the message.
+
+    Raises:
+        ValueError: ``frame`` is outside :data:`UNIT_FRAMES`.
+    """
+    if frame in UNIT_FRAMES:
+        return
+    raise ValueError(
+        f"{owner}: {field_name}={frame!r} is not a unit frame this module can convert; "
+        f"expected one of {sorted(UNIT_FRAMES)}. Every conversion site compares against "
+        f"'degrees', so another spelling (LeRobot's own 'DEGREES', say) silently means "
+        f"'native': the sim's raw radians reach a degrees-trained checkpoint unconverted, "
+        f"and its degree actions saturate the sim's radian joint limits. dim_policy is "
+        f"refused the same way by reconcile_dim."
+    )
 
 
 def _convert_joint_vector(
@@ -681,7 +723,9 @@ def register_pack_state_step() -> type | None:
                 or ``"degrees"`` (convert the sim's radian joints to the model's
                 training units before packing). Mirrors
                 :attr:`EmbodimentMap.state_units`, which is where this step's
-                value comes from.
+                value normally comes from; a frame outside :data:`UNIT_FRAMES`
+                is refused by :meth:`__post_init__`, so a step LeRobot rebuilds
+                from a saved pipeline is graded like the map.
             gripper_index: Column of the gripper inside ``state_keys``, which
                 speaks ``RANGE_0_100`` rather than degrees. ``-1`` (the default)
                 = no distinct gripper column.
@@ -724,6 +768,14 @@ def register_pack_state_step() -> type | None:
         # The caller's list, written (not replaced) with the declared keys this
         # step zero-filled, so the policy can report the degradation it packed.
         missing_keys_sink: list[str] = field(default_factory=list)
+
+        def __post_init__(self) -> None:
+            """Refuse a ``state_units`` frame :meth:`observation` cannot honor.
+
+            Raises:
+                ValueError: ``state_units`` is outside :data:`UNIT_FRAMES`.
+            """
+            _require_unit_frame(self.state_units, field_name="state_units", owner="strands_pack_state step")
 
         def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
             """Compose the declared scalar joint keys into ``observation.state`` (passthrough when already packed)."""
@@ -833,12 +885,33 @@ def register_pack_state_step() -> type | None:
             return out
 
         def get_config(self) -> dict[str, Any]:
-            """Return the JSON-serializable config (``state_keys``, ``expected_dim``, ``dim_policy``) for checkpoint round-trip."""
-            return {
-                "state_keys": list(self.state_keys),
-                "expected_dim": self.expected_dim,
-                "dim_policy": self.dim_policy,
-            }
+            """Return the JSON-serializable config for LeRobot's checkpoint round-trip.
+
+            Every field this step READS at runtime is emitted, so a pipeline
+            that is saved and reloaded packs the same vector. The unit frame
+            (``state_units``, ``gripper_index``, ``gripper_joint_range``,
+            ``joint_mids``) and the ``strict_keys`` posture were dropped here,
+            and LeRobot rehydrates a registered step from exactly this dict - so
+            a reloaded ``"degrees"`` pipeline silently packed raw sim radians
+            where the checkpoint was trained on mid-centered degrees, and a
+            declared key the observation did not carry was zero-filled instead of
+            refused.
+
+            ``missing_keys_sink`` is excluded: it is the POLICY's list, passed in
+            so a degradation this step absorbs is visible to the envelope the
+            caller gates on. It is a live object rather than configuration, and
+            whoever rebuilds the step hands it a fresh one.
+            """
+            config: dict[str, Any] = {}
+            for spec in fields(self):
+                if spec.name == "missing_keys_sink":
+                    continue
+                value = getattr(self, spec.name)
+                # Copy the mutable ones: the config is handed to a serializer
+                # (and, on from_pretrained, to another step) that must not alias
+                # this step's lists.
+                config[spec.name] = list(value) if isinstance(value, list) else value
+            return config
 
         def transform_features(self, features):  # type: ignore[no-untyped-def]
             """Return ``features`` unchanged: packing reshapes only the runtime obs, not the model's declared feature set."""
@@ -870,7 +943,9 @@ class EmbodimentMap:
         state_units: Unit convention of the sim state vector this map packs:
             ``"native"`` (the default - no conversion) or ``"degrees"`` (arm
             columns in degrees, gripper column in ``RANGE_0_100``), which is
-            what :meth:`sim_state_to_model` converts from.
+            what :meth:`sim_state_to_model` converts from. Those two are the
+            whole vocabulary (:data:`UNIT_FRAMES`); any other spelling is
+            refused by :meth:`__post_init__`.
         action_units: Unit convention of the model's action vector, same
             vocabulary as ``state_units``. On ``"degrees"``
             :meth:`model_action_to_sim` converts the model's degrees back to sim
@@ -932,6 +1007,16 @@ class EmbodimentMap:
     # (RANGE_0_100). Empty (default) = mid 0, i.e. sim qpos=0 is assumed to be
     # the calibration mid (the prior absolute-degrees behavior).
     joint_mids: list[float] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        """Refuse a unit frame no conversion site can honor.
+
+        Raises:
+            ValueError: ``state_units`` or ``action_units`` names a frame outside
+                :data:`UNIT_FRAMES`.
+        """
+        for attr in ("state_units", "action_units"):
+            _require_unit_frame(getattr(self, attr), field_name=attr, owner=f"embodiment {self.name!r}")
 
     def validate(self, input_features: dict[str, Any], output_features: dict[str, Any]) -> None:
         """Fail-fast validation against the model's declared features.
@@ -1038,6 +1123,13 @@ _CONFIG_FILE = Path(__file__).parent / "embodiments.json"
 def _resolve(name: str, definitions: dict) -> EmbodimentMap:
     """Resolve a definition name to an :class:`EmbodimentMap`, following ``_extends``.
 
+    A child inherits EVERY field the parent declares except ``name`` (its own),
+    read off :func:`dataclasses.fields` rather than a hand-written list, so a
+    field added to :class:`EmbodimentMap` later cannot silently fail to be
+    inherited and leave the child in the default unit frame while the parent
+    declares ``degrees``. Each value is copied so a child never shares the
+    parent's mutable container. Keys the child declares win.
+
     Keys beginning with a double underscore (e.g. ``__note__``, ``__doc__``) are
     treated as human-facing documentation/metadata and are stripped before
     constructing the dataclass, so the JSON can carry inline provenance notes
@@ -1047,10 +1139,7 @@ def _resolve(name: str, definitions: dict) -> EmbodimentMap:
     if "_extends" in definition:
         parent = _resolve(definition["_extends"], definitions)
         merged: dict[str, Any] = {
-            "obs_rename": dict(parent.obs_rename),
-            "state_keys": list(parent.state_keys),
-            "action_keys": list(parent.action_keys),
-            "dim_policy": parent.dim_policy,
+            f.name: copy.copy(getattr(parent, f.name)) for f in fields(parent) if f.name != "name"
         }
         for k, v in definition.items():
             if k != "_extends" and not k.startswith("__"):
@@ -1113,6 +1202,7 @@ def load_embodiment(embodiment: str | EmbodimentMap | dict) -> EmbodimentMap:
 __all__ = [
     "EmbodimentMap",
     "EMBODIMENT_MAP",
+    "UNIT_FRAMES",
     "ZeroActionMonitor",
     "diagnose_action_dim",
     "load_embodiment",

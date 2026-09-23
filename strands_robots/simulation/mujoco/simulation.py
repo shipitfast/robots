@@ -88,6 +88,7 @@ from strands_robots.simulation.base import (
     own_keyword_names,
     reject_misspelled_kwargs,
     reject_setup_kwargs,
+    unknown_model_msg,
 )
 from strands_robots.simulation.ik import (
     GRIPPER_BODY_HINTS,
@@ -507,6 +508,18 @@ def _resolve_policy_stop_timeout(policy_stop_timeout: float | None, default: flo
 # when the caller gives no per-robot override. Single-sourced so the signature
 # default and the per-robot mapping fallback cannot drift apart.
 _DEFAULT_ACTION_HORIZON = 8
+
+# Vertical seating of a floating base on terrain
+# (:meth:`MuJoCoSimEngine._seat_floating_bases_on_terrain`). A long geom can be
+# buried at more than one point, so clearing the deepest reveals the next and the
+# lift is iterated: measured, every floating-base asset in the registry is clear
+# within 3 passes on all four terrain kinds at difficulty 2.0, and a synthetic
+# leg buried 180 mm inside the heightfield prism takes 5. The tolerance is the
+# residual that ends it - a tenth of a millimetre, two orders below the contact
+# softness MuJoCo resolves in one step, because the lift converges on the
+# surface rather than landing exactly on it.
+_MAX_SEAT_PASSES = 8
+_SEAT_TOLERANCE_M = 1e-4
 
 
 # The ``create_world`` parameters a LIVE world can still adopt, paired with the
@@ -1375,10 +1388,13 @@ class MuJoCoSimEngine(
         effect) and must be a finite value ``> 0``.
 
         A floating-base robot added to a terrain world is spawned SEATED on
-        the local terrain surface (its base is raised by the heightfield
-        height beneath it) at ``add_robot`` and on every ``reset()``, rather
-        than at the flat-ground keyframe height that would leave its feet
-        buried below the raised terrain.
+        the local terrain surface at ``add_robot`` and on every ``reset()``,
+        rather than at the flat-ground keyframe height that would leave its feet
+        buried below the raised terrain. The seat is MEASURED: the base is raised
+        by the heightfield height beneath it and then by the depth its own geoms
+        are still inside the ground, because the surface under the base is not
+        the surface under a foot 0.3 m away and a model's flat pose does not
+        always clear ``z=0`` to begin with.
 
         A world can only be built once: a second call while one is live is
         refused rather than rebuilding under the live scene (``Robot("so101")``
@@ -2056,127 +2072,18 @@ class MuJoCoSimEngine(
     def _unknown_model_msg(requested: str) -> str:
         """Build the 'model could not be resolved' error for a robot name.
 
-        Three conditions reach this message and they have different remedies, so
-        it diagnoses which one it is instead of reporting them all as a bad name:
-
-        * The registry does not know ``requested`` - a typo or an unknown robot.
-          Names the closest sim-loadable registry keys via
-          :func:`close_match_hint` so the caller can fix it in place without a
-          discovery round-trip. The pool is deliberately the ``mode="sim"``
-          listing rather than the whole registry: a suggestion this engine
-          cannot spawn sends the caller straight back here, and the registry
-          holds hardware-only entries close enough to be suggested (the sole
-          suggestion offered for ``earthrover`` was ``hope_jr``, which is itself
-          hardware-only, so the one remedy on offer reproduced the same
-          refusal). ``close_match_hint`` already drops a suggestion identical to
-          ``requested`` for the same reason - it carries no information and
-          displaces a real one out of the three slots.
-        * The registry knows ``requested`` and the entry declares a hardware
-          backend and no simulation asset - a real robot strands drives over
-          LeRobot that has no model to load. The name is already correct, so
-          spelling suggestions are the wrong advice here too; names the hardware
-          entry point instead, the way
-          :func:`~strands_robots.robot.Robot` already answers a leader-arm name
-          with the teleoperator entry point rather than the registry listing.
-        * The registry knows ``requested`` and its model XML is simply not on
-          disk. Here the name is already correct, so spelling suggestions are
-          the wrong advice - ``difflib`` ranks an exact match first, so this was
-          the one case that got told "Did you mean: <the name it just
-          refused>". Names the asset path the resolver looked for and the
-          remedy, split on the entry's own ``auto_download`` posture: an entry
-          with ``auto_download: false`` is never fetched automatically (the
-          asset has to be placed by hand), any other entry had a download
-          attempted by :func:`~strands_robots.assets.manager.resolve_model_path`
-          before it gave up, so retrying it through the ``download_assets``
-          tool is what surfaces why. Mirrors the registration-time wording in
-          :func:`~strands_robots.registry.user_registry.register_robot`, which
-          already reports a missing asset directory this way.
-
-        Suggestions and the asset probe are both best-effort: a registry that
-        cannot be read degrades to the bare form rather than propagating.
+        Delegates to :func:`~strands_robots.simulation.base.unknown_model_msg`,
+        which owns the wording. The three-way diagnosis this used to spell out
+        inline moved there unchanged when the Isaac backend became a second
+        caller: the message explains why
+        :func:`~strands_robots.simulation.model_registry.resolve_model` returned
+        ``None``, which is a property of the registry rather than of this engine,
+        and two inline copies is how two backends come to diagnose one registry
+        differently. The default discovery hint is this backend's own
+        ``action='list_urdfs'``, so the text is byte-identical to what this
+        method returned before.
         """
-        known: list[str] = []
-        try:
-            from strands_robots.registry import list_robots as _list_robots
-
-            # mode="sim" so a suggestion is a name this engine can actually
-            # spawn. A user model added through ``register_urdf`` is absent from
-            # every ``list_robots`` mode, so narrowing the pool drops nothing
-            # that was suggestable before.
-            known = [r.get("name", "") for r in _list_robots(mode="sim") if r.get("name")]
-        except Exception:  # noqa: BLE001 - suggestions are best-effort
-            known = []
-
-        # Probed independently of the suggestion list so an unreadable registry
-        # listing cannot mask the more specific diagnosis, and vice versa.
-        asset_gap: tuple[str, str, str, bool, list[str]] | None = None
-        hardware_only: tuple[str, str] | None = None
-        try:
-            from strands_robots.assets.manager import get_search_paths, is_robot_asset_present
-            from strands_robots.registry import get_robot as _get_robot
-            from strands_robots.registry import resolve_name as _resolve_name
-
-            # ``requested`` may be an alias; resolve to the canonical key the
-            # asset entry hangs off. No type test on ``requested`` here - a name
-            # that cannot be a registry key raises and is caught, which keeps
-            # the availability listing above ungated on the name's type.
-            canonical = _resolve_name(requested)
-            entry = ((_get_robot(canonical) or {}) if canonical else {}) or {}
-            asset = entry.get("asset") or {}
-            if asset and not is_robot_asset_present(canonical):
-                asset_gap = (
-                    canonical,
-                    str(asset.get("dir", "")),
-                    str(asset.get("model_xml", "")),
-                    asset.get("auto_download") is False,
-                    [str(path) for path in get_search_paths()],
-                )
-            elif entry and not asset:
-                # Registered, correct, and simply not a simulation robot. The
-                # LeRobot type is what the hardware route is keyed on, so it is
-                # quoted when the entry declares one.
-                hardware_only = (canonical, str((entry.get("hardware") or {}).get("lerobot_type") or ""))
-        except Exception:  # noqa: BLE001 - the diagnosis is best-effort
-            asset_gap = None
-            hardware_only = None
-
-        if asset_gap is not None:
-            canonical, asset_dir, model_xml, never_downloads, search_paths = asset_gap
-            relative = f"{asset_dir}/{model_xml}"
-            searched = ", ".join(f"'{path}'" for path in search_paths)
-            msg = (
-                f"Robot '{requested}' is registered but its model file is not on disk: "
-                f"no '{relative}' under {searched}."
-                if search_paths
-                else (
-                    f"Robot '{requested}' is registered but its model file is not on disk "
-                    f"(expected '{relative}' on an asset search path)."
-                )
-            )
-            if never_downloads:
-                msg += (
-                    f" This entry declares auto_download=false, so its asset is never fetched "
-                    f"automatically - create that directory and place '{model_xml}' inside it."
-                )
-            else:
-                msg += f" Fetch it with the download_assets tool (robots='{canonical}')."
-            return msg
-
-        if hardware_only is not None:
-            canonical, lerobot_type = hardware_only
-            typed = f" (LeRobot type '{lerobot_type}')" if lerobot_type else ""
-            return (
-                f"Robot '{requested}' is registered for real hardware only{typed}: its registry "
-                f"entry declares no simulation asset, so there is no model to load. The name is "
-                f"already correct, so there is no spelling to fix - drive it as hardware with "
-                f"Robot('{canonical}', mode='real'), or pass urdf_path= to supply a model of your "
-                f"own. Use list_robots(mode='sim') to see the robots this backend can spawn."
-            )
-
-        msg = f"No model found for '{requested}'."
-        msg += close_match_hint(requested, known)
-        msg += " Use action='list_urdfs' to see all available robots."
-        return msg
+        return unknown_model_msg(requested)
 
     def _unknown_object_msg(self, requested: object) -> str:
         """Actionable 'object not found' message: name it, offer a close-match,
@@ -3213,9 +3120,13 @@ class MuJoCoSimEngine(
         in the ground, with penetration that grows with the curriculum
         ``difficulty`` -- contradicting the terrain feature's stated purpose of
         spawning a locomotion robot ON non-flat ground. Offset each floating
-        base's ``z`` by the terrain height beneath its ``(x, y)`` so it is
-        seated on the surface (feet just clear of it), the correct initial
-        state for a locomotion policy and a terrain-difficulty curriculum.
+        base's ``z`` by the terrain height beneath its ``(x, y)``, then by the
+        depth its geoms are still buried by (:meth:`_ground_burial_depth`), so it
+        is seated ON the surface - the correct initial state for a locomotion
+        policy and a terrain-difficulty curriculum. The height under the base is
+        not the height under a foot, and a real asset's flat pose does not always
+        clear ``z=0``, so the height sample alone left every floating-base robot in
+        the registry measurably buried.
 
         A flat ground plane (``_ground_height_at`` returns ``0.0``) is a no-op,
         so non-terrain worlds are byte-for-byte unchanged; a fixed-base arm (no
@@ -3247,6 +3158,78 @@ class MuJoCoSimEngine(
             ground = self._ground_height_at(float(data.qpos[adr]), float(data.qpos[adr + 1]))
             if ground:
                 data.qpos[adr + 2] = float(data.qpos[adr + 2]) + ground
+            # That offset reads the surface under the BASE and assumes the
+            # model's flat pose already clears ``z=0`` -- neither holds for a
+            # real asset. A foot 0.2 m out stands on a different part of a
+            # ``rough`` heightfield than the base does, and an asset authored
+            # for a recessed floor (LeKiwi's wheels sit 34.6 mm below its root
+            # body) or spawned in its straight-legged zero pose (Unitree A1:
+            # 120 mm) does not clear flat ground to begin with. Both leave the
+            # robot buried after the offset, which is what this seat exists to
+            # prevent, so lift by the depth its own geoms are MEASURED to be
+            # buried by. Zero for a robot already clear of the surface, so a
+            # model authored to rest on it keeps its pose exactly.
+            for _ in range(_MAX_SEAT_PASSES):
+                buried = self._ground_burial_depth(int(model.jnt_bodyid[jid]))
+                if buried <= _SEAT_TOLERANCE_M:
+                    break
+                data.qpos[adr + 2] = float(data.qpos[adr + 2]) + buried
+
+    def _ground_burial_depth(self, base_body: int) -> float:
+        """Vertical lift (metres, ``>= 0``) that takes ``base_body``'s tree out of the ground.
+
+        Reads MuJoCo's own contact solve rather than a height sample, so the
+        answer covers every collidable geom the base carries wherever it stands.
+        Each contact between one of those geoms and a ground geom (the terrain
+        ``<hfield>``, or a ``<plane>``) contributes the lift IT needs, and the
+        largest wins:
+
+        * its penetration depth ``-dist``, the vertical need for a contact whose
+          normal points up (a foot resting into a plateau);
+        * the surface height above the contact POINT, for a contact whose normal
+          is horizontal - a geom inside the heightfield prism, pushed sideways
+          out of a bump's wall, whose ``dist`` says nothing about how far DOWN it
+          is. The Unitree A1's straight-legged spawn puts all four calves there:
+          ``dist`` -24.3 mm with ``normal_z`` 0.000, while the surface stands
+          64-87 mm above the contact point.
+
+        Ownership is by ``body_rootid``, not by namespace: a free-jointed task
+        object shipped inside the robot's own MJCF (a payload, a kick ball, a
+        Menagerie grasping cube) is its OWN kinematic root, and moving the base
+        does not move it - so its burial is not the base's to answer for, the
+        same distinction
+        :meth:`~strands_robots.simulation.mujoco.rendering.RenderingMixin._robot_free_base_joint_id`
+        draws when it names the base in the first place.
+
+        ``0.0`` when nothing of that tree is inside the ground, including when it
+        rests inside the margin band, where a contact is generated with a
+        POSITIVE ``dist`` and the geom is above the surface rather than in it.
+
+        Requires the caller's model lock, and runs ``mj_forward`` itself because
+        the contact list has to reflect the base pose written a moment earlier.
+        """
+        mj = self._mj
+        world = self._world
+        if world is None or world._model is None or world._data is None:
+            return 0.0
+        model, data = world._model, world._data
+        mj.mj_forward(model, data)
+        ground_types = (int(mj.mjtGeom.mjGEOM_HFIELD), int(mj.mjtGeom.mjGEOM_PLANE))
+        root = int(model.body_rootid[base_body])
+        lift = 0.0
+        for con in data.contact[: int(data.ncon)]:
+            pair = (int(con.geom1), int(con.geom2))
+            on_ground = [g for g in pair if int(model.geom_type[g]) in ground_types]
+            if len(on_ground) != 1:  # neither side is ground, or both are
+                continue
+            other = pair[1] if on_ground[0] == pair[0] else pair[0]
+            if int(model.body_rootid[model.geom_bodyid[other]]) != root:
+                continue  # another robot, a world object, or a carried prop
+            if float(con.dist) >= 0.0:  # in the margin band, not in the ground
+                continue
+            x, y, z = (float(v) for v in con.pos)
+            lift = max(lift, -float(con.dist), self._ground_height_at(x, y) - z)
+        return lift
 
     def remove_robot(self, name: str) -> dict[str, Any]:
         """Remove a robot and every element it injected (bodies, actuators,
