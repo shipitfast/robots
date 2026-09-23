@@ -13,7 +13,13 @@ import importlib
 import inspect
 import re
 
-from strands_robots.tools.lerobot_teleoperate import lerobot_teleoperate
+import pytest
+
+# The tool module reaches psutil, which ships with the [lerobot] extra, so a
+# venv without it must skip this module rather than error while collecting it.
+pytest.importorskip("psutil")
+
+from strands_robots.tools.lerobot_teleoperate import lerobot_teleoperate  # noqa: E402
 
 # The package's lazy ``__getattr__`` hands back the tool for this name, so the
 # module itself has to be imported by path.
