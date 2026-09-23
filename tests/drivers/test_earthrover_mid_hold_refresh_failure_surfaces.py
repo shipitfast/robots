@@ -90,15 +90,13 @@ def test_mid_hold_refresh_failure_reports_true_elapsed_time(
 
     # The answer MUST be an error - the hold was cut short.
     assert answer["status"] == "error", (
-        "A failed mid-hold refresh must surface as status='error', "
-        "not silently report a completed hold"
+        "A failed mid-hold refresh must surface as status='error', not silently report a completed hold"
     )
 
     outcome = answer["content"][-1]["json"]
     # The true hold should be much less than the requested 10 s.
     assert outcome["held_s"] < 10.0, (
-        f"held_s should reflect the true elapsed time, not the requested duration; "
-        f"got {outcome['held_s']}"
+        f"held_s should reflect the true elapsed time, not the requested duration; got {outcome['held_s']}"
     )
     # The stop should still have been sent (early but intentional).
     assert outcome["stopped"] is True
@@ -106,9 +104,7 @@ def test_mid_hold_refresh_failure_reports_true_elapsed_time(
     assert fail_on_second_refresh.posts[-1] == STOP
 
 
-def test_successful_hold_reports_true_elapsed_time(
-    clock: _FakeClock, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_successful_hold_reports_true_elapsed_time(clock: _FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
     """A successful 10 s hold reports held_s close to 10.0, not some other value."""
 
     class _OkSession:
