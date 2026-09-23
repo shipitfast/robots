@@ -10,7 +10,10 @@ Two properties of ``strands_robots``, both read from the source by
   ``KNOWN_DEFERRED_UPWARD_EDGES``. Each pin is an equality, so an inversion
   added to the package fails until someone declares it, and an inversion removed
   from the package fails until someone deletes its line. The rosters are
-  ratchets, not suppression lists.
+  ratchets, not suppression lists. Both grade an edge by the layers of its
+  two ends, so no module may import the package root, which has no layer:
+  ``TestTheContract`` pins that too, or a public name read off the facade
+  would be a dependency neither roster can see.
 
 The two properties grade different import kinds because they measure different
 things. Acyclicity is about import-time mechanics, so typing-only imports
@@ -27,6 +30,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -174,14 +178,45 @@ class TestTheContract:
         """The same ratchet over the inversions the one above cannot see.
 
         Deferring an import moves when the dependency is paid, not whether it
-        exists, so an inversion inside a function body is an inversion. Twelve
-        survive the runtime roster being empty, which is why "no upward edges"
-        needs this cell to mean what it sounds like.
+        exists, so an inversion inside a function body is an inversion. The ones
+        that survive the runtime roster being empty are declared pair by pair,
+        which is why "no upward edges" needs this cell to mean what it sounds
+        like.
         """
         found = set(mod.upward_edges(graph, "late"))
         declared = set(mod.KNOWN_DEFERRED_UPWARD_EDGES)
         assert sorted(found - declared) == [], "undeclared deferred inversion; fix it or declare it"
         assert sorted(declared - found) == [], "declared deferred inversion is gone; delete its line"
+
+    def test_no_module_reaches_a_public_name_off_the_package_root(self, graph: Any) -> None:
+        """The facade is not a back door around the two rosters above.
+
+        ``layer_of`` answers ``None`` for the package root - it re-exports names
+        from every layer, so it belongs to none - and :func:`upward_edges` skips
+        an edge whose end has no layer. So an import of the root is graded by
+        neither equality: planting ``strands_robots.utils`` (``core``) ->
+        ``strands_robots`` leaves ``upward_edges`` empty, while 20 of the 46
+        lazily re-exported public names resolve into ``tools`` and 4 into
+        ``app``. ``from strands_robots import Robot`` in a ``core`` module is
+        therefore a dependency on ``app`` that both rosters report as absent.
+
+        Naming the defining module instead gives every internal edge two layers
+        and a direction, which is what the rosters ratchet. That the scan can
+        see the form at all is
+        :meth:`TestTheParserBehindIt.test_each_import_kind_lands_in_its_own_graph`'s
+        ``fakepkg.leaf.attrs`` row: reading an attribute off the package is the
+        only way to earn an edge to the package itself, so a submodule import
+        (``from strands_robots import _dyld``) is not one of these.
+        """
+        laundered = replace(graph, runtime={**graph.runtime, f"{mod.PACKAGE}.utils": frozenset({mod.PACKAGE})})
+        assert mod.upward_edges(laundered) == (), "an edge to the root is graded after all; this pin is redundant"
+        offenders = sorted(
+            (importer, kind)
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if mod.PACKAGE in targets
+        )
+        assert offenders == [], "reads a public name off the package root; import the module that defines it"
 
     def test_the_registry_owns_the_vocabulary_it_validates(self, graph: Any) -> None:
         """A declared field's legal values sit with the loader that refuses the rest.
@@ -205,6 +240,33 @@ class TestTheContract:
         assert offenders == [], f"the registry reaches into the driver seam: {offenders}"
         seam = "strands_robots.drivers.registry"
         assert "strands_robots.registry" in graph.runtime[seam], f"{seam} reads no registry, so this is vacuous"
+
+    def test_the_registry_reads_no_policy_to_import_one(self, graph: Any) -> None:
+        """The registry declares providers; the factory imports their classes.
+
+        ``import_policy_class`` walked ``policies.json`` and then fell back to
+        scanning ``strands_robots.policies.<name>`` for a
+        :class:`~strands_robots.policies.Policy` subclass -- ``issubclass``
+        against a class two layers above the registry, so the declarative layer
+        deferred an import of the behaviour it is meant to only describe. It
+        lives in ``policies.factory`` now, where ``Policy`` is already a
+        module-level name, and the registry answers the same question without
+        importing anything (``policy_provider_resolves``).
+
+        Graded across all three import kinds: the edge that existed was a late
+        import inside the function, which the runtime graph alone does not see.
+        """
+        offenders = sorted(
+            (importer, target)
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if importer.split(".")[:2] == ["strands_robots", "registry"]
+            for target in targets
+            if target == "strands_robots.policies" or target.startswith("strands_robots.policies.")
+        )
+        assert offenders == [], f"the registry reaches up for a policy: {offenders}"
+        factory = "strands_robots.policies.factory"
+        assert "strands_robots.registry" in graph.runtime[factory], f"{factory} reads no registry, so this is vacuous"
 
     def test_no_driver_imports_a_policy(self, graph: Any) -> None:
         """The cut this contract was first used to make, named on its own.
@@ -343,11 +405,11 @@ class TestTheContract:
         a contract stored with its first host rather than under all of them: the
         teleoperation mixin (read by the Device Connect sim driver and the MuJoCo
         ``Simulation`` as well as by ``Robot``) and the recording frame error
-        (raised in ``app``, caught by the rollout drivers a layer down).
+        (raised by the dataset writer, caught by the rollout drivers a layer
+        down).
 
-        Eight deferred edges still point into it - the recording modules the
-        roadmap itself places here, read from ``simulation``, and the mixin's
-        lerobot-deferred ``teleoperator`` read - declared in
+        The one deferred edge that still points into it - the mixin's
+        lerobot-deferred ``teleoperator`` read - is declared in
         ``KNOWN_DEFERRED_UPWARD_EDGES`` and graded by the equality above rather
         than by this cell.
         """
@@ -362,13 +424,43 @@ class TestTheContract:
                 "strands_robots.recording_errors",
                 "core",
                 frozenset(),
-                frozenset({"sim|policies", "app"}),
+                frozenset({"core", "sim|policies"}),
             ),
             (
                 "strands_robots._motion_grants",
                 "core",
                 frozenset(),
                 frozenset({"app", "tools", "dashboard"}),
+            ),
+            (
+                "strands_robots.dataset_metadata",
+                "core",
+                frozenset(),
+                frozenset({"sim|policies", "app", "tools"}),
+            ),
+            (
+                "strands_robots.dataset_source",
+                "core",
+                frozenset(),
+                frozenset({"core", "sim|policies", "tools"}),
+            ),
+            (
+                "strands_robots.streaming_dataset",
+                "core",
+                frozenset(),
+                frozenset({"sim|policies"}),
+            ),
+            (
+                "strands_robots.dataset_transfer",
+                "core",
+                frozenset(),
+                frozenset({"core", "sim|policies"}),
+            ),
+            (
+                "strands_robots.dataset_recorder",
+                "core",
+                frozenset(),
+                frozenset({"sim|policies"}),
             ),
             (
                 "strands_robots.teleop_mixin",
@@ -394,9 +486,15 @@ class TestTheContract:
                 frozenset(),
                 frozenset({"drivers|mesh", "tools"}),
             ),
+            (
+                "strands_robots.simulation.recording",
+                "sim|policies",
+                frozenset(),
+                frozenset({"sim|policies", "tools"}),
+            ),
         ],
     )
-    def test_a_contract_several_layers_share_sits_under_all_of_them(
+    def test_a_contract_sits_under_every_layer_that_reads_it(
         self,
         graph: Any,
         name: str,
@@ -409,10 +507,30 @@ class TestTheContract:
         Each row states the same three things the ``_command_gate`` pin above
         states for the operator decision. The module sits in the named layer; it
         reads nothing above that layer at import time, which is what lets it sit
-        there; and its callers span more than one layer, which is why it has to.
-        A deferred read above the layer is listed explicitly rather than allowed
-        in general - the mixin's ``teleoperator`` read is late because that module
-        imports lerobot, and promoting it to module scope has to fail here.
+        there; and its callers are the layers that need it, which is why it sits
+        under them. A deferred read above the layer is listed explicitly rather
+        than allowed in general - the mixin's ``teleoperator`` read is late
+        because that module imports lerobot, and promoting it to module scope has
+        to fail here.
+
+        The five ``dataset`` rows are one concern touched five ways: what a
+        dataset recorded (``dataset_metadata``, the ``meta/episodes`` parquet the
+        sim facade, the ``verify-dataset`` checker and the episode judge each
+        certify a run with), which directory a ``repo_id`` names and where an
+        episode's frames start (``dataset_source``), the frames streamed back out
+        of it (``streaming_dataset``), a finalized directory uploaded to a
+        storage bucket (``dataset_transfer``), and the writer that produced it
+        (``dataset_recorder``). Four of them lived with the writer in ``app``, so
+        a recording backend depended on a CLI and the sim facade's
+        ``stream_dataset`` reached up for a module no ``app`` module reads. The
+        writer is the fifth: its own imports are ``_dyld``, ``dataset_source``,
+        ``dataset_transfer``, ``recording_errors`` and ``utils`` - all ``core`` -
+        and nothing in ``app`` reads it, because a recording session exists only
+        on the three sim backends a layer below. One caller layer is enough to
+        justify a placement - ``streaming_dataset`` has exactly the sim facade,
+        the writer exactly the shared recording mixin - and the package root is
+        not a layer (``layer_of`` answers ``None`` for it), so its
+        ``TYPE_CHECKING`` re-export of a public name is not a caller here.
 
         ``rtps.participant`` is the DDS mechanics two surfaces share: the
         ``use_rtps`` tool and the ``RtpsRobot`` that drives a ROS 2 base over the
@@ -425,6 +543,14 @@ class TestTheContract:
         them the ``tools`` caller is what makes the placement load-bearing:
         moving one back up would restore the inversion, and the equality above
         would refuse it.
+
+        ``simulation.recording`` is the row where the empty deferral set is the
+        point. The lifecycle every backend mixes in still resolves the recorder
+        class inside the call, because that import is what its probe diagnoses: a
+        partial install refuses from ``start_recording`` rather than breaking
+        ``import strands_robots.simulation``. It carried the last
+        ``sim|policies -> app`` inversion until the writer moved under it, and
+        the empty set is what stops that edge returning as a deferral.
         """
         assert name in graph.modules
         assert mod.LAYER_NAMES[mod.layer_of(name)] == layer
@@ -435,10 +561,13 @@ class TestTheContract:
         late = {t for t in graph.late.get(name, frozenset()) if mod.layer_of(t) > index}
         assert late == set(deferred_above), f"{name} defers to {sorted(late)}, not {sorted(deferred_above)}"
         callers = {
-            mod.LAYER_NAMES[mod.layer_of(importer)]
+            mod.LAYER_NAMES[index]
             for kind in ("runtime", "typing_only", "late")
             for importer, targets in getattr(graph, kind).items()
             if name in targets
+            # The package root re-exports public names under TYPE_CHECKING and
+            # has no layer, which is how upward_edges reads it too.
+            if (index := mod.layer_of(importer)) is not None
         }
         assert callers == set(caller_layers), f"{name} is read from {sorted(callers)}, not {sorted(caller_layers)}"
 
