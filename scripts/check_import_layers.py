@@ -52,11 +52,17 @@ PACKAGE = "strands_robots"
 #:
 #: The placements that are a judgement rather than a reading of the tree:
 #: ``assets`` sits with ``registry`` because it resolves the asset paths the
-#: registry declares; ``streaming_dataset`` sits with ``dataset_recorder`` in
-#: ``app`` because it is the same recording concern written incrementally, while
-#: ``dataset_metadata`` sits in ``core`` because reading what a dataset recorded
-#: is a fact the sim facade, the checker and the judge each verify, where writing
-#: one is a session the app owns; and
+#: registry declares; the five dataset modules sit in ``core`` because a dataset
+#: is a contract rather than a host - ``dataset_recorder`` writes one, and
+#: reading what it recorded (``dataset_metadata``), resolving the directory a
+#: ``repo_id`` names (``dataset_source``), streaming the frames back out
+#: (``streaming_dataset``) and uploading the finished directory
+#: (``dataset_transfer``) are the other four. The writer is the one that had to
+#: be argued: no ``app`` module imports it and none holds a recording session -
+#: ``start_recording`` exists only on the three sim backends a layer below -
+#: while its own five imports are all ``core``, so keeping it in ``app`` inverted
+#: the layering for its only caller and made three core modules look like they
+#: had an ``app`` reader when that reader was the recorder. And
 #: ``teleop_mixin`` sits with ``drivers|mesh`` because it is an input-device
 #: concern shared by three hosts in three layers - the hardware ``Robot``, the
 #: MuJoCo ``Simulation`` and the Device Connect sim driver - so it belongs under
@@ -77,11 +83,15 @@ LAYERS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "_serial_discovery",
             "bus_access",
             "dataset_metadata",
+            "dataset_recorder",
+            "dataset_source",
+            "dataset_transfer",
             "episode_labels",
             "locomotion_envelope",
             "recording_errors",
             "refusal_codes",
             "rendering",
+            "streaming_dataset",
             "utils",
         ),
     ),
@@ -95,14 +105,12 @@ LAYERS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "app",
         (
             "__main__",
-            "dataset_recorder",
             "doctor",
             "hardware_observe",
             "hardware_robot",
             "hardware_ros_bridge",
             "hardware_rtps_bridge",
             "robot",
-            "streaming_dataset",
             "teleoperator",
             "verify_dataset",
         ),
@@ -134,20 +142,19 @@ KNOWN_UPWARD_EDGES: tuple[tuple[str, str], ...] = ()
 #: that module imports lerobot. Each is pinned individually in
 #: ``tests/test_import_layers_are_a_dag.py``.
 #:
-#: The rest are cuts this lane has not made. The six ``simulation`` reads of the
-#: recording modules are the roadmap's own placement of recording in ``app``
-#: (strands-labs/robots#3818), so they are debt rather than a mislabel; and
-#: ``drivers.ur`` reaches up to build a policy.
+#: The cuts left here reach up from a driver: ``drivers.ur`` builds a policy,
+#: and the twin transports (``drivers.feetech.twin``,
+#: ``drivers.yahboom_m3pro_twin``) build the MuJoCo engine they step through
+#: ``simulation.create_simulation`` - deferred to the first ``connect`` rather
+#: than imported, and taken from the simulation package rather than the driver
+#: factory, which imports the driver registry and would close a cycle around
+#: the driver each one twins.
 KNOWN_DEFERRED_UPWARD_EDGES: tuple[tuple[str, str], ...] = (
     ("strands_robots.__main__", "strands_robots.dashboard.cli"),
     ("strands_robots._hitl_audit", "strands_robots.mesh.audit"),
     ("strands_robots.drivers.ur", "strands_robots.policies"),
-    ("strands_robots.simulation.isaac.recording", "strands_robots.dataset_recorder"),
-    ("strands_robots.simulation.mujoco.recording", "strands_robots.dataset_recorder"),
-    ("strands_robots.simulation.newton.recording", "strands_robots.dataset_recorder"),
-    ("strands_robots.simulation.policy_runner", "strands_robots.dataset_recorder"),
-    ("strands_robots.simulation.recording", "strands_robots.dataset_recorder"),
-    ("strands_robots.simulation.recording", "strands_robots.streaming_dataset"),
+    ("strands_robots.drivers.feetech.twin", "strands_robots.simulation"),
+    ("strands_robots.drivers.yahboom_m3pro_twin", "strands_robots.simulation"),
     ("strands_robots.teleop_mixin", "strands_robots.teleoperator"),
 )
 
