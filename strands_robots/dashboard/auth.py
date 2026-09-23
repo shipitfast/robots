@@ -75,6 +75,8 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
 )
 
+from strands_robots.dashboard import log_redaction
+
 _ENV = "STRANDS_DASH_AUTH_"
 
 # Both directions are spelled out. A value outside either vocabulary must not
@@ -350,7 +352,7 @@ def store_corruption() -> dict[str, str] | None:
 
 
 def _preserve_corrupt(path: Path, exc: Exception) -> None:
-    """Move an unparseable store aside instead of clobbering it, and remember that we did."""
+    """Move a store this module cannot use aside instead of clobbering it, and remember that we did."""
     global _corrupt
     backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
     try:
@@ -408,6 +410,50 @@ def _remember_locked(identity: tuple | None, raw: str, store: dict[str, Any]) ->
         _cache[identity] = _CachedStore(raw, store)
 
 
+def _parsed_store(raw: str) -> dict[str, Any]:
+    """The store *raw* holds, or ``ValueError`` naming why it cannot be one.
+
+    Parsing is not usability. Every reader here indexes the parsed document
+    without a second look - ``_jwt_secret`` takes ``store["jwt_secret"]``,
+    ``has_credentials`` takes ``len(store.get("credentials", []))`` - so a file
+    that is valid JSON and still not a store hands each of them a value it has
+    no branch for, and the fault surfaces as a ``KeyError``, ``TypeError`` or
+    ``AttributeError`` from inside whichever route asked. Presenting any session
+    token against a store with no ``jwt_secret`` did exactly that: ``KeyError``
+    inside :func:`verify_token`, which is a 500 on every guarded route and says
+    nothing an operator could act on, where the same request without the token
+    was a clean 401. A non-string secret was quieter and worse - every token
+    failed to verify (401 forever) while signing in raised from PyJWT.
+
+    Raising here routes all of that into the recovery :func:`_load` already
+    has for a store it cannot read: the bytes are kept aside, the reason is
+    recorded for :func:`store_corruption`, and a working default takes over -
+    so the dashboard comes up sealed against enrollment from anywhere but the
+    machine, instead of answering 500 until someone reads a traceback.
+
+    Args:
+        raw: The store file's contents.
+
+    Returns:
+        The parsed store, usable by every reader in this module.
+
+    Raises:
+        ValueError: The text is not JSON, or is JSON that cannot serve as a
+            store. ``json.JSONDecodeError`` is a ``ValueError``, so both
+            arrive at the caller through one channel.
+    """
+    store = json.loads(raw)
+    if not isinstance(store, dict):
+        raise ValueError(f"store is a JSON {type(store).__name__}, not an object")
+    secret = store.get("jwt_secret")
+    if not isinstance(secret, str) or not secret:
+        raise ValueError(f"store has no usable jwt_secret (found {type(secret).__name__})")
+    creds = store.get("credentials", [])
+    if not isinstance(creds, list) or not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in creds):
+        raise ValueError("store credentials are not a list of records each carrying an id")
+    return store
+
+
 def _load() -> dict[str, Any]:
     """Read the store, serving memory only while the file still holds its bytes.
 
@@ -426,7 +472,7 @@ def _load() -> dict[str, Any]:
                 cached = _cache.get(identity)
                 if cached is not None and cached.raw == raw:
                     return cached.store
-                store: dict[str, Any] = json.loads(raw)
+                store: dict[str, Any] = _parsed_store(raw)
             except (OSError, ValueError) as exc:
                 _preserve_corrupt(path, exc)
             else:
@@ -617,7 +663,7 @@ def _derive_rp_id(request_or_ws: Any) -> str:
     host = _host_only(_headers(request_or_ws).get("host", ""))
     rp_id, reason = rp_id_verdict(host, _forced_rp_id())
     if rp_id is None:
-        logger.warning("refused WebAuthn ceremony: %s", reason)
+        logger.warning("refused WebAuthn ceremony: %s", log_redaction.one_line(reason))
         raise HTTPException(
             400,
             {
@@ -751,7 +797,7 @@ def _derive_origin(request_or_ws: Any) -> str:
         return expected
     origin, reason = origin_verdict(_headers(request_or_ws).get("origin", ""), expected)
     if origin is None:
-        logger.warning("refused WebAuthn ceremony: %s", reason)
+        logger.warning("refused WebAuthn ceremony: %s", log_redaction.one_line(reason))
         raise HTTPException(
             400,
             {
@@ -880,7 +926,9 @@ def _stash_challenge(
         if ip:
             evicted = _evict_oldest(_challenges, _CHAL_MAX_PER_IP - 1, ip=ip)
             if evicted:
-                logger.warning("challenge cap: dropped %d stale challenge(s) from %s", evicted, ip)
+                logger.warning(
+                    "challenge cap: dropped %d stale challenge(s) from %s", evicted, log_redaction.one_line(ip)
+                )
         if len(_challenges) >= _CHAL_MAX:
             _evict_oldest(_challenges, _CHAL_MAX - 1)
             logger.warning("challenge table full (%d); evicted oldest", _CHAL_MAX)
@@ -1387,7 +1435,9 @@ def finish_authentication(request: Any, challenge_id: str, credential: dict) -> 
     # authentication VERIFIED against rec["extra"]["rp_id"], which is proof, not a guess.
     if not match.get("rp_id") and rec["extra"].get("rp_id"):
         match["rp_id"] = rec["extra"]["rp_id"]
-        logger.info("recorded rp_id %r for credential %s", match["rp_id"], match.get("name"))
+        # The credential's name is the label the enrolling request chose, kept in the
+        # store and read back here, so it arrives from outside like any header would.
+        logger.info("recorded rp_id %r for credential %s", match["rp_id"], log_redaction.one_line(match.get("name")))
     _save(store)
     token = issue_token(cast(str, cred_id), name=match.get("name", "passkey"))
     return {"ok": True, "token": token, "credential_id": cred_id}

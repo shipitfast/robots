@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from strands_robots.simulation.models import SimRobot
+from tests._device_connect_real import restore_the_edge, use_a_mock_edge
 from tests._sim_stop_policy_stand_in import stop_policy_stand_in
 
 # The RPCs graded here run as an allowlisted operator: authorization fails
@@ -101,25 +102,19 @@ class FakeDeviceStatus:
 mock_types.DeviceIdentity = FakeDeviceIdentity
 mock_types.DeviceStatus = FakeDeviceStatus
 
-# Save originals so we can restore after this module's tests run
-_saved_modules = {}
-_mock_keys = (
-    "device_connect_edge",
-    "device_connect_edge.drivers",
-    "device_connect_edge.types",
-    "device_connect_edge.device",
+# The swap has one owner (tests/_device_connect_real.py), which records only
+# what is real. Collected after test_device_connect_all_robots.py and before
+# that file tears down - the alphabetical order - the edge and integration
+# registered right now are that file's mocks and the modules bound to them, not
+# originals to hand back at teardown.
+_mocked_edge = use_a_mock_edge(
+    {
+        "device_connect_edge": mock_device_connect_edge,
+        "device_connect_edge.drivers": mock_drivers,
+        "device_connect_edge.types": mock_types,
+        "device_connect_edge.device": MagicMock(),
+    }
 )
-# Also track strands_robots.device_connect submodules that will be imported
-# with the mocked base class - they need to be purged so later tests re-import
-# with the real base class.
-_strands_dc_keys = [k for k in sys.modules if k.startswith("strands_robots.device_connect")]
-for _key in list(_mock_keys) + _strands_dc_keys:
-    _saved_modules[_key] = sys.modules.get(_key)
-
-sys.modules["device_connect_edge"] = mock_device_connect_edge
-sys.modules["device_connect_edge.drivers"] = mock_drivers
-sys.modules["device_connect_edge.types"] = mock_types
-sys.modules["device_connect_edge.device"] = MagicMock()
 
 # Mock DeviceRuntime
 mock_device_runtime = MagicMock()
@@ -149,22 +144,13 @@ def _patch_sim_driver_caller(value):
 
 
 def teardown_module():
-    """Restore real device_connect_edge modules so other test files are not affected.
+    """Put the real device_connect_edge back, and the integration it was imported by.
 
-    Also purge cached strands_robots.device_connect submodules that were imported
-    with the mock base class, so later test files get fresh imports with the real base.
+    The integration modules imported here against the mock DeviceDriver base
+    class go; the real ones the process already had come back, entry and parent
+    attribute both.
     """
-    # Restore device_connect_edge modules
-    for key, original in _saved_modules.items():
-        if original is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = original
-    # Purge ALL strands_robots.device_connect submodules - they were imported
-    # with the mock DeviceDriver base class and must be re-imported fresh.
-    for key in list(sys.modules):
-        if key.startswith("strands_robots.device_connect"):
-            sys.modules.pop(key, None)
+    restore_the_edge(_mocked_edge)
 
 
 # ── Task state mocks ──────────────────────────────────────────────

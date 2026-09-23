@@ -15,7 +15,7 @@ defect rather than a gap:
 * the base ``start_policy`` entry tells the caller a backend "advertises
   ``list_policies_running`` beside it, so this entry is how to tell which one
   you hold" - a promise about the same mapping that omitted it;
-* ``docs/simulation/overview.md`` states the verb "answers on every backend ...
+* ``docs/simulation/rollouts.md`` states the verb "answers on every backend ...
   a MuJoCo, Newton or Isaac engine names the robots it is driving";
 * :meth:`SimEngine.list_policies_running` documents itself as "promoted here
   from the MuJoCo engine so it answers on every backend".
@@ -62,7 +62,7 @@ _PROMISE = re.compile(r"advertis\w*\s+(?:it\s+)?(?:the\s+)?([a-z_][a-z0-9_]*)")
 #: caller reading the entry is already holding this method's output.
 _SELF_REFERENCE = "describe"
 
-#: The two halves of the rollout-reporting pair. ``docs/simulation/overview.md``
+#: The two halves of the rollout-reporting pair. ``docs/simulation/rollouts.md``
 #: derives one verdict from the other's population, so a surface that offers one
 #: and hides the other tells a caller half a contract.
 _ROLLOUT_REPORTING_PAIR = ("stop_policy", "list_policies_running")
@@ -114,8 +114,43 @@ class _BaseSurfaceEngine(SimEngine):
         return {"status": "success"}
 
 
+class _DeclaredSurfaceEngine(_BaseSurfaceEngine):
+    """The thinnest engine that also implements every OPTIONAL base verb.
+
+    ``SimEngine.describe()`` advertises ``load_scene`` / ``randomize`` /
+    ``set_obs_noise`` / ``get_contacts`` only on a subclass that actually
+    overrides them, because an entry for a method whose body is ``raise
+    NotImplementedError`` is a false advertisement. So
+    :class:`_BaseSurfaceEngine`, which overrides none of the four, reports the
+    base mapping *minus* those - which is the right reference for the promise
+    pins (what a caller is really told) and the wrong one for measuring whether
+    another backend NARROWS the surface: against it, a backend that omits a
+    raising stub hides nothing, because the base never offered it either.
+
+    This subclass gives the narrowing pin the mapping as *declared*, so it keeps
+    grading Newton's own narrowing rather than the base's.
+    """
+
+    def load_scene(self, *a: Any, **k: Any) -> dict[str, Any]:
+        return {"status": "success"}
+
+    def randomize(self, *a: Any, **k: Any) -> dict[str, Any]:
+        return {"status": "success"}
+
+    def set_obs_noise(self, *a: Any, **k: Any) -> dict[str, Any]:
+        return {"status": "success"}
+
+    def get_contacts(self, *a: Any, **k: Any) -> dict[str, Any]:
+        return {"status": "success"}
+
+
 def _base_methods() -> dict[str, str]:
     return dict(_BaseSurfaceEngine().describe()["methods"])
+
+
+def _declared_base_methods() -> dict[str, str]:
+    """The base mapping including the optional verbs, for the narrowing pin."""
+    return dict(_DeclaredSurfaceEngine().describe()["methods"])
 
 
 def _broken_promises(methods: dict[str, str]) -> list[tuple[str, str]]:
@@ -264,11 +299,15 @@ class TestNarrowingStaysHonest:
     def test_newton_hides_only_verbs_it_does_not_implement(self) -> None:
         sim = _live_engine("newton")
         try:
-            hidden = sorted(set(_base_methods()) - set(sim.describe()["methods"]))
+            methods = sim.describe()["methods"]
+            hidden = sorted(set(_declared_base_methods()) - set(methods))
             assert hidden == ["get_contacts", "load_scene"], f"the hidden set moved: {hidden}"
             with pytest.raises(NotImplementedError):
                 sim.get_contacts()
             with pytest.raises(NotImplementedError):
                 sim.load_scene("/nonexistent/scene.xml")
+            # Non-vacuity: an empty or collapsed mapping would satisfy the rule
+            # above by hiding everything, so name a verb that must be present.
+            assert "list_policies_running" in methods
         finally:
             sim.destroy()

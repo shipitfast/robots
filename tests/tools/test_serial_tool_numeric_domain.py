@@ -31,9 +31,9 @@ one failed differently and none of the failures was reportable:
   ``0`` was accepted outright.
 
 :mod:`~strands_robots.tools.pose_tool` writes the same ``Goal_Position`` register
-through the same mask and is unaffected: it clamps to each motor's declared range
-in ``degrees_to_position`` before encoding, so its mask can only ever see a value
-that fits. That is the contract these tests give the raw-bus tool.
+through the same mask and is unaffected: ``FeetechBus.to_counts`` refuses a
+target the encoder cannot hold before encoding it, so its mask can only ever see
+a value that fits. That is the contract these tests give the raw-bus tool.
 
 They pin the domain, the per-action scoping (an option an action never reads must
 not be refused), the guard's placement before the port is opened, that a value
@@ -277,7 +277,8 @@ class TestTheRequiredFieldCheckStillOwnsAnAbsentRegister:
 
         assert result["status"] == "error"
         assert "motor_id and position required" in _text(result)
-        assert opened[0].closed
+        # Refused before the gate and before the port is opened: nothing to close.
+        assert opened == []
 
     def test_an_absent_motor_id_still_reports_the_whole_missing_pair(self, opened: list[_FakeSerial]) -> None:
         result = _call(action="feetech_velocity", velocity=100)

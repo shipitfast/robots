@@ -11,6 +11,7 @@ it from the discovery surface rather than the API carrying a second name.
 """
 
 import ast
+import importlib.util
 import inspect
 import re
 import textwrap
@@ -19,6 +20,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+#: Presence of MuJoCo read as a spec rather than imported: only the live-sim
+#: class below needs it, and the rest of this module grades ``describe()``
+#: strings by AST and inspect alone.
+_HAS_MUJOCO = importlib.util.find_spec("mujoco") is not None
 
 
 def _advertised_param_names(sig_str: str) -> list[str]:
@@ -378,27 +384,54 @@ class TestDescribeABC:
         assert "name" in methods["remove_robot"]
 
     def test_describe_lists_scene_variation_and_grounding(self):
-        """describe() advertises the scene-variation + physics-grounding facades.
+        """describe() advertises the scene-variation + physics-grounding facades
+        exactly where the backend implements them.
 
-        ``load_scene`` (the alternative scene-construction entry point),
-        ``randomize`` and ``set_obs_noise`` (domain randomization + sensor-noise
-        variation), and ``get_contacts`` (the physics-grounding read used to
-        verify a grasp / detect a collision) are all public methods declared on
-        the base ``SimEngine`` contract, but describe() listed none of them -- so
-        a caller enumerating ``describe()["methods"]`` could build a scene and
-        run a policy, yet could not discover how to load a scene from file, vary
-        it for sim2real, or verify the physics result without guessing the
-        names. They belong on the base discovery surface; each backend documents
-        its concrete signature via its own describe() override.
+        ``load_scene``, ``randomize``, ``set_obs_noise`` and ``get_contacts``
+        are declared on the base ``SimEngine`` contract as RAISING STUBS, so
+        their advertisement is conditional: a backend that overrides one gets
+        the entry (the discoverability this test originally pinned - a caller
+        enumerating ``describe()["methods"]`` must be able to find how to load
+        a scene, vary it for sim2real, or verify the physics result), and a
+        backend that inherits the stub does not. This test used to assert the
+        unconditional half only, which made ``describe()`` a false
+        advertisement on any backend without the capability: the Isaac backend
+        re-published ``get_contacts`` for months while its call raised
+        ``NotImplementedError``, and a caller acting on the advertisement -
+        ``eval_policy(success_fn="contact")`` - got a 0.0 success rate shaped
+        like a failing policy.
         """
-        engine = _make_minimal_engine()
-        methods = engine.describe()["methods"]
+        from typing import Any
+
+        # An engine that implements all four advertises all four, with the
+        # signatures naming the real distinguishing details.
+        base_cls = type(_make_minimal_engine())
+
+        class CapableEngine(base_cls):  # type: ignore[misc, valid-type]
+            def load_scene(self, scene_path: str) -> dict[str, Any]:
+                return {"status": "success", "content": []}
+
+            def randomize(self, **kwargs: Any) -> dict[str, Any]:
+                return {"status": "success", "content": []}
+
+            def set_obs_noise(self, **kwargs: Any) -> dict[str, Any]:
+                return {"status": "success", "content": []}
+
+            def get_contacts(self) -> dict[str, Any]:
+                return {"status": "success", "content": []}
+
+        methods = CapableEngine().describe()["methods"]
         for name in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
-            assert name in methods, f"describe() omits base scene/grounding method {name!r}"
-        # Advertised signatures name the real distinguishing details so a caller
-        # can invoke them (or know where to read the concrete backend signature).
+            assert name in methods, f"describe() omits implemented scene/grounding method {name!r}"
         assert "scene_path" in methods["load_scene"]
         assert "contact" in methods["get_contacts"].lower()
+
+        # And the minimal engine, which inherits every stub, advertises none:
+        # an entry for a method whose body raises NotImplementedError is a
+        # promise the backend cannot keep.
+        stub_methods = _make_minimal_engine().describe()["methods"]
+        for name in ("load_scene", "randomize", "set_obs_noise", "get_contacts"):
+            assert name not in stub_methods, f"describe() advertises the raising stub {name!r}"
 
     def test_describe_lists_world_lifecycle_entry_points(self):
         """describe() advertises create_world and destroy on the BASE contract.
@@ -440,10 +473,7 @@ class TestDescribeABC:
         _assert_advertised_params_are_real(_make_minimal_engine())
 
 
-@pytest.mark.skipif(
-    not pytest.importorskip("mujoco", reason="MuJoCo not installed"),
-    reason="MuJoCo not available",
-)
+@pytest.mark.skipif(not _HAS_MUJOCO, reason="MuJoCo not installed")
 class TestDescribeMuJoCo:
     """Tests for MuJoCoSimEngine.describe() with a live sim world."""
 

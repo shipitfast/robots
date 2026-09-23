@@ -112,7 +112,7 @@ class _RecordingPublisher:
     """Records ``publish`` calls without touching a DDS bus.
 
     Same acceptance contract as
-    :class:`~strands_robots.tools.g1._dds_engine.DDSPublisher`: ``publish``
+    :class:`~strands_robots.drivers.unitree._dds_engine.DDSPublisher`: ``publish``
     returns ``None`` on success and a reason string on failure. Every call lands
     in :attr:`writes` so a test can walk the wire capture.
     """
@@ -348,8 +348,7 @@ def test_a_gated_write_reaches_the_wire_with_the_go_protocol_header(stub_unitree
     The whole wire contract in one cell, because it is one frame: the protocol
     header and low-level flag the ``unitree_go`` constructor does *not* set, the
     enable byte on the commanded slot, the reference gains for that slot, the CRC
-    stamped last, and - the part a reader most wants guaranteed - every
-    uncommanded slot left disabled.
+    stamped last, and every undriven slot left at its zero default.
     """
     del stub_unitree_sdk
     driver, pub = _released_driver()
@@ -374,9 +373,35 @@ def test_a_gated_write_reaches_the_wire_with_the_go_protocol_header(stub_unitree
     assert motor.q == pytest.approx(-1.5)
     assert motor.kp == pytest.approx(_SDK_KP[slot])
     assert motor.kd == pytest.approx(_SDK_KD[slot])
+    driven = set(GO2_JOINT_INDEX.values())
     for other in range(len(cmd.motor_cmd)):
-        if other != slot:
-            assert cmd.motor_cmd[other].mode == 0, f"slot {other} was not commanded and must stay disabled"
+        if other not in driven:
+            assert cmd.motor_cmd[other].mode == 0, f"slot {other} is not a Go2 joint and must stay at its default"
+
+
+def test_a_partial_action_leaves_the_omitted_joints_enabled_at_zero_gain(stub_unitree_sdk: None) -> None:
+    """An action that names one joint does not *disable* the other eleven.
+
+    ``mode = 0`` is the Disable byte; on a standing robot it cuts that motor
+    dead, which is the frame ``build_zero_torque_lowcmd`` documents as "drops
+    the robot onto its knees". The SDK's own Go2 example sets ``mode = 0x01``
+    on every slot on every frame. So the joints an action omits ride the
+    soft-stop shape - enabled, zero gain - not the constructor's zero default.
+    """
+    del stub_unitree_sdk
+    cmd, err = build_lowcmd_from_action({"FL_calf_joint": -1.5})
+    assert err is None, err
+    commanded = GO2_JOINT_INDEX["FL_calf_joint"]
+    disabled = sorted(
+        name for name, slot in GO2_JOINT_INDEX.items() if slot != commanded and cmd.motor_cmd[slot].mode == 0
+    )
+    assert disabled == [], f"omitted joints published with the Disable byte: {disabled}"
+    for name, slot in GO2_JOINT_INDEX.items():
+        if slot == commanded:
+            continue
+        motor = cmd.motor_cmd[slot]
+        assert motor.mode == _MOTOR_MODE_SERVO, name
+        assert (motor.kp, motor.kd, motor.tau) == pytest.approx((0.0, 0.0, 0.0)), name
 
 
 def test_per_joint_gains_override_the_reference_gains(stub_unitree_sdk: None) -> None:
@@ -855,19 +880,19 @@ class TestMotionSwitcherClientImportPath:
 
         # The method must import from the shared helper module, not directly
         # from the SDK
-        helper_imports = [node for node in imports if node.module and "g1._motion_switcher" in node.module]
+        helper_imports = [node for node in imports if node.module == "strands_robots.drivers.unitree._motion_switcher"]
         sdk_direct_imports = [node for node in imports if node.module and "unitree_sdk2py" in node.module]
 
         assert helper_imports, (
             "_open_motion_switcher_client must delegate to the shared "
-            "strands_robots.tools.g1._motion_switcher helper (one-owner "
+            "strands_robots.drivers.unitree._motion_switcher helper (one-owner "
             "pattern for the SDK module path); found no such import"
         )
         assert not sdk_direct_imports, (
             "_open_motion_switcher_client must not import directly from "
             f"unitree_sdk2py; found: {[n.module for n in sdk_direct_imports]}. "
             "The correct import path lives in "
-            "strands_robots.tools.g1._motion_switcher._SDK_MODULE"
+            "strands_robots.drivers.unitree._motion_switcher._SDK_MODULE"
         )
 
 

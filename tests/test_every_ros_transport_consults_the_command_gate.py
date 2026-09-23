@@ -33,15 +33,18 @@ from __future__ import annotations
 
 import ast
 import inspect
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
 
+import strands_robots.ros as ros_transport_mod
+import strands_robots.rosbridge as rosbridge_transport_mod
+import strands_robots.rtps.participant as rtps_participant_mod
 import strands_robots.tools.use_ros as ros_mod
-import strands_robots.tools.use_rosbridge as rosbridge_mod
-import strands_robots.tools.use_rtps as rtps_mod
+from strands_robots.mesh import RosBridgedRobot, RosbridgeRobot, RtpsRobot
 from strands_robots.tools.use_ros import use_ros
 from strands_robots.tools.use_rosbridge import use_rosbridge
 from strands_robots.tools.use_rtps import use_rtps
@@ -58,14 +61,20 @@ _COMMAND_VERBS = frozenset({"publish", "service_call", "action_send_goal"})
 
 # Each agent-callable transport, with the module holding its backend probe and
 # the interface type spelling that transport accepts. rosbridge speaks ROS 1
-# two-segment types; the other two speak ROS 2 three-segment types.
+# two-segment types; the other two speak ROS 2 three-segment types. All three
+# are envelopes over transports a layer down, which the mesh robots publish
+# through as well, so each probe is that transport's rather than the tool's.
 _TRANSPORTS: tuple[tuple[str, Any, Any, str], ...] = (
-    ("use_ros", use_ros, ros_mod, "geometry_msgs/msg/Twist"),
-    ("use_rtps", use_rtps, rtps_mod, "geometry_msgs/msg/Twist"),
-    ("use_rosbridge", use_rosbridge, rosbridge_mod, "geometry_msgs/Twist"),
+    ("use_ros", use_ros, ros_transport_mod, "geometry_msgs/msg/Twist"),
+    ("use_rtps", use_rtps, rtps_participant_mod, "geometry_msgs/msg/Twist"),
+    ("use_rosbridge", use_rosbridge, rosbridge_transport_mod, "geometry_msgs/Twist"),
 )
 
 _TOOLS_DIR = Path(ros_mod.__file__).resolve().parent
+#: The package root, so the single-owner pin below reads every module rather
+#: than one directory: the gate itself sits in ``core``, and a second copy
+#: anywhere would make two transports disagree just as surely.
+_PACKAGE_DIR = _TOOLS_DIR.parent
 
 
 def _texts(result: dict[str, Any]) -> str:
@@ -82,7 +91,7 @@ def _hermetic(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.delenv("BYPASS_TOOL_CONSENT", raising=False)
     monkeypatch.delenv("STRANDS_ROS2_COMMAND_ALLOW", raising=False)
-    for module in (ros_mod, rtps_mod, rosbridge_mod):
+    for module in (ros_transport_mod, rtps_participant_mod, rosbridge_transport_mod):
         monkeypatch.setattr(module._backend, "available", lambda: True)
 
 
@@ -213,6 +222,92 @@ class TestTheGateRunsAfterArgumentValidation:
         assert not ctx.interrupt.called, f"{label} asked the operator about an incomplete call"
 
 
+#: A transport whose mechanics are shared by an agent tool and a library class:
+#: the label the operator decision is keyed with, the entry point both callers
+#: reach it through, a factory for the class, the tool, and the interface type
+#: that transport speaks. The structural pin below reads the tool package, so it
+#: cannot see the second caller at all - these rows are the same argument one
+#: layer down.
+_SHARED_TRANSPORTS: tuple[tuple[str, Any, Any, Any, str], ...] = (
+    (
+        "ros",
+        ros_transport_mod.ros_action,
+        lambda: RosBridgedRobot("turtle", _BLOCKED, "/odom"),
+        use_ros,
+        "geometry_msgs/msg/Twist",
+    ),
+    (
+        "rtps",
+        rtps_participant_mod.rtps_action,
+        lambda: RtpsRobot.from_rtps(node_name="rover", cmd_vel_topic=_BLOCKED),
+        use_rtps,
+        "geometry_msgs/msg/Twist",
+    ),
+    (
+        "rosbridge",
+        rosbridge_transport_mod.rosbridge_action,
+        lambda: RosbridgeRobot("rover", _BLOCKED, "/odom"),
+        use_rosbridge,
+        "geometry_msgs/Twist",
+    ),
+)
+
+
+class TestEveryCallerOfOneTransportAsksTheSameQuestion:
+    """A transport is not always a tool: every one of them has a second caller.
+
+    :mod:`strands_robots.ros` carries the in-process ``rclpy`` mechanics for the
+    ``use_ros`` tool *and* for :class:`~strands_robots.mesh.RosBridgedRobot` and
+    :class:`~strands_robots.mesh.AckermannRosRobot`;
+    :mod:`strands_robots.rtps.participant` carries the DDS mechanics for the
+    ``use_rtps`` tool *and* for :class:`~strands_robots.mesh.RtpsRobot`; and
+    :mod:`strands_robots.rosbridge` carries the WebSocket mechanics for the
+    ``use_rosbridge`` tool *and* for
+    :class:`~strands_robots.mesh.RosbridgeRobot`. Each of those robots reaches
+    the same physical ``cmd_vel`` without going through an agent tool at all,
+    and the structural pin above reads the tool package, so it cannot see that
+    second caller. Two pins per shared transport: a transport nobody can command
+    through without deciding about the operator, and one label for the decision
+    however it was reached.
+    """
+
+    @pytest.mark.parametrize(("label", "entry_point", "_factory", "_tool", "_msg_type"), _SHARED_TRANSPORTS)
+    def test_the_transport_refuses_to_command_without_a_gate_argument(
+        self, label: str, entry_point: Any, _factory: Any, _tool: Any, _msg_type: str
+    ) -> None:
+        """The gate is a required argument, so a caller cannot omit it silently.
+
+        A default would be the un-gated sibling all over again: whichever value
+        it took, a new caller would inherit it by writing nothing.
+        """
+        gate = inspect.signature(entry_point).parameters["gate"]
+        assert gate.default is inspect.Parameter.empty, f"{label}: a defaulted gate is a gate a caller can forget"
+        assert gate.kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.parametrize(("label", "_entry_point", "factory", "tool", "msg_type"), _SHARED_TRANSPORTS)
+    def test_a_robot_and_the_tool_prompt_the_operator_identically(
+        self, label: str, _entry_point: Any, factory: Any, tool: Any, msg_type: str
+    ) -> None:
+        """One blocklisted topic, one question - whichever caller reached it.
+
+        The label keys the interrupt id ``<tool>-command-approval`` and the audit
+        source ``<tool>_tool``, so two spellings would file one incident's rows
+        under two names and an operator would be asked the same thing twice over.
+        Both callers decline here, so the assertion is made before any socket is
+        dialed or anything joins a graph.
+        """
+        tool_ctx, robot_ctx = MagicMock(), MagicMock()
+        tool_ctx.interrupt.return_value = "n"
+        robot_ctx.interrupt.return_value = "n"
+
+        assert _publish(tool, msg_type, tool_ctx)["status"] == "error"
+        assert factory().drive(linear=1.0, tool_context=robot_ctx)["status"] == "error"
+
+        assert robot_ctx.interrupt.call_args == tool_ctx.interrupt.call_args, (
+            f"{label}: the two callers ask the operator different questions about one surface"
+        )
+
+
 def _commanding_transport_modules() -> dict[str, set[str]]:
     """Derive the tool modules that dispatch a command verb onto a ROS graph.
 
@@ -282,8 +377,117 @@ class TestEveryCommandingTransportConsultsTheGate:
     def test_the_gate_has_exactly_one_owner(self) -> None:
         """One blocklist. A second copy is how two transports come to disagree."""
         owners = [
-            path.stem
-            for path in sorted(_TOOLS_DIR.glob("*.py"))
+            str(path.relative_to(_PACKAGE_DIR))
+            for path in sorted(_PACKAGE_DIR.rglob("*.py"))
             if "COMMAND_BLOCKLIST = frozenset(" in path.read_text(encoding="utf-8")
         ]
-        assert owners == ["_command_gate"], f"the command blocklist is defined in {owners}"
+        assert owners == ["_command_gate.py"], f"the command blocklist is defined in {owners}"
+
+
+def _lock_is_free(backend: Any) -> bool:
+    """Whether a second thread can take ``backend.lock`` right now.
+
+    The lock is an ``RLock``, so the thread already holding it re-enters freely -
+    the question is only answerable from another thread, which is also the thread
+    the harm lands on: every other caller of the transport.
+    """
+    taken: list[bool] = []
+
+    def probe() -> None:
+        acquired = backend.lock.acquire(timeout=_LOCK_PROBE_TIMEOUT)
+        taken.append(acquired)
+        if acquired:
+            backend.lock.release()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join()
+    return taken[0]
+
+
+#: Long enough that a held lock is not mistaken for scheduler noise, short enough
+#: that the failing case costs a fraction of a second per row.
+_LOCK_PROBE_TIMEOUT = 0.5
+
+
+class TestNoOperatorIsAskedUnderTheTransportLock:
+    """A human thinking must not stall every other caller of the transport.
+
+    Each transport serialises its callers through one process-wide lock - the
+    rclpy executor is not re-entrant, DDS access is serialised, and one
+    ``roslibpy.Ros`` is shared per ``(host, port)``. ``ctx.interrupt()`` blocks
+    for as long as the operator takes to answer, so consulting the gate under
+    that lock hands a human the transport: an unrelated ``echo`` on the same
+    graph - the odometry read of a second robot, a scan - waits out the decision.
+
+    Measured on the three transports before this pin existed, with the operator
+    being asked about a ``publish`` onto a blocklisted topic::
+
+        use_ros        lock free while asking: False
+        use_rtps       lock free while asking: True
+        use_rosbridge  lock free while asking: True
+
+    ``use_ros`` consulted the gate inside ``with _backend.lock:``; the two
+    siblings hoisted it above. Both halves below are table-driven over every
+    transport rather than written against the one that diverged, so the next one
+    to grow a lock is graded on arrival.
+    """
+
+    @pytest.mark.parametrize(("label", "tool", "module", "msg_type"), _TRANSPORTS)
+    def test_the_transport_lock_is_free_while_the_operator_is_asked(
+        self, label: str, tool: Any, module: Any, msg_type: str
+    ) -> None:
+        observed: list[bool] = []
+        ctx = MagicMock()
+
+        def ask(*_args: Any, **_kwargs: Any) -> str:
+            observed.append(_lock_is_free(module._backend))
+            return "n"
+
+        ctx.interrupt.side_effect = ask
+        result = _publish(tool, msg_type, ctx)
+
+        assert observed, f"{label} did not ask the operator about {_BLOCKED}"
+        assert result["status"] == "error"
+        assert observed == [True], (
+            f"{label} asked the operator while holding its transport lock: every other "
+            f"caller of this transport - a read, a second robot on the same graph - waits "
+            f"out the human decision"
+        )
+
+    @pytest.mark.parametrize(("label", "entry_point", "_factory", "_tool", "_msg_type"), _SHARED_TRANSPORTS)
+    def test_no_gate_call_sits_inside_a_lock_block(
+        self, label: str, entry_point: Any, _factory: Any, _tool: Any, _msg_type: str
+    ) -> None:
+        """The same rule structurally, so a new verb cannot reintroduce it.
+
+        The behavioural half above exercises ``publish``; this reads the whole
+        dispatch, so a ``service_call`` or an ``action_send_goal`` that consults
+        the gate under the lock is caught without a row of its own.
+        """
+        source = Path(inspect.getsourcefile(entry_point) or "").read_text(encoding="utf-8")
+        dispatch = next(
+            node
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef) and node.name == entry_point.__name__
+        )
+        lock_blocks = [
+            node
+            for node in ast.walk(dispatch)
+            if isinstance(node, ast.With)
+            and any(
+                isinstance(item.context_expr, ast.Attribute) and item.context_expr.attr == "lock" for item in node.items
+            )
+        ]
+        assert lock_blocks, f"{label}: the scan found no lock block in {entry_point.__name__} to grade"
+        gated_under_lock = [
+            node.lineno
+            for block in lock_blocks
+            for node in ast.walk(block)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "gate"
+        ]
+        assert not gated_under_lock, (
+            f"{label}: the operator gate is consulted under the transport lock at "
+            f"line(s) {gated_under_lock}, so a human deciding holds the lock every "
+            f"other caller of this transport has to take"
+        )

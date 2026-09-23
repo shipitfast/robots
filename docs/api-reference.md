@@ -32,7 +32,7 @@ from strands_robots.registry import (
     list_robots_by_category, list_aliases, normalize_robot_name, format_robot_table,
     register_robot, unregister_robot, list_user_robots,
     user_registry_source, parse_user_robots,
-    list_policy_providers, resolve_policy, import_policy_class, build_policy_kwargs,
+    list_policy_providers, resolve_policy, build_policy_kwargs,
 )
 ```
 
@@ -56,7 +56,6 @@ from strands_robots.registry import (
 | `list_policy_providers()` | Providers from `policies.json`, canonical names only. |
 | `list_policy_aliases()` | Alias/shorthand -> canonical provider, from `policies.json`. Peer of `list_aliases()` for robots. |
 | `resolve_policy(uri)` | URI → provider name. |
-| `import_policy_class(provider)` | Lazy import of provider class. |
 | `build_policy_kwargs(provider, **kw)` | Normalise + validate kwargs. An explicit value beats the provider's registry default; the provider's own key (`host=`) beats the generic parameter (`policy_host=`). Every generic parameter defaults to `None`, meaning "unset", so an omitted one leaves the provider's own default -- registry, else constructor -- in place. |
 
 ## `strands_robots.simulation`
@@ -83,7 +82,7 @@ Selected actions:
 |--------|------|
 | `run_policy(robot_name, ...)` | Blocking policy rollout. |
 | `start_policy(robot_name, ...)` | Rollout in a background thread on MuJoCo; a blocking passthrough to `run_policy` on the other backends. `describe()['methods']['start_policy']` states which one the engine you hold implements. |
-| `stop_policy(robot_name)` | Cooperatively stop a rollout; the `json` block reports `was_running`. Refused (naming the class) by a backend with no durable per-robot claim. |
+| `stop_policy(robot_name)` | Cooperatively stop a rollout, then wait (bounded, 1 s) for its worker to exit, so the caller's next action on that robot is admitted. The `json` block reports `was_running` and `exited`: `true` when the worker was joined and is gone, `false` when it is still live after that budget (the text says so, and names the action that stays refused), `null` when there was nothing to join - no rollout, or a blocking `run_policy` driven on its caller's own thread. An empty `robot_name` means the only rollout in flight, and is otherwise refused naming what is running. Refused (naming the class) by a backend with no durable per-robot claim. |
 | `run_multi_policy(policies, ...)` | Synchronized multi-robot rollout, one merged frame per step. |
 | `eval_policy(robot_name, n_episodes, ...)` | Multi-episode evaluation. |
 | `evaluate_benchmark(benchmark_name, ...)` | Run registered benchmark. |
@@ -113,7 +112,8 @@ from strands_robots.hardware_robot import Robot, TaskStatus, RobotTaskState
 
 ```python
 from strands_robots.policies import (
-    Policy, MockPolicy, create_policy, register_policy, list_providers, UntrustedRemoteCodeError,
+    Policy, MockPolicy, create_policy, import_policy_class, register_policy, list_providers,
+    UntrustedRemoteCodeError,
 )
 from strands_robots.policies.groot import Gr00tPolicy
 from strands_robots.policies.lerobot_local import LerobotLocalPolicy
@@ -125,6 +125,7 @@ from strands_robots.policies.cosmos3 import Cosmos3Policy
 | `Policy` | ABC: `get_actions`, `set_robot_state_keys`, `requires_images`, `provider_name`. |
 | `MockPolicy` | Sinusoidal mock. `requires_images=False`. |
 | `create_policy(provider, **kw)` | Resolve + construct. Accepts `zmq://`, `cosmos3://`, HF `org/model`. |
+| `import_policy_class(provider)` | Lazy import of a provider's class: the registry entry's module, else auto-discovery of `strands_robots.policies.<provider>`. Raises `ImportError` naming the extra when the module's optional dependency is absent, `ValueError` when no provider resolves. |
 | `register_policy(name, loader, aliases)` | Runtime registration. |
 | `list_providers()` | Sorted canonical names of every JSON-registered provider, plus any runtime `register_policy` names and their aliases. Canonical names only for the JSON registry: pair it with `list_aliases()` for the rest. |
 | `list_aliases()` | Every provider alias and the canonical name it resolves to, across both registries. Together with `list_providers()` they are every *registered* spelling - not every spelling `create_policy` resolves. A module under `strands_robots.policies` exporting a `Policy` subclass also resolves under its own module name: `composite` (builds through the factory) and `persistent` (resolves; constructed directly). |

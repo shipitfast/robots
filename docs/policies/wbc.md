@@ -27,15 +27,16 @@ pip install "strands-robots[wbc,sim-mujoco]" # + MuJoCo to drive the G1 in sim
 
 No weights are bundled and there is no default download: a bare
 `create_policy("wbc")` raises instead of fetching the wrong model family. The
-decoupled-WBC G1 policies live in the
-[`NVlabs/GR00T-WholeBodyControl`](https://github.com/NVlabs/GR00T-WholeBodyControl)
-git-LFS tree:
+two decoupled-WBC G1 controllers are 1.8 MB each inside the 4.6 GB git-LFS tree
+of [`NVlabs/GR00T-WholeBodyControl`](https://github.com/NVlabs/GR00T-WholeBodyControl).
+`media.githubusercontent.com` serves the LFS content of a public repository, so
+fetch the two files (3.6 MB of ONNX) instead of cloning everything around them:
 
 ```bash
-git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git   # 4.6G LFS
-mkdir -p /path/to/grootwbc-g1
-cp GR00T-WholeBodyControl/decoupled_wbc/sim2mujoco/resources/robots/g1/policy/\
-GR00T-WholeBodyControl-{Balance,Walk}.onnx /path/to/grootwbc-g1/
+mkdir -p /path/to/grootwbc-g1 && cd /path/to/grootwbc-g1
+url=https://media.githubusercontent.com/media/NVlabs/GR00T-WholeBodyControl/main/decoupled_wbc/sim2mujoco/resources/robots/g1/policy
+curl -LO "$url/GR00T-WholeBodyControl-Balance.onnx"   # main (Balance) policy
+curl -LO "$url/GR00T-WholeBodyControl-Walk.onnx"      # optional walk policy
 ```
 
 The canonical `GR00T-WholeBodyControl-Balance.onnx` / `-Walk.onnx` filenames are
@@ -203,7 +204,11 @@ that overrides SONIC's tuned PD, so writing targets to them directly makes the
 robot fall. `run_policy` therefore detects a `WBCPolicy` on a position-servo
 scene and installs the torque shim (`WBCTorqueController`, PD->torque) for the
 call, restoring the actuators afterwards so a second call behaves like the
-first. The shim's `physics_substeps_per_control` (upstream `control_decimation=4`
+first. That install is the MuJoCo engine's: the shim is written against a
+compiled `MjModel`, so on any other backend (`newton`, `isaac`) a WBC rollout is
+refused up front - naming `backend="mujoco"` and the opt-out below - instead of
+running without it. Unrefused it reported `status="success"` while the pelvis
+sank from 0.793 m to 0.074 m in one second. The shim's `physics_substeps_per_control` (upstream `control_decimation=4`
 at 0.005 s = one inference per 20 ms) must be a positive integer, because the
 gait clock integrates at the declared period. With the real weights and
 `target_velocity = [0.5, 0, 0]` the base advances ~1.9 m over 5 s at pelvis
@@ -218,6 +223,50 @@ A *static* velocity can be set once via
 also the way to evaluate WBC at a fixed velocity, since `policy_kwargs` is wired
 on the control path (`run_policy` / `start_policy` / `tell()`), not on
 `eval_policy`.
+
+### Recording it
+
+`run_policy(video={...})` records from the scene's `default` camera unless told
+otherwise, and that view is a fixed function of the compiled model - its pose
+does not move while the robot does. On the stock G1 scene the pelvis crosses the
+right edge of the 640x480 default view after 1.5 m of forward walk (under 4 s at
+0.4 m/s) and the rest of the clip is empty floor. Add a camera first and name it
+in `video`. Mounted on the pelvis it rides with the robot and turns with it -
+`position` and `target` are then in the pelvis frame, x forward:
+
+```python
+sim = Robot("unitree_g1")
+sim.add_camera(
+    name="follow",
+    parent_body="unitree_g1/pelvis",
+    position=[-2.6, -1.6, 1.1],     # behind and to the right, a little above
+    target=[0.4, 0.0, -0.3],        # looking just ahead of the base
+    fov=45,
+    width=1280,
+    height=720,
+)
+sim.run_policy(
+    robot_name="unitree_g1",
+    policy_provider="wbc",
+    policy_config={"checkpoint": "/path/to/grootwbc-g1", "walk": True},
+    policy_kwargs={"target_velocity": [0.5, 0.0, 0.3]},
+    duration=6.0,
+    control_frequency=50.0,
+    action_horizon=1,
+    video={"path": "/tmp/g1_follow.mp4", "fps": 30, "camera": "follow", "width": 1280, "height": 720},
+)
+```
+
+The mount holds the base at one pixel for the whole rollout, so a longer walk
+needs no re-placement.
+[`examples/microduck/eval_rl_policy.py`](https://github.com/strands-labs/robots/blob/main/examples/microduck/eval_rl_policy.py)
+records a walking robot this way: a `chase` camera mounted on
+`microduck/trunk_base`, added before the rollout and named in its `video`.
+A fixed camera works when the path is known -
+[`examples/kimodo/kimodo_g1_walking.py`](https://github.com/strands-labs/robots/blob/main/examples/kimodo/kimodo_g1_walking.py)
+calls `add_camera` with `position=[3.0, 0.0, 1.2]`, `target=[0.0, 0.0, 0.8]` to
+face the G1 where it starts. Either way the camera has to be added before the
+rollout; `add_camera` is refused while a policy is running.
 
 ## Watching it walk (torque-control deploy)
 

@@ -33,6 +33,20 @@ from strands_robots import (
 
 Parse results via `result["content"][0]["text"]`, not custom keys like `result["ports"]`.
 
+Every parameter, default and refusal of every tool in the package - these and the G1 and
+Reachy Mini verbs - is on the generated [tool reference](../reference/tools.md).
+
+### `pose_tool` and `serial_tool` need pyserial
+
+Both drive the servo bus through pyserial, and no extra of this project declares
+it on its own - it arrives only inside `lerobot[feetech]`. Without it neither
+tool imports, and the refusal names the remedy rather than leaving the
+interpreter's `No module named 'serial'` as the only hint:
+
+```bash
+pip install pyserial
+```
+
 ### Numeric options are checked before the session starts
 
 A teleop session runs in a detached subprocess, so a value the lerobot CLI
@@ -199,6 +213,15 @@ driven instead of an arm that is safe to approach, and reading it is also what
 keeps six unread acks from sitting in front of the next state read's reply
 stream.
 
+That sweep writes two registers per motor, `Torque_Enable` and then `Lock`, both
+carrying the same value - the pairing LeRobot's `enable_torque` /
+`disable_torque` use. `Lock` clear is what lets the servo's EEPROM (its ID, baud
+rate and position limits, all of which persist across power) be written, and
+`lerobot-calibrate` leaves the arm there, so energizing without it would drive
+the arm with that region open. A `Lock` write that went unacknowledged is logged
+rather than named in the return: the joint is in the state that was asked for,
+and only its write protection is unknown.
+
 | Option | Accepted | Why the bound is where it is |
 |--------|----------|------------------------------|
 | `motor_id` | integer in `[1, 254]`, or `[1, 253]` for an action that reads a reply | the frame carries the ID in one byte, of which `0xfd` is the highest a servo may hold and `0xfe` is the broadcast, while `0xff` is the header value |
@@ -214,8 +237,9 @@ these options. An unset `motor_id` / `position` is still reported by the action'
 own "required" message rather than as an unusable value.
 
 `pose_tool` writes the same `Goal_Position` register through the same mask and
-needs no bound of its own - it clamps to each motor's declared range before
-encoding, so the mask only ever sees a value that fits.
+needs no bound of its own: it converts a target through `FeetechBus.to_counts`,
+which refuses one the encoder cannot hold, so the mask only ever sees a value
+that fits.
 
 Both bounds and the reported angle are STS/SMS-series properties, not properties
 of the register or of Feetech generally, and so is the two-byte order the value
@@ -231,6 +255,13 @@ once (`MAX_GOAL_POSITION`), and every Feetech write path in the package - this
 tool, `pose_tool`, and the native `FeetechDriver` bus - reads both from there.
 Addressing an SCS-series servo needs a second word order and a second full scale
 rather than a scale option, so no surface here offers one.
+
+The read back is the same one authority. `Present_Position` is sign-magnitude on
+this series - bit 15 is the direction - so `pose_tool` decodes a reply through
+that module's `SIGN_BIT` table rather than deciding the bit itself. Read as an
+unsigned field, a servo reporting a joint just past its homing zero answers with
+an angle more than a full turn from where the joint is, and nothing on a read
+path bounds the number it quotes.
 
 ### A stored pose is stored whole, or the tool reports that it was not
 
@@ -276,7 +307,7 @@ so none of them is refused for it. The two declared postures are unchanged.
 
 `robot_mesh` takes four numeric options. `duration` and `policy_port` travel
 inside the command body that
-[`validate_command`](../security.md) inspects, so that validator already bounds
+[`validate_command`](../security/commands.md#payload-validation) inspects, so that validator already bounds
 them. `timeout` and `limit` never enter a command body, so they are bounded by
 the tool:
 
@@ -309,10 +340,19 @@ lerobot-calibrate    --robot.type=so101_follower --robot.port=/dev/ttyACM0 \
 
 The result is JSON under `HF_LEROBOT_CALIBRATION` (by default
 `~/.cache/huggingface/lerobot/calibration/`). `lerobot_teleoperate` and
-`lerobot_train` read it through LeRobot, so nothing here needs to parse it; code
-that does should import `lerobot.motors.MotorCalibration` rather than restate
-the schema. `lerobot-find-joint-limits` reports the travel a recorded
-calibration allows.
+`lerobot_train` read it through LeRobot; `lerobot-find-joint-limits` reports the
+travel a recorded calibration allows.
+
+Two surfaces here read that file directly, and both take the same argument:
+`FeetechDriver(calibration=...)` and `pose_tool(calibration=...)`, each the path
+of the JSON that run wrote. It is the scale, not a refinement - a degree is
+`360/resolution` counts from the middle of the *measured* travel, and percent
+open spans the gripper's measured travel - so the number a calibrated arm quotes
+through either surface is the number LeRobot quotes for the same servo. Omitting
+it reads and commands the servo's whole rotation, which is off by however far
+that arm's stops sit inside it, and bounds a target by the encoder rather than by
+where the joint stops. A per-joint degree range is deliberately not declared
+anywhere in the package: an SO arm's reachable span is measured per arm.
 
 ## Examples
 

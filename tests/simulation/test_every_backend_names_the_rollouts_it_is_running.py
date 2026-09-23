@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regression tests: ``list_policies_running`` answers on every backend.
 
-``docs/simulation/overview.md`` lists ``list_policies_running`` in the Policy
+``docs/simulation/rollouts.md`` lists ``list_policies_running`` in the action
 action table beside ``run_policy`` / ``start_policy`` / ``stop_policy``, with no
 backend qualifier, and documents ``stop_policy`` -- a base contract since a
 robot's stop was promoted to the ABC -- as deriving its verdict from "the same
@@ -70,6 +70,10 @@ class _IdleRegistry:
 
     def _rollouts_in_flight(self) -> tuple[str, ...] | None:
         return ()
+
+    # The second seam the verb reads: how the last asynchronous rollout per
+    # robot failed. A backend with no asynchronous entry has nothing to say.
+    _rollouts_ended_in_error = SimEngine._rollouts_ended_in_error
 
 
 def _text(envelope: dict[str, Any]) -> str:
@@ -210,6 +214,7 @@ class TestIsaacAnswersItToo:
         # The verb lives on the ABC and reads the seam, so the stand-in answers
         # it with Isaac's own reader - both halves are the production code.
         stub._rollouts_in_flight = lambda: IsaacSimulation._rollouts_in_flight(stub)  # type: ignore[arg-type]
+        stub._rollouts_ended_in_error = lambda: IsaacSimulation._rollouts_ended_in_error(stub)  # type: ignore[arg-type]
         return stub
 
     def test_it_names_the_robot_holding_the_claim(self) -> None:

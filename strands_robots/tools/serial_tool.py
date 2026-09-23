@@ -45,7 +45,7 @@ that already fits.
 Operator approval: the four actions that write to the bus - ``send``,
 ``send_read``, ``feetech_position`` and ``feetech_velocity`` - stop for a human
 BEFORE the port is opened, through the same decision path the ROS transports
-use (:func:`~strands_robots.tools._command_gate.gate_motion`).
+use (:func:`~strands_robots._command_gate.gate_motion`).
 ``STRANDS_SERIAL_COMMAND_ALLOW`` (comma-separated action names, or ``*``)
 pre-approves, ``BYPASS_TOOL_CONSENT=true`` lifts the gate with a WARNING,
 otherwise the operator is prompted through the tool context and, with none
@@ -63,11 +63,11 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-import serial
-import serial.tools.list_ports
 from strands import tool
 from strands.types.tools import ToolContext
 
+from strands_robots._command_gate import gate_motion
+from strands_robots._motion_grants import consume_grant
 from strands_robots.drivers.feetech.protocol import (
     BROADCAST_ID,
     MAX_GOAL_POSITION,
@@ -76,14 +76,24 @@ from strands_robots.drivers.feetech.protocol import (
     Register,
     encode_word,
     max_magnitude,
+    ping_packet,
+    write_packet,
 )
-from strands_robots.tools._command_gate import gate_motion
 from strands_robots.utils import (
     finite_number_error,
     non_negative_count_error,
     positive_count_error,
     refusal_str,
+    require_optional,
 )
+
+# pyserial is what the tool talks to the bus through, and no extra of this
+# project declares it on its own: it arrives only inside ``lerobot[feetech]``.
+# Bound here, at import, so ``from strands_robots import serial_tool`` on an
+# install without it is refused with the install line rather than the
+# interpreter's ``No module named 'serial'`` (AGENTS.md convention 7).
+serial: Any = require_optional("serial", pip_install="pyserial", purpose="the Feetech serial bus tool (serial_tool)")
+require_optional("serial.tools.list_ports", pip_install="pyserial", purpose="the Feetech serial bus tool (serial_tool)")
 
 # Bit index carrying the direction in the two STS/SMS registers this module
 # writes. ``Goal_Position`` (0x2A) and ``Goal_Velocity`` (0x2E) are both
@@ -268,28 +278,53 @@ WRITE_ACTIONS = frozenset({"send", "send_read", "feetech_position", "feetech_vel
 COMMAND_ALLOW_ENV = "STRANDS_SERIAL_COMMAND_ALLOW"
 
 
-def _dashboard_grant(tool_input: dict[str, Any]) -> bool:
-    """Spend a grant the dashboard's motion hook deposited for this exact call.
+def _write_payload_error(
+    action: str,
+    *,
+    data: str | None,
+    hex_data: str | None,
+    motor_id: int | None,
+    position: int | None,
+    velocity: int | None,
+) -> str | None:
+    """The checks that decide a write's fate with no operator and no port.
 
-    The dashboard registers :class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook`
-    on its agent, which asks the operator before the tool runs and records a
-    one-shot grant keyed on what they were shown. Asking again here would be
-    the same question twice, so a grant is consumed and the call proceeds. The
-    dashboard extra may be absent, and a missing module must read as "no
-    grant", never as a crash: the gate below then asks the operator itself.
+    Every write action asks the operator before the port is opened, then
+    checks what it was given: ``send``/``send_read`` with neither ``data`` nor
+    ``hex_data``, or with ``hex_data`` that is not hex; ``feetech_position``
+    without a motor id or a position; ``feetech_velocity`` without a motor id
+    or a velocity. Each is decided by the call alone, so a call that fails
+    one was never going to reach the bus - asking first spends an approval
+    on nothing, and a bad hex string used to surface as a ``ValueError`` from
+    the write itself, after the port was opened. This runs before the gate;
+    the action's own branch still checks the payload again.
 
     Args:
-        tool_input: The call as the hook saw it - the same field names, with
-            the unset ones omitted.
+        action: One of :data:`WRITE_ACTIONS`.
+        data: As supplied.
+        hex_data: As supplied.
+        motor_id: As supplied.
+        position: As supplied.
+        velocity: As supplied.
 
     Returns:
-        True when a grant for this exact call existed and was spent.
+        An error message, or ``None`` when the call reaches the operator.
     """
-    try:
-        from strands_robots.dashboard import agent_hitl
-    except ImportError:
-        return False
-    return bool(agent_hitl.consume_grant("serial_tool", tool_input))
+    if action in ("send", "send_read"):
+        if hex_data:
+            try:
+                bytes.fromhex(hex_data.replace(" ", ""))
+            except ValueError:
+                return f"{action}: hex_data must be hex byte pairs such as 'FF FF 01 04', got {refusal_str(hex_data)}."
+            return None
+        if data:
+            return None
+        return "No data or hex_data provided" if action == "send" else "No data to send"
+    if action == "feetech_position" and (motor_id is None or position is None):
+        return "motor_id and position required"
+    if action == "feetech_velocity" and (motor_id is None or velocity is None):
+        return "motor_id and velocity required"
+    return None
 
 
 def _gate_write(action: str, tool_input: dict[str, Any], tool_context: ToolContext | None) -> str | None:
@@ -305,7 +340,7 @@ def _gate_write(action: str, tool_input: dict[str, Any], tool_context: ToolConte
     Returns:
         A refusal message, or None to let the write proceed.
     """
-    if _dashboard_grant(tool_input):
+    if consume_grant("serial_tool", tool_input):
         return None
     port = str(tool_input.get("port") or "")
     detail = " ".join(f"{k}={v}" for k, v in tool_input.items() if k not in ("action", "port"))
@@ -407,13 +442,6 @@ def serial_tool(
             )
         return ports
 
-    def build_feetech_packet(motor_id: int, instruction: int, params: list[int]) -> bytes:
-        """Build Feetech servo protocol packet."""
-        packet = [0xFF, 0xFF, motor_id, len(params) + 2, instruction] + params
-        checksum = ~sum(packet[2:]) & 0xFF
-        packet.append(checksum)
-        return bytes(packet)
-
     try:
         if action == "list_ports":
             ports = list_serial_ports()
@@ -456,6 +484,12 @@ def serial_tool(
                 )
                 if value is not None and value != ""
             }
+            # A write the action's own branch would refuse on its payload is
+            # refused here, before the operator is asked to approve it.
+            if payload_error := _write_payload_error(
+                action, data=data, hex_data=hex_data, motor_id=motor_id, position=position, velocity=velocity
+            ):
+                return {"status": "error", "content": [{"text": payload_error}]}
             if refusal := _gate_write(action, tool_input, tool_context):
                 # The port is not open yet: a refused write is exactly as inert
                 # as a call that never happened.
@@ -527,9 +561,9 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and position required"}]}
 
-            # Feetech position command: INST_WRITE (0x03), Goal_Position address (0x2A)
-            params = [0x2A, *encode_word(position)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            # The broadcast is allowed here: this write expects no reply, and
+            # ``_motor_id_error`` refuses it only for the actions that read one.
+            packet = write_packet(motor_id, Register.GOAL_POSITION, encode_word(position), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -548,9 +582,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and velocity required"}]}
 
-            # Feetech velocity command: Goal_Velocity address (0x2E)
-            params = [0x2E, *encode_word(velocity)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            packet = write_packet(motor_id, Register.GOAL_VELOCITY, encode_word(velocity), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -561,8 +593,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id required"}]}
 
-            # Feetech ping command
-            packet = build_feetech_packet(motor_id, 0x01, [])  # INST_PING
+            packet = ping_packet(motor_id)
             ser.write(packet)
 
             time.sleep(0.1)

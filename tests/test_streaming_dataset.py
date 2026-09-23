@@ -13,6 +13,7 @@ import subprocess
 import pytest
 
 import strands_robots.dataset_recorder as dr
+import strands_robots.dataset_transfer as dt
 import strands_robots.streaming_dataset as sd
 
 
@@ -108,7 +109,7 @@ def _two_frame_dataset_with_a_video_feature(root):
 
 
 def test_drop_videos_never_decodes_video_with_the_real_streaming_dataset(tmp_path):
-    """The claim under test is docs/recording.md's: drop_videos=True "skips video
+    """The claim under test is docs/data/reading-back.md's: drop_videos=True "skips video
     decode entirely". lerobot's StreamingLeRobotDataset decodes every key in
     meta.video_keys whether or not it is in delta_timestamps, so stripping the
     camera deltas alone (the previous implementation) still decoded - and the
@@ -210,7 +211,7 @@ def test_sync_to_bucket_builds_cli(tmp_path, monkeypatch):
     (tmp_path / "meta").mkdir()  # satisfy the meta/ guard
     rec = _recorder(tmp_path)
 
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -235,7 +236,7 @@ def test_sync_to_bucket_builds_cli(tmp_path, monkeypatch):
 
 def test_sync_to_bucket_requires_meta(tmp_path, monkeypatch):
     rec = _recorder(tmp_path)  # NO meta/ dir
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
     res = rec.sync_to_bucket("my-org/robot-fave")
     assert res["status"] == "error"
     assert "meta/" in res["message"]
@@ -244,7 +245,7 @@ def test_sync_to_bucket_requires_meta(tmp_path, monkeypatch):
 def test_sync_to_bucket_missing_hf_cli(tmp_path, monkeypatch):
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: None)
+    monkeypatch.setattr(dt, "_hf_executable", lambda: None)
     res = rec.sync_to_bucket("my-org/robot-fave")
     assert res["status"] == "error"
     assert "hf` CLI" in res["message"] or "hf CLI" in res["message"]
@@ -255,7 +256,7 @@ def _guard_recorder(tmp_path, monkeypatch):
     subprocess call would be a security regression (the fake raises)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     def boom(*a, **k):  # subprocess must never run with a rejected target
         raise AssertionError(f"subprocess.run reached with {a!r}")
@@ -310,7 +311,7 @@ def test_sync_to_bucket_bucket_create_failure_surfaces_error(tmp_path, monkeypat
     never fall through to ``hf sync`` (a silent success would upload nowhere)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -339,7 +340,7 @@ def test_sync_to_bucket_existing_bucket_proceeds_to_sync(tmp_path, monkeypatch):
     exists is idempotent: sync proceeds and the call succeeds."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -367,7 +368,7 @@ def test_sync_to_bucket_sync_failure_surfaces_stderr(tmp_path, monkeypatch):
     not a false success."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     def fake_run(cmd, **_kwargs):
         is_create = cmd[:3] == ["hf", "buckets", "create"]
@@ -391,7 +392,7 @@ def test_sync_to_bucket_delete_flag_forwarded(tmp_path, monkeypatch):
     mirrored (removed-locally files are pruned remotely)."""
     (tmp_path / "meta").mkdir()
     rec = _recorder(tmp_path)
-    monkeypatch.setattr(dr, "_hf_executable", lambda: "hf")
+    monkeypatch.setattr(dt, "_hf_executable", lambda: "hf")
 
     calls = []
 
@@ -490,7 +491,10 @@ def test_dyld_shim_noop_without_torchcodec(monkeypatch):
 def test_dyld_shim_sets_env_and_skips_reexec_when_unsafe(monkeypatch, tmp_path):
     """When torchcodec + ffmpeg are present but it's NOT safe to re-exec
     (e.g. under pytest), the shim sets DYLD for child procs and does NOT
-    re-exec — it warns instead."""
+    re-exec - it keeps the remedy for the first video-decoding open instead
+    of warning at import."""
+    import warnings
+
     from strands_robots import _dyld
 
     monkeypatch.setattr(_dyld.sys, "platform", "darwin")
@@ -499,14 +503,18 @@ def test_dyld_shim_sets_env_and_skips_reexec_when_unsafe(monkeypatch, tmp_path):
     monkeypatch.delenv(_dyld._DYLD_VAR, raising=False)
     monkeypatch.setattr(_dyld, "_torchcodec_installed", lambda: True)
     monkeypatch.setattr(_dyld, "_find_ffmpeg_lib_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(_dyld, "_pending_hint", None)
     # Under pytest, _is_safe_to_reexec() is False → must NOT call os.execv.
     called = {"execv": False}
     monkeypatch.setattr(_dyld.os, "execv", lambda *a: called.__setitem__("execv", True))
 
-    with pytest.warns(RuntimeWarning):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         result = _dyld.ensure_ffmpeg_on_dyld_path()
 
     assert result is False
+    assert not caught
+    assert str(tmp_path) in (_dyld.video_decode_hint() or "")
     assert called["execv"] is False  # never re-exec under pytest
     # but child-process env IS set
     assert str(tmp_path) in os.environ[_dyld._DYLD_VAR]
@@ -530,7 +538,7 @@ def test_dyld_shim_noop_when_already_set(monkeypatch, tmp_path):
 #
 # These exercise the real ``from lerobot.datasets import StreamingLeRobotDataset``
 # path. lerobot itself is import-order fragile in some envs, so we inject a
-# stand-in ``lerobot.datasets`` module rather than depend on the real package —
+# stand-in ``lerobot.datasets`` module rather than depend on the real package -
 # the code under test only cares that the symbol resolves (or doesn't).
 
 
@@ -678,3 +686,60 @@ def test_reader_exposes_metadata_and_iterates(monkeypatch):
     assert r.meta == {"stats": {"action": {"mean": [0.0]}}}
     frames = list(r)
     assert frames == [{"observation.state": [0.0], "action": [0.0], "task": "t"}]
+
+
+class _FakeStreamingWithVideo(_FakeStreaming):
+    """A fake whose metadata says it carries a video key."""
+
+    def __init__(self, repo_id, **kw):
+        super().__init__(repo_id, **kw)
+        self.meta = type("Meta", (), {"video_keys": ["observation.images.cam"], "info": {"features": {}}})()
+
+
+def test_open_with_video_keys_says_the_dyld_remedy_once_this_process_needs_it(monkeypatch):
+    """The ffmpeg/dyld remedy moved from import time to the first video-decoding
+    open: a process the shim could not fix hears it here, not on ``import``."""
+    import warnings
+
+    import strands_robots._dyld as _dyld
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreamingWithVideo, raising=False)
+    monkeypatch.setattr(_dyld, "_pending_hint", "export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sd.StreamingDatasetReader.open("org/ds", validate_deltas=False)
+    assert [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)] == [
+        "export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib"
+    ]
+
+
+def test_open_with_drop_videos_never_says_the_dyld_remedy(monkeypatch):
+    """Proprio-only streaming decodes no video, so the remedy is not its business."""
+    import warnings
+
+    import strands_robots._dyld as _dyld
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreamingWithVideo, raising=False)
+    monkeypatch.setattr(_dyld, "_pending_hint", "export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sd.StreamingDatasetReader.open(
+            "org/ds",
+            delta_timestamps={"observation.state": [0.0]},
+            drop_videos=True,
+            validate_deltas=False,
+        )
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+
+
+def test_open_with_video_keys_is_quiet_when_this_process_is_fine(monkeypatch):
+    import warnings
+
+    import strands_robots._dyld as _dyld
+
+    monkeypatch.setattr(sd, "StreamingLeRobotDataset", _FakeStreamingWithVideo, raising=False)
+    monkeypatch.setattr(_dyld, "_pending_hint", None)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sd.StreamingDatasetReader.open("org/ds", validate_deltas=False)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]

@@ -18,6 +18,7 @@ from strands_robots.simulation.recording import (
     camera_schema_key_collision_error,
     dataset_recording_option_error,
     dataset_recording_posture_error,
+    recorded_cameras_line,
 )
 from strands_robots.utils import camera_schema_key, name_list_error
 
@@ -96,7 +97,7 @@ class RecordingMixin(DatasetRecordingMixin):
         Args:
             repo_id: HuggingFace dataset id (``owner/name``) or a local path. The
                 directory it records into is resolved by
-                :func:`~strands_robots.dataset_recorder.resolve_dataset_dir` -
+                :func:`~strands_robots.dataset_source.resolve_dataset_dir` -
                 the same resolver ``DatasetRecorder.create`` uses - so an
                 ``owner/name`` id lands in ``$HF_LEROBOT_HOME/{repo_id}`` while a
                 value that is itself a path is taken as the directory. That home
@@ -129,7 +130,7 @@ class RecordingMixin(DatasetRecordingMixin):
                 value rather than silently appending frames on a wrong timebase.
             root: Explicit on-disk dataset directory, used verbatim - it replaces
                 the ``repo_id`` resolution above rather than being joined to it.
-                See :func:`~strands_robots.dataset_recorder.resolve_dataset_dir`
+                See :func:`~strands_robots.dataset_source.resolve_dataset_dir`
                 for the full precedence.
             push_to_hub: Publish to the Hub at ``stop_recording``. Must be a
                 boolean - a publication posture is not read by truthiness
@@ -213,37 +214,12 @@ class RecordingMixin(DatasetRecordingMixin):
         if error := self._validate_recording_start_rate(fps, "start_recording"):
             return error
 
-        _DatasetRecorder: Any = None
-        unavailable: str | None = None
-        try:
-            from strands_robots.dataset_recorder import DatasetRecorder as _DatasetRecorder
-            from strands_robots.dataset_recorder import lerobot_dataset_import_error
-
-            unavailable = lerobot_dataset_import_error()
-        except ImportError as exc:
-            # strands_robots.dataset_recorder itself did not import (a partial or
-            # drifted install); report that rather than blaming the lerobot extra.
-            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
-        if unavailable is None and _DatasetRecorder is None:
-            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
-
-        if unavailable is not None:
-            return {
-                "status": "error",
-                "content": [
-                    {
-                        "text": (
-                            "start_recording produces a LeRobotDataset (parquet + video), which "
-                            "needs lerobot's dataset stack:\n"
-                            "\n"
-                            f"  {unavailable}\n"
-                            "\n"
-                            "For plain MP4 video under the [sim-mujoco] extra alone, use "
-                            "start_cameras_recording(cameras=..., output_dir=...) instead."
-                        )
-                    }
-                ],
-            }
+        _DatasetRecorder, refusal = self._dataset_recorder_or_refusal(
+            "For plain MP4 video under the [sim-mujoco] extra alone, use "
+            "start_cameras_recording(cameras=..., output_dir=...) instead.",
+        )
+        if refusal is not None:
+            return refusal
 
         # A dataset column is named by camera_schema_key, which collapses a
         # camera's "/" namespace separator to "__" because a LeRobot feature name
@@ -265,20 +241,30 @@ class RecordingMixin(DatasetRecordingMixin):
         ):
             return error
 
+        # A second start while one recording is live used to fall through: it
+        # replaced the recorder object (the frames buffered since the last
+        # save_episode went with it - never saved, never mentioned) and, when
+        # the new dataset then refused (schema mismatch on resume), left
+        # ``recording`` False with the first session's frames gone too. Refuse
+        # up front and leave the live recording exactly as it was.
+        if error := self._already_recording_error("start_recording", repo_id):
+            return error
+
         self._world._backend_state["recording"] = True
         self._world._backend_state["trajectory"] = []
         self._world._backend_state["push_to_hub"] = push_to_hub
+        # ``step`` feeds the recording at this rate and labels its frames with
+        # this task (see ``Simulation._record_step_frame``); the due-time clock
+        # starts fresh with every session.
+        self._world._backend_state["recording_fps"] = fps
+        self._world._backend_state["recording_task"] = task
+        self._world._backend_state.pop("step_recording_due", None)
 
-        # Resolve the on-disk dataset dir (shared by overwrite + resume logic).
-        # Delegates to the same resolver DatasetRecorder.create() uses so the
-        # facade and the low-level recorder agree on where a dataset lives
-        # (honouring $HF_LEROBOT_HOME).
-        from strands_robots.dataset_recorder import resolve_dataset_dir
-
-        dataset_dir = resolve_dataset_dir(repo_id, root)
-        # Stash the resolved root so verify_dataset_episodes can read the parquet
-        # after stop_recording has finalized the dataset and dropped the recorder.
-        self._world._backend_state["last_dataset_root"] = str(dataset_dir)
+        # Resolve the on-disk dataset dir (shared by overwrite + resume logic)
+        # and stash it with the id it is recorded under, so the consumers that
+        # run after the recorder is dropped can find the parquet and a reader
+        # handed only that id can find a custom directory.
+        dataset_dir = self._stash_dataset_target(repo_id, root)
 
         try:
             # Collect joint names from every robot. When the scene contains
@@ -379,6 +365,13 @@ class RecordingMixin(DatasetRecordingMixin):
                 else:
                     camera_dims[safe_name] = (int(self.default_height), int(self.default_width))
 
+            # Scene camera name -> dataset column key, in dataset column order:
+            # what start_recording's reply names the cameras by. The reply lists
+            # the SCENE name (the spelling render/get_frame answer for) and the
+            # column only when camera_schema_key renamed it, so it cannot hand
+            # back a name every camera surface refuses.
+            recorded_cameras = dict(raw_to_safe)
+
             # Optional camera scoping. By default EVERY scene camera is recorded,
             # which sweeps in the implicit ``default`` overview camera and any
             # view the trained policy never declared - bloating the dataset and
@@ -422,6 +415,7 @@ class RecordingMixin(DatasetRecordingMixin):
                     }
                 camera_keys = selected_safe
                 camera_dims = {safe: camera_dims[safe] for safe in selected_safe}
+                recorded_cameras = {safe_to_raw[safe]: safe for safe in selected_safe}
             # Stash the scoped RAW camera names so the run_policy frame hook drops
             # un-recorded camera arrays before add_frame (None -> record all).
             self._world._backend_state["recording_cameras"] = record_raw_cameras
@@ -502,6 +496,8 @@ class RecordingMixin(DatasetRecordingMixin):
                     root=root,
                     task=task,
                     vcodec=vcodec,
+                    joint_names=joint_names,
+                    extra_state_specs=base_state_specs,
                 )
                 # resume() inherits the feature schema from disk; it does NOT
                 # check it against the CURRENT scene. Adding a robot or swapping
@@ -509,9 +505,9 @@ class RecordingMixin(DatasetRecordingMixin):
                 # cryptic per-feature shape error on the next add_frame. Compare
                 # up front and raise a clear schema-diff instead.
                 self._verify_resume_schema(resumed, state_names_full, camera_keys, camera_dims, action_names, fps=fps)
-                self._world._backend_state["dataset_recorder"] = resumed
+                recorder = resumed
             else:
-                self._world._backend_state["dataset_recorder"] = _DatasetRecorder.create(
+                recorder = _DatasetRecorder.create(
                     repo_id=repo_id,
                     fps=fps,
                     robot_type=robot_type,
@@ -526,15 +522,25 @@ class RecordingMixin(DatasetRecordingMixin):
                     video_width=self.default_width,
                     video_height=self.default_height,
                 )
+            resumed_line = self._arm_dataset_recorder(self._world._backend_state, recorder, resumed=resume_existing)
             return {
                 "status": "success",
                 "content": [
                     {
                         "text": (
                             f"Recording to LeRobotDataset: {repo_id}\n"
-                            f"{len(joint_names)} joints, {len(camera_keys)} cameras @ {fps}fps\n"
+                            f"{resumed_line}"
+                            f"{recorded_cameras_line(joint_names, recorded_cameras, list(raw_to_safe), cameras, fps)}"
                             f"Codec: {vcodec} | Task: {task or '(set per policy)'}\n"
-                            f"Run policies to capture frames, then stop_recording to save episode"
+                            f"Frames are captured by a policy rollout - run_policy (one rollout; "
+                            f"it closes NO episode, so call reset between rollouts or pass "
+                            f"n_episodes=N in one call, else consecutive rollouts merge into one "
+                            f"episode), start_policy (async), eval_policy / evaluate_benchmark "
+                            f"(one dataset episode per evaluation episode) or run_multi_policy "
+                            f"(several robots into one merged frame) - or by stepping a scripted motion: "
+                            f"set_joint_positions(hold=True) + step records one frame per 1/{fps}s "
+                            f"of sim time. teleoperate and replay_episode do not feed the "
+                            f"recorder. Then stop_recording to save the open episode"
                         )
                     }
                 ],

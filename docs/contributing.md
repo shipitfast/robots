@@ -9,6 +9,7 @@ Repo: [`strands-labs/robots`](https://github.com/strands-labs/robots). Requires 
 ```bash
 git clone https://github.com/strands-labs/robots
 cd robots
+uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e '.[all,dev]'
 ```
 
@@ -61,6 +62,8 @@ that equivalence first.
 **No host paths** - `/Users/...` is CI-blocked. Use `tmp_path`, `~/.cache`, or env vars.
 
 **JSON registries** - new robots and policies are JSON edits + tests. No hardcoded lookups in `.py` files.
+
+**Imports point downward** - the package reads as seven layers, `core -> registry -> drivers|mesh -> sim|policies -> app -> tools -> dashboard`, and a module imports only its own layer or below. Check with `python scripts/check_import_layers.py` (source-only, imports nothing). It fails on a cycle in the runtime graph and on an upward import that is not declared - `KNOWN_UPWARD_EDGES` for a module-scope one, `KNOWN_DEFERRED_UPWARD_EDGES` for one inside a function body - both rosters of inversions left to fix, which shrink by deleting a line. Deferring an import breaks a cycle without changing who depends on whom, so it is exempt from the first property and graded by the second. `if TYPE_CHECKING:` imports are reported and graded by neither.
 
 **A dependency change and its relock are one commit** - editing `pyproject.toml` without running `uv lock` leaves the lock describing a manifest that no longer exists. `uv.lock` is one of the manifests GitHub's dependency graph parses, so a stale lock is a stale *security surface*, not just a stale install. Check it before pushing with `python scripts/check_lockfile_parity.py` (offline, no resolver) or `uv lock --check`.
 

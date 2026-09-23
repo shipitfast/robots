@@ -12,15 +12,17 @@ reference clip.
 ## Install
 
 ```bash
-pip install "strands-robots[protomotions]"
+pip install "strands-robots[protomotions,sim-mujoco]"
 ```
 
-That pulls `onnxruntime` (runs the graph), `pyyaml` (reads the
+`[protomotions]` pulls `onnxruntime` (runs the graph), `pyyaml` (reads the
 `unified_pipeline.yaml` sidecar) and `huggingface_hub` — which you call yourself
 to fetch the checkpoint, because `onnx_path` and `yaml_path` take local files and
-this policy resolves no model id. Weights are not bundled. Building a reference clip from `qpos` with
-[`qpos_to_motion_data`](#bridging-a-qpos-clip) additionally needs MuJoCo, which
-ships in `strands-robots[sim-mujoco]`.
+this policy resolves no model id. Weights are not bundled. It declares no MuJoCo,
+and both halves of this page need one: `Robot("unitree_g1", mode="sim")` below
+raises `ImportError: 'mujoco' is required for MuJoCo simulation`, and
+[`qpos_to_motion_data`](#bridging-a-qpos-clip) reads the reference MJCF through
+it. `[sim-mujoco]` is therefore part of the install line, not an aside.
 
 ## Run a clip in simulation
 
@@ -127,8 +129,13 @@ cache["num_frames"], cache["control_dt"]
 ```
 
 `MotionPlayer` accepts that dict, an `.npz` from `MotionPlayer.save_cache_npz`,
-or a raw ProtoMotions `.pt`. Four things to know about the cache:
+or a raw ProtoMotions `.pt`. Things to know about the cache:
 
+- **The six channels are the required content.** `control_dt` and `num_frames`
+  are optional on every route: omit `control_dt` and the `control_dt=` argument
+  stands, omit `num_frames` and the channels' own row count is used. A cache
+  short of a channel is refused by naming every channel it lacks - and, when it
+  came from a file, the file.
 - **Frame counts must agree.** Every channel is `[num_frames, ...]`; trimming
   the channels and leaving `num_frames` behind is refused with both counts
   named. Drop `num_frames` (or set it) after editing:
@@ -146,6 +153,22 @@ player = MotionPlayer(cache)
   G1 models expose 30 bodies (no `head`, no `rubber_hand`s) and the hand
   variants 44; both are refused naming what is missing, since a positional
   read of a 30-body model hands the tracker the wrong link for `torso_link`.
+  ProtoMotions' own G1 MJCFs are that embodiment, and no asset is bundled here,
+  so fetch one. Which one matters for the download, not for the cache:
+  `g1_bm.xml`, `g1_bm_box_feet.xml`, `g1_bm_no_mesh_box_feet.xml` and
+  `g1_holo_compat.xml` produce byte-identical `body_pos`, while `g1_holo.xml` is
+  the fingerless case above and is refused by name. Only the no-mesh variant
+  loads from a single file:
+
+```bash
+curl -LO https://raw.githubusercontent.com/NVlabs/ProtoMotions/main/protomotions/data/assets/mjcf/g1_bm_no_mesh_box_feet.xml
+```
+
+  The other three reference `../mesh/G1/*.stl`, which upstream keeps in Git LFS:
+  a `raw.githubusercontent.com` copy of those files is a pointer, and MuJoCo
+  refuses it with `decoder failed for mesh file`. Clone with `git lfs` beside the
+  XML if you want a meshed model — the bridge reads only body frames, so it
+  gains nothing from the meshes.
 - **A floor is added only when the model has none.** The bridge appends a
   plane geom named `floor` unless MuJoCo's parsed geom list already has a
   ground (a `unitree_ros` second `<worldbody>`, a menagerie `scene.xml`

@@ -61,11 +61,16 @@ from strands_robots.simulation.models import (
     registered,
     registry_entry,
 )
+from strands_robots.simulation.newton.actuator_gains import (
+    apply_joint_servos,
+    mjcf_joint_servos,
+)
 from strands_robots.simulation.newton.backend import (
     articulated_solver_error,
     articulated_solvers,
     ensure_newton,
     resolve_solver_class,
+    solver_contact_budget,
     solver_registry,
 )
 from strands_robots.simulation.newton.randomization import DomainRandomizationMixin
@@ -81,6 +86,7 @@ from strands_robots.utils import (
     coerce_size_vector,
     entity_name_error,
     is_boolean,
+    mounted_camera_pose_error,
     non_negative_whole_number_error,
     positive_count_error,
     positive_whole_number_error,
@@ -1175,9 +1181,10 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 state only (used by control loops that do not need pixels).
 
         Returns:
-            Mapping of short joint name to joint position (float), plus one
-            entry per registered camera (name -> RGB ndarray) when
-            ``skip_images`` is False. A robot with a floating base additionally
+            Mapping of short joint name to joint position (float) paired with
+            its velocity under ``<joint>.vel`` (rad/s, the same reading
+            :meth:`get_robot_state` reports), plus one entry per registered
+            camera (name -> RGB ndarray) when ``skip_images`` is False. A robot with a floating base additionally
             carries ``base_pos`` (world x,y,z incl. height), ``base_quat``
             (orientation, w,x,y,z), ``base_lin_vel`` (m/s, WORLD frame) and
             ``base_ang_vel`` (rad/s, BODY frame - matching the MuJoCo backend and
@@ -1219,10 +1226,34 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 idx = self._joint_coord_index.get((robot_name, jname))
                 if idx is not None and idx < len(joint_q):
                     obs[jname] = float(joint_q[idx])
-        # Joint-position sensor noise applies only to the float joint entries;
-        # camera frames are added afterwards (and carry their own jitter via the
-        # render path), so the result holds mixed float/ndarray values.
-        obs_out: dict[str, Any] = dict(self._apply_joint_pos_noise(obs))
+                    # Velocity companion (``<name>.vel``), read from joint_qd via
+                    # the per-joint DOF index - the two indices differ once a
+                    # robot has a multi-coordinate joint, so the position index
+                    # cannot be reused. Concretely, a free joint upstream shifts
+                    # them apart by one entry per joint (7 position coordinates
+                    # against 6 velocity DOFs), which is the whole reason the
+                    # second map exists. The free joint itself is skipped above;
+                    # its own twist is surfaced as ``base_lin_vel`` /
+                    # ``base_ang_vel``.
+                    #
+                    # INSIDE the position branch, and emitted for every position
+                    # entry (0.0 when the DOF index is unavailable, as
+                    # get_robot_state reports it), because a velocity-feedback
+                    # policy reads the pair BY NAME: the MicroduckPolicy
+                    # observation builder indexes obs[f"{joint}.vel"] for all 14
+                    # joints, and WBC / ProtoMotions read the same spelling.
+                    # Without it a locomotion policy that runs on the MuJoCo
+                    # backend raised KeyError on the first tick here. Keeping the
+                    # two in one branch is what makes "every position has a
+                    # velocity" true rather than usually true.
+                    d_idx = self._joint_dof_index.get((robot_name, jname))
+                    obs[f"{jname}.vel"] = float(joint_qd[d_idx]) if d_idx is not None and d_idx < len(joint_qd) else 0.0
+        # Joint sensor noise applies only to the float joint entries -
+        # ``joint_pos_std`` to positions, ``joint_vel_std`` to the ``.vel``
+        # companions, split by suffix inside the helper; camera frames are added
+        # afterwards (and carry their own jitter via the render path), so the
+        # result holds mixed float/ndarray values.
+        obs_out: dict[str, Any] = dict(self._apply_joint_noise(obs))
         # Floating-base IMU-style signals for a robot with a free root (a
         # humanoid / mobile base): ``base_quat`` (orientation, w,x,y,z) and
         # ``base_ang_vel`` (rad/s), consumed by WBC / locomotion controllers.
@@ -1583,6 +1614,15 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                         }
                     ],
                 }
+
+            # A mount with no pose of its own would read the free-camera
+            # defaults in this body's frame - 1.73 m off it, looking back at it.
+            # Checked AFTER the body is known to exist, so an unknown body still
+            # gets the not-found refusal above: the order MuJoCo's ``add_camera``
+            # uses, and this rule exists to make the two backends agree.
+            mount_err = mounted_camera_pose_error("add_camera", name, parent_body, position, target)
+            if mount_err is not None:
+                return {"status": "error", "content": [{"text": mount_err}]}
 
         with self._lock:
             self._world.cameras[name] = SimCamera(
@@ -2897,6 +2937,36 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 tgt[idx] = value
         self._control.joint_target_q = self._wp.array(tgt, dtype=self._wp.float32, device=self._model.device)
 
+    def _apply_mjcf_servo_gains(self, builder: Any, model_path: str, first_joint: int) -> None:
+        """Carry the MJCF's compiled servo damping and torque ceiling onto DOFs.
+
+        Newton's MJCF importer reads a ``<position>`` actuator's ``kp`` into
+        ``joint_target_ke`` but not the ``dampratio`` MuJoCo compiles into a
+        velocity gain, nor its ``forcerange``. The joint then arrives with
+        ``joint_target_kd == 0`` and a 1e6 torque ceiling, and a constant
+        position command oscillates instead of settling - the same command the
+        MuJoCo backend tracks to its target, which breaks the cross-backend
+        equivalence ``add_robot`` advertises. Applied to the builder before
+        ``finalize``, so the solver is built from the corrected gains.
+
+        A model MuJoCo cannot read is not fatal: the robot is already imported,
+        so the gains Newton did carry are kept and the reason is logged rather
+        than aborting the world.
+
+        Args:
+            builder: Newton ``ModelBuilder`` holding the just-imported robot.
+            model_path: The MJCF that was imported.
+            first_joint: Index of this robot's first joint in
+                ``builder.joint_label``.
+        """
+        try:
+            servos = mjcf_joint_servos(model_path)
+        except Exception as exc:  # noqa: BLE001 - fidelity gain, never fatal
+            logger.warning("Newton: MJCF servo gains unread for %s: %s", model_path, exc)
+            return
+        applied = apply_joint_servos(builder, servos, list(builder.joint_label), first_joint, _short_joint_name)
+        logger.debug("Newton: applied MJCF servo gains to %d joints", len(applied))
+
     def _rebuild(self) -> None:
         """(Re)build the Newton model from the current world state.
 
@@ -2933,6 +3003,7 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
                 builder.add_urdf(model_path, xform=xform, collapse_fixed_joints=True)
             else:
                 builder.add_mjcf(model_path, xform=xform, collapse_fixed_joints=True)
+                self._apply_mjcf_servo_gains(builder, model_path, label_before)
             new_labels = builder.joint_label[label_before:]
             # Map each joint to its coordinate index in joint_q and its DOF index
             # in joint_qd. These are NOT the joint's ordinal position: a floating
@@ -2986,7 +3057,11 @@ class NewtonSimEngine(DomainRandomizationMixin, NewtonRecordingMixin, SimEngine)
         # Rigid-body solvers (notably SolverMuJoCo) require at least one joint.
         # An empty world (ground plane only) has none, so defer solver creation
         # until a robot is added; stepping is a no-op until then.
-        self._solver = solver_cls(self._model) if self._model.joint_dof_count > 0 else None
+        self._solver = (
+            solver_cls(self._model, **solver_contact_budget(solver_cls, self._model.shape_count))
+            if self._model.joint_dof_count > 0
+            else None
+        )
         self._state_0 = self._model.state()
         self._state_1 = self._model.state()
         self._control = self._model.control()

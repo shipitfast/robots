@@ -2,7 +2,7 @@
 
 import logging
 import math
-from typing import Any
+from typing import Any, ClassVar
 
 from strands_robots.policies.base import Policy
 from strands_robots.utils import name_list_error, sequence_length
@@ -16,6 +16,7 @@ class MockPolicy(Policy):
     def __init__(self, **kwargs: Any) -> None:
         self.robot_state_keys: list[str] = []
         self._step = 0
+        self._ctrl_bounds: dict[str, tuple[float, float]] = {}
         logger.info("Mock Policy initialized")
 
     @property
@@ -27,6 +28,11 @@ class MockPolicy(Policy):
     def requires_images(self) -> bool:
         """Mock policy only consumes joint state - skip camera rendering."""
         return False
+
+    #: ``False``: every joint follows a sinusoid; ``instruction`` is never read.
+    reads_instruction: ClassVar[bool] = False
+    #: The words the task envelope uses for that sinusoid.
+    instruction_free_actions: ClassVar[str | None] = "a test motion on every joint"
 
     def set_robot_state_keys(self, robot_state_keys: list[str]) -> None:
         """Record the ordered joint keys used to name the sinusoidal action dict.
@@ -43,6 +49,63 @@ class MockPolicy(Policy):
         ):
             raise ValueError(error)
         self.robot_state_keys = robot_state_keys
+
+    def set_sim_context(self, model: Any, namespace: str) -> None:
+        """Learn the range each driven actuator is held to, so the sinusoid stays inside it.
+
+        Called by the MuJoCo engine's ``bind_policy_sim_context`` right after
+        :meth:`set_robot_state_keys`, with the compiled ``MjModel`` and the
+        robot's namespace prefix (``"so100/"``). The mock's ±0.5 rad sinusoid
+        was written for a generic joint; on a real model some actuators do not
+        span it - the SO-100 ``Pitch`` ctrlrange is ``[-3.32, 0.174]`` and its
+        ``Jaw`` is ``[-0.174, 1.75]`` - so the value was held to the range and
+        the engine warned that the commanded trajectory was NOT reproduced.
+        That warning was the first thing ``examples/01_sim_hello_world.py``
+        printed. Knowing the ranges, the mock clips its own output so what it
+        commands is what the actuator does.
+
+        Which range holds the command is
+        :func:`~strands_robots.simulation.mujoco.scene_ops.effective_ctrl_range`\'s
+        rule, read here rather than re-derived: an actuator whose MJCF authors
+        neither ``ctrlrange`` nor ``inheritrange`` compiles to
+        ``ctrlrange == (0, 0)`` with ``actuator_ctrllimited == 0``, and for a
+        position servo its ``ctrl`` IS the joint target, so the driven joint\'s
+        limits bound the pose. Reading only ``actuator_ctrllimited`` therefore
+        learned nothing at all on the so101 - all six of its actuators are in
+        that second case - and the mock commanded -0.433 to a jaw whose joint
+        range is ``[-0.1745, 1.745]``, which is the warning this method exists
+        to prevent.
+
+        Actuators that are held to no range and names that resolve to no
+        actuator are left alone; an error while reading the model leaves the
+        policy exactly as configured, never fails the rollout.
+        """
+        bounds: dict[str, tuple[float, float]] = {}
+        try:
+            import mujoco  # noqa: PLC0415 - optional sim dependency
+
+            # Late, beside its own optional dependency: the rule lives with the
+            # engine that enforces it, and this module is imported by hosts that
+            # have no MuJoCo at all.
+            from strands_robots.simulation.mujoco.scene_ops import (  # noqa: PLC0415
+                actuator_joint_id,
+                effective_ctrl_range,
+            )
+
+            for key in self.robot_state_keys:
+                act_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{namespace}{key}")
+                if act_id < 0:
+                    continue
+                jnt_id = actuator_joint_id(model, act_id, mujoco)
+                held_to, _source_or_reason = effective_ctrl_range(
+                    model, mujoco, act_id, jnt_id if jnt_id >= 0 else None
+                )
+                if held_to is not None:
+                    bounds[key] = held_to
+        except Exception as exc:  # noqa: BLE001 - best-effort, mirrors the engine's binding
+            logger.debug("MockPolicy.set_sim_context could not read ctrlranges: %s", exc)
+            return
+        self._ctrl_bounds = bounds
 
     async def get_actions(
         self, observation_dict: dict[str, Any], instruction: str, **kwargs: Any
@@ -74,7 +137,11 @@ class MockPolicy(Policy):
             for j, key in enumerate(self.robot_state_keys):
                 freq = 0.3 + j * 0.15
                 phase = j * math.pi / 3
-                action_dict[key] = 0.5 * math.sin(2 * math.pi * freq * t + phase)
+                value = 0.5 * math.sin(2 * math.pi * freq * t + phase)
+                bound = self._ctrl_bounds.get(key)
+                if bound is not None:
+                    value = min(max(value, bound[0]), bound[1])
+                action_dict[key] = value
             mock_actions.append(action_dict)
 
         self._step += len(mock_actions)

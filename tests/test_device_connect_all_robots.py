@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from strands_robots.simulation.models import SimRobot
+from tests._device_connect_real import restore_the_edge, use_a_mock_edge
 from tests._sim_stop_policy_stand_in import stop_policy_stand_in
 
 # ── Mock heavy dependencies before importing ──────────────────────
@@ -96,17 +97,6 @@ class FakeDeviceStatus:
 mock_types.DeviceIdentity = FakeDeviceIdentity
 mock_types.DeviceStatus = FakeDeviceStatus
 
-_saved_modules = {}
-_mock_keys = (
-    "device_connect_edge",
-    "device_connect_edge.drivers",
-    "device_connect_edge.types",
-    "device_connect_edge.device",
-)
-_strands_dc_keys = [k for k in sys.modules if k.startswith("strands_robots.device_connect")]
-for _key in list(_mock_keys) + _strands_dc_keys:
-    _saved_modules[_key] = sys.modules.get(_key)
-
 # The robot_mesh dispatch tests below patch
 # ``device_connect_agent_tools.connection.get_connection``, which forces an
 # import of the real ``device_connect_agent_tools`` package (__init__ -> agent
@@ -119,10 +109,17 @@ try:
 except Exception:
     pass
 
-sys.modules["device_connect_edge"] = mock_device_connect_edge
-sys.modules["device_connect_edge.drivers"] = mock_drivers
-sys.modules["device_connect_edge.types"] = mock_types
-sys.modules["device_connect_edge.device"] = MagicMock()
+# The swap has one owner (tests/_device_connect_real.py), which records only
+# what is real: a sibling's mock already under these names, or an integration
+# module bound to one, is not an original to hand back at teardown.
+_mocked_edge = use_a_mock_edge(
+    {
+        "device_connect_edge": mock_device_connect_edge,
+        "device_connect_edge.drivers": mock_drivers,
+        "device_connect_edge.types": mock_types,
+        "device_connect_edge.device": MagicMock(),
+    }
+)
 
 mock_device_runtime = MagicMock()
 mock_device_connect_edge.DeviceRuntime = mock_device_runtime
@@ -136,15 +133,13 @@ pytestmark = pytest.mark.usefixtures("named_rpc_caller")
 
 
 def teardown_module():
-    """Restore real device_connect_edge modules."""
-    for key, original in _saved_modules.items():
-        if original is None:
-            sys.modules.pop(key, None)
-        else:
-            sys.modules[key] = original
-    for key in list(sys.modules):
-        if key.startswith("strands_robots.device_connect"):
-            sys.modules.pop(key, None)
+    """Put the real device_connect_edge back, and the integration it was imported by.
+
+    The integration modules imported here against the mock DeviceDriver base
+    class go; the real ones the process already had come back, entry and parent
+    attribute both.
+    """
+    restore_the_edge(_mocked_edge)
 
 
 # ── Load robot registry ──────────────────────────────────────────

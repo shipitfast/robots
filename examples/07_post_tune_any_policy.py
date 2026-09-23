@@ -11,7 +11,7 @@ Swap ``PROVIDER`` to "groot" or "cosmos3" and only the provider string changes:
 the lerobot draccus CLI, GR00T's tyro FinetuneConfig, and Cosmos's TOML+DCP
 pipeline all hide behind one ``TrainSpec`` + ``Trainer`` lifecycle.
 
-Dependencies: pip install "strands-robots[sim-mujoco,lerobot]"
+Dependencies: pip install "strands-robots[sim-mujoco,lerobot]" "lerobot[training]"
 Expected output: a trained ACT checkpoint under /tmp, loaded back as a Policy.
 Runtime: ~30s on CPU (2 training steps - just enough to prove the loop).
 """
@@ -37,6 +37,11 @@ sim.start_recording(
     fps=30,
     task="pick up the red cube",
     overwrite=True,
+    # Record the sensor added above and nothing else. Unscoped, the implicit
+    # "default" overview view lands in the dataset too, and step 2 bakes it into
+    # the checkpoint's input_features - which then refuses any robot that has no
+    # such camera, i.e. every real one.
+    cameras=["front"],
 )
 # control_frequency must equal the recording's fps above: the recorder writes
 # one frame per control step with no decimation, so the 50 Hz default rollout

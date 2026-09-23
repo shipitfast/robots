@@ -33,6 +33,7 @@ LerobotLocalPolicy(
     policy_type=None,                    # override auto-detected class
     device=None,                         # "cuda" | "cpu" | "mps"
     actions_per_step=1,                  # positive int; auto-set from config.n_action_steps if left at 1
+                                         #   (a value BELOW that chunk is warned about - see RTC)
     use_processor=True,                  # observation/action processor bridge
     processor_overrides=None,
     tokenizer_max_length=48,
@@ -67,8 +68,14 @@ LerobotLocalPolicy(
 
 Loading a large VLA (MolmoAct2 SO-100/101 ships 1,295 weight files) takes a
 minute or more. Models are cached process-wide, keyed by
-`(pretrained_name_or_path, policy_type, device, revision)`; a second
-`create_policy` with the same key reuses the weights. Every instance records
+`(pretrained_name_or_path, policy_type, device, revision)` and by the RTC
+request (`rtc_enabled`, `rtc_execution_horizon`, `rtc_max_guidance_weight`); a
+second `create_policy` with the same key reuses the weights. RTC is part of the
+key because it is configured on the model rather than beside it, so an RTC-on
+and an RTC-off policy from one checkpoint hold one resident copy each - which is
+what lets an on/off comparison run in a single process without either arm
+rewriting the other's RTC. Call `clear_model_cache()` between the two arms when
+the memory matters more than the reload. Every instance records
 `load_cache_hit` (`bool`) and `load_time_s` (`float`, near `0.0` on a hit),
 and `run_policy` reports them as
 `policy_load_cache_hit` / `policy_load_time_s` in its result block.
@@ -166,6 +173,18 @@ Naming only one leaves the other inert, and the diagnostic keeps reporting
 whichever half is still unnormalized. Fine-tuning the checkpoint writes stats
 under the canonical keys and needs no override at all.
 
+Where those stats come from is usually the checkpoint you already have. A
+pretraining base checkpoint carries its training datasets' stats under prefixed
+keys rather than the canonical ones LeRobot looks up, so the diagnostic lists the
+spellings it found per missing key -- `lerobot/smolvla_base` reports
+`{'observation.state': [], 'action': ['so100-blue.buffer.action',
+'so100-red.buffer.action', 'so100.buffer.action']}`. Remap one onto `action` and
+pass it as the override above. They are listed rather than adopted because those
+three describe different distributions (joint 0's std is 26.4, 14.1 and 14.3),
+so choosing one is the caller's decision; and the empty `observation.state` list
+is the useful half of that answer -- this checkpoint ships no state stats at all,
+which is why proprioception needs the units half below as well.
+
 Stats also carry the *units* the dataset was recorded in, and that is the second
 half a sim caller owes. An SO-arm dataset comes through the driver's
 `MotorNormMode` - arm joints in servo **degrees**, gripper in `RANGE_0_100`
@@ -197,7 +216,12 @@ policy = create_policy(
 The built-in `so100` / `so101` maps declare `state_units`/`action_units`
 `"degrees"`; every other map defaults to `"native"`, which is right for real
 hardware - an SO follower already reports driver units - and wrong for a sim
-packing radians.
+packing radians. Those two spellings are the whole vocabulary
+(`embodiment.UNIT_FRAMES`) and any other is refused wherever a frame is held -
+when the map is built, and when LeRobot rebuilds the pack-state step from a
+checkpoint's saved `policy_preprocessor.json`: `"DEGREES"`, the spelling
+LeRobot's own `MotorNormMode` uses, would otherwise mean `"native"` and convert
+nothing.
 
 Both halves of a declared map are installed as *preprocessor* steps, so a
 checkpoint that ships no `policy_preprocessor.json` (only a postprocessor) has
@@ -231,6 +255,16 @@ present the vector is partly bound and the policy reports the absent keys, the
 keys the observation does carry and the remedy; when none are present it falls
 back to the observation's own state vector. Both degradations are logged, and
 `strict_keys=True` turns them into raises.
+
+The remedy names an `embodiment=` only when a shipped one declares `state_keys`
+the observation carries, so following it cannot land back on the same mismatch.
+One exception is reported instead of recommended: if a declared embodiment was
+already **rejected** at load time - its `obs_rename` names an image feature the
+checkpoint does not declare, so the whole map including the state binding is
+discarded (see [Camera routing](#embodiment-obs_rename-and-the-pre-flight-check))
+- then re-passing it would loop. The remedy then says the embodiment was
+rejected and points at `camera_key_map=` / `obs_rename_override=` to make it
+validate, or `set_robot_state_keys([...])`.
 
 ## Camera routing
 
@@ -274,6 +308,34 @@ provides [...]. Either: (a) rename your sim cameras to one of ['front', 'wrist']
 ..., or (b) pass policy_config={'camera_key_map': {...}} ...
 ```
 
+### When the checkpoint declares different image features
+
+An embodiment's rename targets are a *guess* about a checkpoint's feature names,
+and a pretrained checkpoint records its own `input_features`. `so101` feeds
+`observation.images.image` + `.../wrist_image`; `lerobot/smolvla_base` declares
+`observation.images.camera1..3`. No camera name can satisfy a target the model
+does not declare, so the pre-flight check reads the checkpoint's declared
+features (from its `config.json`, before the weight download) and reports that
+mismatch instead of asking for a camera rename that cannot help:
+
+```text
+Embodiment 'so101' feeds image feature(s) ['observation.images.image',
+'observation.images.wrist_image'], which 'lerobot/smolvla_base' does not declare
+- it declares ['observation.images.camera1', 'observation.images.camera2',
+'observation.images.camera3']. ... Route the features it does declare instead:
+policy_config={'obs_rename_override': {'front': None, 'wrist': None,
+'camera1': 'observation.images.camera1', ...}} - a falsy value drops a rename
+this checkpoint cannot accept.
+```
+
+Both halves are needed: the drops alone leave the declarative path with no
+camera routing, and the model then raises "All image features are missing from
+the batch". Without this check the mismatch was reported after the download, as
+`EmbodimentMap.validate` rejecting the rename - at which point the whole
+processor pipeline is discarded, **including the embodiment's `state_units` /
+`action_units` conversion**, so a sim in radians silently reached a
+degrees-trained checkpoint as radians under a successful-looking run.
+
 A single-camera checkpoint needs no embodiment: declare the joint names with
 `set_robot_state_keys([...])` and the policy synthesizes a state-only embodiment
 that routes the one declared image feature to the one camera.
@@ -300,7 +362,15 @@ checkpoint itself was saved with.
 
 The sim consumes `policy.execution_horizon` actions from each chunk before
 re-querying - `rtc_execution_horizon` (default 10) for an RTC policy, the full
-chunk otherwise. For relative-action checkpoints (pi0 / pi0.5 / pi0-FAST
+chunk otherwise.
+
+RTC - not a smaller `actions_per_step` - is how you shorten that interval.
+Pinning `actions_per_step` below the checkpoint's `config.n_action_steps`
+truncates every chunk to its prefix and re-queries from a state the model was
+never trained to replay from, so each seam is a discontinuity in the commanded
+trajectory; the provider now names that when it happens. `rtc_enabled=True`
+re-queries just as often and blends the unexecuted tail into the next chunk
+instead, leaving `actions_per_step` at the trained chunk. For relative-action checkpoints (pi0 / pi0.5 / pi0-FAST
 trained with `RelativeActionsProcessorStep`) the carried prefix is re-anchored
 to the state at the new query, so the seam does not double-apply the offset.
 

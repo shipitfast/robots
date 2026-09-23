@@ -187,18 +187,27 @@ LOW_BATTERY_VOLTS: float = 3.2
 #: ``pmStates`` enum order.
 POWER_STATES: tuple[str, ...] = ("battery", "charging", "charged", "low_power", "shutdown")
 
-#: The log variables one telemetry block subscribes to, as ``(name, ctype)``.
+#: The log variables one telemetry block subscribes to, as ``(name, fetch_as)``.
 #: All are core variables present on a bare Crazyflie with no expansion deck -
 #: a block naming an absent variable fails to add entirely, which would take
 #: the pose and battery reads down with whichever deck-specific variable was
 #: optimistically included.
+#:
+#: One block is one CRTP packet, and ``cflib`` refuses a block whose fetched
+#: bytes exceed ``LogConfig.MAX_LEN`` (26; the other four of the 30-byte
+#: payload are the block id and the timestamp) with ``AttributeError`` at
+#: ``add_config``. Fetching the attitude as ``float`` alongside the position
+#: put this block at 29 bytes, so the attitude is fetched as ``FP16`` - the
+#: type ``cflib`` provides for fitting a block into its packet - which keeps
+#: the position and the battery voltage at full width and lands the block at
+#: 23 bytes.
 LOG_VARIABLES: tuple[tuple[str, str], ...] = (
     ("stateEstimate.x", "float"),
     ("stateEstimate.y", "float"),
     ("stateEstimate.z", "float"),
-    ("stabilizer.roll", "float"),
-    ("stabilizer.pitch", "float"),
-    ("stabilizer.yaw", "float"),
+    ("stabilizer.roll", "FP16"),
+    ("stabilizer.pitch", "FP16"),
+    ("stabilizer.yaw", "FP16"),
     ("pm.vbat", "float"),
     ("pm.state", "uint8_t"),
 )
@@ -555,7 +564,6 @@ class CrazyflieDriver:
         *,
         port: str | None = None,
         setpoint_hz: int = DEFAULT_SETPOINT_HZ,
-        **kwargs: Any,
     ) -> None:
         """Record configuration; :meth:`connect_eagerly` opens the radio.
 
@@ -571,7 +579,6 @@ class CrazyflieDriver:
             setpoint_hz: Rate at which the latched setpoint is re-sent, in Hz.
                 A positive integer: it divides into the repeater's sleep, and
                 the firmware supervisor cuts thrust if the stream goes quiet.
-            **kwargs: Ignored; accepted so the factory can forward extras.
 
         Raises:
             ValueError: If ``setpoint_hz`` is not a positive integer. Raised
@@ -582,8 +589,6 @@ class CrazyflieDriver:
                 infinity inside a background thread, where nothing reports it.
         """
         del cameras, data_config
-        if kwargs:
-            logger.debug("CrazyflieDriver ignoring extra kwargs: %s", sorted(kwargs))
         if (reason := positive_count_error(setpoint_hz, "setpoint_hz", "CrazyflieDriver")) is not None:
             raise ValueError(reason)
 

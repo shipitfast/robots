@@ -13,6 +13,7 @@ import os
 import socket
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -142,8 +143,30 @@ def _emit_insecure_tls_warning(kind: str) -> None:
 # ── REST API ─────────────────────────────────────────────────────
 
 
-def api(host: str, port: int, path: str, method: str = "GET", data: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Call Reachy Mini daemon REST API."""
+def api(host: str, port: int, path: str, method: str = "GET", data: dict[str, Any] | None = None) -> Any:
+    """Call Reachy Mini daemon REST API.
+
+    Args:
+        host: Daemon host.
+        port: Daemon port.
+        path: Request path, e.g. ``/api/daemon/status``.
+        method: HTTP method.
+        data: JSON body, or ``None``.
+
+    Returns:
+        The decoded body, unreshaped. ``json.loads`` decodes any JSON value, so
+        this is whatever the daemon answered with: an object for most
+        endpoints, an array for a catalogue read, and a scalar for a daemon (or
+        an interposed proxy) that answered with one. The return type is
+        therefore ``Any`` rather than ``dict``, which is what lets a caller that
+        needs an object judge that shape - see
+        :meth:`~strands_robots.device_connect.reachy_mini_driver.ReachyMiniDriver._transport_failure`
+        for the rule and :meth:`strands_robots.drivers.reachy.ReachyDriver._daemon_get`
+        for the native driver's door.
+
+        Every HTTP and connection failure is reported as ``{"error": ...}``
+        instead of raising, so no caller needs a ``try``.
+    """
     import urllib.error
     import urllib.request
 
@@ -254,7 +277,7 @@ class ZenohLink(HardwareLink):
 
 
 class WebSocketLink(HardwareLink):
-    """Lite variant - real-time I/O via daemon's WebSocket."""
+    """Real-time I/O via the daemon WebSocket (Lite and Wireless on 1.10.0)."""
 
     _WS_CMD_MAP = {
         "head_pose": lambda c: {"type": "set_target", "head": [v for row in c["head_pose"] for v in row]},
@@ -291,7 +314,11 @@ class WebSocketLink(HardwareLink):
         _extra_headers = {"Authorization": f"Bearer {_token}"} if _token else None
         if not _token:
             _warn_unauthenticated_once("WebSocket")
-        _connect_kwargs: dict[str, Any] = {}
+        # Keep the socket close handshake inside the native driver's five-second
+        # cleanup budget. The websockets default is ten seconds: a daemon that
+        # never acknowledges close otherwise leaves keepalive/stop tasks on a
+        # loop the driver has already closed.
+        _connect_kwargs: dict[str, Any] = {"close_timeout": 1.0}
         if _extra_headers:
             # websockets >=12 uses additional_headers; older uses extra_headers.
             try:
@@ -326,28 +353,35 @@ class WebSocketLink(HardwareLink):
         The handle is dropped before the close is awaited because
         :meth:`send_cmd` reads it as its "is the socket connected?" test. A
         closed socket left in ``_ws`` is still truthy, so that guard cannot see
-        a stop: the send goes ahead on a closed connection and surfaces as the
-        ``ConnectionClosed`` the socket raises, out of a method documented to
-        be a no-op when the socket is not connected.
+        a stop. Dropping the handle makes later sends report disconnection
+        rather than attempt a write on a closed socket.
 
         Clearing first also holds when the close itself fails - the socket is
         gone either way, so the link must stop offering it as connected.
         """
-        if self._read_task:
-            self._read_task.cancel()
         ws, self._ws = self._ws, None
-        if ws:
-            await ws.close()
+        try:
+            if self._read_task:
+                self._read_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._read_task
+        finally:
+            if ws:
+                await ws.close()
 
     async def send_cmd(self, cmd: dict[str, Any]) -> None:
         """Translate the first recognised command key to the daemon wire format.
 
         Maps ``head_pose`` / ``antennas_joint_positions`` / ``body_yaw`` /
-        ``torque`` to their WebSocket message shape and sends it; a no-op when the
-        socket is not connected or no known key is present.
+        ``torque`` to their WebSocket message shape and sends it; a no-op when no
+        known key is present. A completed send means transport submission only:
+        the daemon's SDK WebSocket does not acknowledge target adoption or motion.
+
+        Raises:
+            ConnectionError: The link has not started or has already stopped.
         """
-        if not self._ws:
-            return
+        if self._ws is None:
+            raise ConnectionError("Reachy WebSocket is not connected; command was not sent")
         for key, fn in self._WS_CMD_MAP.items():
             if key in cmd:
                 await self._ws.send(json.dumps(fn(cmd)))

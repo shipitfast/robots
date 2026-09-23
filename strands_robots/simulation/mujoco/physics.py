@@ -18,6 +18,7 @@ Exposes the deep MuJoCo C API through clean Python methods:
 import logging
 import math
 import numbers
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -34,12 +35,13 @@ from strands_robots.simulation.mujoco.backend import (
 from strands_robots.simulation.mujoco.scene_ops import (
     fromto_fixed_size_components,
     joint_drive_map,
+    joint_position_unit,
     joint_rate_drive_map,
     persist_body_mass,
     persist_geom_properties,
     refresh_body_inertial_from_geometry,
 )
-from strands_robots.simulation.safe_output import atomic_write_bytes, validate_output_path
+from strands_robots.simulation.safe_output import atomic_write_bytes, resolve_sandbox_root, validate_output_path
 from strands_robots.utils import (
     BOOLEAN_VECTOR_REASON,
     boolean_flag_error,
@@ -522,6 +524,60 @@ def _geom_type_name(mj: Any, geom_type: int) -> str:
         return f"type_{int(geom_type)}"
 
 
+def scene_root() -> Path:
+    """The directory a relative scene path names, for both writing and reading.
+
+    Defaults to ``~/.strands_robots/scenes``; override with the
+    ``STRANDS_ROBOTS_SCENE_ROOT`` env var (read at call time). The sibling of
+    the render sandbox (``STRANDS_ROBOTS_RENDER_ROOT``), resolved the same way.
+
+    One owner for the location, read by the sink that writes there
+    (:meth:`PhysicsMixin.export_xml`) and by the source that reads it back
+    (:meth:`~strands_robots.simulation.mujoco.simulation.Simulation.load_scene`),
+    so an exported scene and the reload of it cannot disagree about where the
+    file is.
+    """
+    return resolve_sandbox_root("STRANDS_ROBOTS_SCENE_ROOT", "scenes")
+
+
+def anchor_relative_scene_path(scene_path: str) -> str:
+    """Anchor a relative scene path to :func:`scene_root`.
+
+    An absolute path (after ``~`` expansion) is returned unchanged - the
+    historic contract that ``export_xml`` writes to any absolute destination,
+    and ``load_scene`` reads any absolute source, holds. A relative one, bare
+    (``"scene.xml"``) or with directories (``"handoff/scene.xml"``), is joined
+    under the scenes directory instead of resolving against the process CWD.
+
+    Nothing is validated here. On the write path the result still goes through
+    :func:`~strands_robots.simulation.safe_output.validate_output_path`, whose
+    traversal check scans every part of the joined path, so ``".."`` cannot
+    climb back out of the anchor.
+    """
+    raw = Path(scene_path).expanduser()
+    if raw.is_absolute() or not scene_path.strip():
+        return scene_path
+    return str(scene_root() / raw)
+
+
+def scene_not_found_error(scene_path: str) -> str:
+    """Say a scene file is missing, naming every directory that was searched.
+
+    A relative source is looked for as given (against the process working
+    directory) and then in the scenes directory, so a refusal that named only
+    the caller's spelling left an agent with no way to tell which of the two
+    places to fix. An absolute path has one candidate, so only it is named.
+    """
+    raw = Path(scene_path).expanduser()
+    if raw.is_absolute() or not scene_path.strip():
+        return f"Scene file not found: {scene_path}"
+    return (
+        f"Scene file not found: {scene_path} - looked in the working directory {Path.cwd()} "
+        f"and the scenes directory {scene_root()}, where a relative export_xml destination lands. "
+        "Pass an absolute scene_path, or export with the same relative name first."
+    )
+
+
 class PhysicsMixin:
     """Advanced MuJoCo physics capabilities mixed into ``Simulation``.
 
@@ -803,6 +859,13 @@ class PhysicsMixin:
         mj = _ensure_mujoco()
         data = self._world._data
 
+        # A latched wrench is state, so it is scoped like one: with two so101s
+        # in the scene 'gripper' names a body on each, and the shared retry
+        # latched it on the first robot attached (_refuse_ambiguous_bare_name).
+        if err := self._refuse_ambiguous_bare_name(
+            mj.mjtObj.mjOBJ_BODY, body_name, "apply_force", "body", "Qualify the name"
+        ):
+            return err
         body_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_BODY, body_name)
         if body_id < 0:
             return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Body", body_name)}]}
@@ -881,7 +944,11 @@ class PhysicsMixin:
         the caller MUST pass the namespaced form (``arm0/gripper``) to
         disambiguate. The fallback returns the first match it finds,
         which is non-deterministic - this is a deliberate
-        "unambiguous or explicit" contract.
+        "unambiguous or explicit" contract. A write that reaches this retry
+        refuses an ambiguous bare name outright
+        (:meth:`_refuse_ambiguous_bare_name`); a read answers and reports the
+        name it resolved to (:meth:`_resolved_name_note`), so which entity
+        answered is part of the answer rather than a caller's guess.
         """
 
         assert self._world is not None and self._world._model is not None
@@ -901,6 +968,222 @@ class PhysicsMixin:
                 if mid >= 0:
                     return int(mid)
         return -1
+
+    def _bare_name_owners(self, obj_type: int, name: object, labels: bool = False) -> list[str]:
+        """The robots a bare name resolves on, in attachment order.
+
+        Mirrors the retry in :meth:`_resolve_mj_name`: each attached robot tried
+        as ``<namespace><name>``, so ``owners[0]`` is the robot that retry would
+        have picked. ``labels`` adds the registry joint-label pass the joint
+        write path falls back to, and only when no namespace carried the name -
+        the order the write path resolves in, where a namespace hit ends the
+        lookup before a label is read.
+
+        Empty when the retry is not what decides the lookup: an already
+        qualified name, a non-string, no compiled scene, or a name the model
+        carries verbatim - ``mj_name2id`` answers that one and no robot is
+        consulted, so there is nothing to disambiguate. That last case is also
+        what keeps a namespace-less robot out: ``<namespace><name>`` is the name
+        itself for it, which the verbatim check has already answered.
+        """
+        if self._world is None or self._world._model is None or not isinstance(name, str) or "/" in name:
+            return []
+        # No _ensure_mujoco() here: ``obj_type`` is an ``mjtObj`` member, so
+        # every caller has already resolved the module to name it.
+        model = self._world._model
+        if mj_name_to_id(model, obj_type, name) >= 0:
+            return []
+        owners = [
+            r.name
+            for r in self._world.robots.values()
+            if mj_name_to_id(model, obj_type, (r.namespace or "") + name) >= 0
+        ]
+        if not owners and labels:
+            owners = [r.name for r in self._world.robots.values() if self._resolve_joint_label(name, r.name) >= 0]
+        return owners
+
+    def _resolved_name_note(self, obj_type: int, requested: object, entity_id: int) -> str:
+        """What a read owes when the namespace retry, not the caller, chose the entity.
+
+        The physics writes refuse a bare name several robots carry
+        (:meth:`_refuse_ambiguous_bare_name`); the readers keep resolving it, and
+        the reason they may is that a read "names one entity and the caller can
+        ask again". The answer named the *request*: ``Body 'base' (id=1)`` for a
+        scene whose only bodies are ``alice/base`` and ``bob/base``, so it named
+        neither the entity that was read nor the fact that a choice had been
+        made, and there was nothing for the caller to ask again about.
+
+        Returns the sentence such a read appends to its answer, and ``""`` when
+        the retry is not what decided - an entity the caller's own spelling
+        names, an unnamed one, or a lookup that found nothing. When several
+        robots carry the name it also names them and the spelling that reads
+        each other one, so the "ask again" the exemption rests on is a remedy
+        the caller can follow rather than a possibility they cannot see.
+
+        Args:
+            obj_type: The ``mjtObj`` type that was looked up.
+            requested: The name the caller passed.
+            entity_id: The id the lookup returned. The resolved name is read
+                back off it, so the note cannot name an entity other than the
+                one the answer describes.
+        """
+        if entity_id < 0 or self._world is None or self._world._model is None:
+            return ""
+        # ``mj_id2name`` has no module-level wrapper to borrow, unlike the
+        # ``mj_name_to_id`` the sibling lookups use, so resolve the module here.
+        resolved = _ensure_mujoco().mj_id2name(self._world._model, obj_type, entity_id)
+        if not resolved or resolved == requested:
+            return ""
+        note = f"resolved '{requested}' to '{resolved}'"
+        owners = self._bare_name_owners(obj_type, requested)
+        if len(owners) < 2:
+            return f"{note}."
+        listed = " and ".join(f"'{owner}'" for owner in owners)
+        # Every owner but the one that answered: the caller already has this
+        # entity, and the point of the list is the ones they have not seen.
+        others = " or ".join(f"'{owner}/{requested}'" for owner in owners if f"{owner}/{requested}" != resolved)
+        return f"{note}; robots {listed} each carry '{requested}' - qualify the name to read another ({others})."
+
+    def _refuse_ambiguous_bare_name(
+        self,
+        obj_type: int,
+        name: object,
+        method: str,
+        kind: str,
+        remedy: str,
+        labels: bool = False,
+    ) -> dict[str, Any] | None:
+        """Refuse a bare name that several attached robots each carry.
+
+        :meth:`_resolve_mj_name`'s retry is documented as an "unambiguous or
+        explicit" contract: it returns the first robot that matches, and its
+        docstring says the caller MUST qualify the name in a multi-robot scene.
+        A read can live on that - it names one entity and the caller can ask
+        again, which is the population the fallback was written for, and
+        :meth:`_resolved_name_note` is what makes both halves of that true: the
+        answer names the entity it resolved and who else carries the name. A WRITE
+        cannot: the state it changed belongs to a robot the caller never
+        addressed, and no answer says which one it was. So every physics write
+        enforces the contract the resolver only describes, on the same terms the
+        list form, ``get_robot_state``, ``move_to`` and ``run_policy`` already
+        refuse a multi-robot scene they cannot scope.
+
+        ``None`` - the caller proceeds - unless at least two robots answer the
+        name. A name only one robot carries is the case the retry exists for.
+
+        Args:
+            obj_type: The ``mjtObj`` type being looked up.
+            name: The caller's name, refused only when it is bare and ambiguous.
+            method: Calling method name, used in the error text.
+            kind: What the name names, in the error text (``"body"``, ``"geom"``,
+                ``"joint key"``).
+            remedy: The sentence before the qualified-spelling example, so each
+                door offers the remedies it actually has (only the joint writes
+                take ``robot_name=``; only a geom takes ``geom_id=``).
+            labels: Whether a registry joint label may resolve the name.
+        """
+        owners = self._bare_name_owners(obj_type, name, labels)
+        if len(owners) < 2:
+            return None
+        listed = " and ".join(f"'{o}'" for o in owners)
+        # Every owner in the example, not just the first: an example naming one
+        # robot reads as a recommendation, and the agent then picks the robot
+        # the fallback would have.
+        qualified = " or ".join(f"'{o}/{name}'" for o in owners)
+        return {
+            "status": "error",
+            "content": [
+                {
+                    "text": (
+                        f"{method}: {kind} '{name}' is ambiguous - robots {listed} each carry it, "
+                        f"so nothing was written. {remedy} ({qualified})."
+                    )
+                }
+            ],
+        }
+
+    def _robot_joint_labels(self, robot: Any) -> dict[str, str]:
+        """``{asset joint name: label}`` for one attached robot, from the registry.
+
+        Empty when the robot was added from a bare file rather than a registry
+        entry, when its entry declares no ``joint_labels``, or when none of
+        those labels names a joint this model actually carries.
+        """
+        # ``add_robot`` resolves the model from ``data_config`` when it is given
+        # and from the instance ``name`` otherwise - its documented precedence -
+        # so the registry entry a robot came from is ``data_config or name``,
+        # which is how the mesh lookup in that same call already spells it
+        # (``_ensure_meshes(resolved_path, data_config or name)``). Reading only
+        # ``data_config`` left every robot added by the short form the
+        # quickstart teaches - ``add_robot("so101")`` - unlabelled. A label map
+        # is keyed by the asset's joint name, so a ``name`` that collides with
+        # an unrelated registry entry cannot mislabel a joint: its keys simply
+        # match none of the model's joints.
+        source = getattr(robot, "data_config", None) or getattr(robot, "name", None)
+        if not source or self._world is None:
+            return {}
+        from strands_robots.registry import joint_labels
+
+        mj = _ensure_mujoco()
+        ns = robot.namespace or ""
+        # Only labels naming a joint this model actually has, so the three
+        # consumers - the state text, its ``joint_labels`` map and the refusal
+        # hint - cannot advertise a label the write path would then refuse.
+        return {
+            jnt: lbl
+            for jnt, lbl in joint_labels(source).items()
+            if self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, ns + jnt) >= 0
+        }
+
+    def _resolve_joint_label(self, key: object, robot_name: str | None) -> int:
+        """Resolve a joint *label* (``shoulder_pan``) or ``<robot>/<label>`` to a joint id.
+
+        Labels come from the registry entry's ``joint_labels`` block, so an
+        agent can write the joint by what it does rather than by the asset's
+        servo id or CAD term. With ``robot_name`` only that robot's labels are
+        consulted; without it the robots are tried in attachment order and the
+        first carrying the label wins, mirroring the namespace fallback for a
+        bare asset name. ``-1`` when nothing matches.
+        """
+        if not isinstance(key, str) or self._world is None:
+            return -1
+        mj = _ensure_mujoco()
+        label = key
+        candidates = list(self._world.robots.values())
+        if robot_name is not None:
+            robot = registry_entry(self._world.robots, robot_name)
+            candidates = [robot] if robot is not None else []
+        if "/" in key:
+            head, _, label = key.rpartition("/")
+            ns = head + "/"
+            candidates = [r for r in candidates if (r.namespace or "") == ns]
+        for robot in candidates:
+            # Labels are a fixed vocabulary (``shoulder_pan``), so case is not
+            # information: ``Shoulder_Pan`` from a capitalising agent means it.
+            by_label = {lbl.lower(): jnt for jnt, lbl in self._robot_joint_labels(robot).items()}
+            jnt = by_label.get(label.lower())
+            if jnt is None:
+                continue
+            jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, (robot.namespace or "") + jnt)
+            if jnt_id >= 0:
+                return jnt_id
+        return -1
+
+    def _joint_labels_hint(self, robot_name: str | None) -> str:
+        """One sentence naming the labels a joint key may use, or ``""`` when there are none."""
+        if self._world is None:
+            return ""
+        robots = list(self._world.robots.values())
+        if robot_name is not None:
+            robot = registry_entry(self._world.robots, robot_name)
+            robots = [robot] if robot is not None else []
+        parts = []
+        for robot in robots:
+            labels = self._robot_joint_labels(robot)
+            if labels:
+                pairs = ", ".join(f"{jnt}={lbl}" for jnt, lbl in labels.items())
+                parts.append(f"'{robot.name}' joints may also be written by label ({pairs}).")
+        return " ".join(parts)
 
     def _unknown_mj_entity_msg(self, kind: str, requested: object) -> str:
         """Actionable "<kind> not found" message for the physics/introspection
@@ -1119,6 +1402,11 @@ class PhysicsMixin:
         names, and a caller who pairs one robot's joint names with the leading
         columns silently reads another robot's Jacobian.
 
+        The body/site/geom name may be bare or namespaced; a bare name is
+        retried under each robot's namespace, and when that retry is what
+        resolved it the answer names the entity it landed on - so a Jacobian
+        spanning two robots also says which one's entity it is for.
+
         Returns:
             ``{"status": "success", "content": [{"text"}, {"json": {"jacp",
             "jacr", "nv", "dof_joint_names"}}]}`` on success, an error envelope
@@ -1148,25 +1436,33 @@ class PhysicsMixin:
                     return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Body", body_name)}]}
                 mj.mj_jacBody(model, data, jacp, jacr, obj_id)
                 label = f"body '{body_name}'"
+                note = self._resolved_name_note(mj.mjtObj.mjOBJ_BODY, body_name, obj_id)
             elif site_name:
                 obj_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_SITE, site_name)
                 if obj_id < 0:
                     return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Site", site_name)}]}
                 mj.mj_jacSite(model, data, jacp, jacr, obj_id)
                 label = f"site '{site_name}'"
+                note = self._resolved_name_note(mj.mjtObj.mjOBJ_SITE, site_name, obj_id)
             elif geom_name:
                 obj_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_GEOM, geom_name)
                 if obj_id < 0:
                     return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Geom", geom_name)}]}
                 mj.mj_jacGeom(model, data, jacp, jacr, obj_id)
                 label = f"geom '{geom_name}'"
+                note = self._resolved_name_note(mj.mjtObj.mjOBJ_GEOM, geom_name, obj_id)
             else:
                 return {"status": "error", "content": [{"text": "Specify body_name, site_name, or geom_name."}]}
 
         return {
             "status": "success",
             "content": [
-                {"text": f"Jacobian for {label}: pos={jacp.shape}, rot={jacr.shape}, nv={model.nv}"},
+                {
+                    "text": (
+                        f"Jacobian for {label}: pos={jacp.shape}, rot={jacr.shape}, nv={model.nv}"
+                        + (f"\n{note}" if note else "")
+                    )
+                },
                 {
                     "json": {
                         "jacp": jacp.tolist(),
@@ -1343,6 +1639,12 @@ class PhysicsMixin:
         Returns Cartesian pose + 6D spatial velocity (linear + angular),
         computed at the current ``qpos``/``qvel`` (the forward pipeline is run
         first so pose and velocity are never a stale earlier state).
+
+        The name may be bare (``"gripper"``) or namespaced
+        (``"arm0/gripper"``); a bare name is retried under each robot's
+        namespace, and when that retry is what resolved it the answer names the
+        entity it landed on - plus, in a scene where several robots carry the
+        name, who else carries it and the spelling that reads them.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
@@ -1396,6 +1698,8 @@ class PhysicsMixin:
             f"  angvel: [{angvel[0]:.4f}, {angvel[1]:.4f}, {angvel[2]:.4f}]\n"
             f"  mass: {mass:.4f}kg, com: {com}"
         )
+        if note := self._resolved_name_note(mj.mjtObj.mjOBJ_BODY, body_name, body_id):
+            text += f"\n  {note}"
 
         return {"status": "success", "content": [{"text": text}, {"json": state}]}
 
@@ -1487,8 +1791,31 @@ class PhysicsMixin:
             jnt_id = -1
             if ns and isinstance(jnt_name, str) and "/" not in jnt_name:
                 jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, ns + jnt_name)
+            elif not ns and isinstance(jnt_name, str) and "/" not in jnt_name:
+                # No scope and a bare key: the shared lookup's first-match
+                # fallback is documented as "unambiguous or explicit", but a
+                # WRITE has to enforce that contract rather than describe it.
+                # Two so101s both carry joint ``1`` (and label
+                # ``shoulder_pan``); resolving the first one attached moved a
+                # robot the caller never addressed while get_robot_state,
+                # move_to and run_policy on the same scene refused to guess.
+                if err := self._refuse_ambiguous_bare_name(
+                    mj.mjtObj.mjOBJ_JOINT,
+                    jnt_name,
+                    method,
+                    "joint key",
+                    "Pass robot_name= to scope the write, or qualify the key",
+                    labels=True,
+                ):
+                    return {}, err
             if jnt_id < 0:
                 jnt_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_JOINT, jnt_name)
+            if jnt_id < 0:
+                # The registry's joint label (``shoulder_pan`` for the SO-101's
+                # joint ``1``), scoped to ``robot_name`` when given, otherwise
+                # the first robot whose labels carry it - the same order the
+                # namespace fallback above uses for a bare asset name.
+                jnt_id = self._resolve_joint_label(jnt_name, robot_name)
             if jnt_id >= 0:
                 resolved[jnt_name] = jnt_id
             else:
@@ -1499,6 +1826,9 @@ class PhysicsMixin:
         detail = self._unknown_mj_entity_msg("Joint", unresolved[0])
         if len(unresolved) > 1:
             detail = f"Unresolved '{name}' keys: {unresolved}. {detail}"
+        labels_hint = self._joint_labels_hint(robot_name)
+        if labels_hint:
+            detail = f"{detail} {labels_hint}"
         return {}, {
             "status": "error",
             "content": [
@@ -1594,7 +1924,13 @@ class PhysicsMixin:
 
         Args:
             positions: The pose to write, as ``{joint_name: value}`` or as an
-                ordered vector (see the two accepted forms above).
+                ordered vector (see the two accepted forms above). Every value is
+                in its joint's own unit -- radians for a hinge, metres for a slide
+                (:func:`~strands_robots.simulation.mujoco.scene_ops.joint_position_unit`)
+                -- so an angle read from a real arm, whose driver reports degrees,
+                must be converted before it is written here. A value the joint's
+                range does not contain is refused naming that unit, and named as a
+                degree reading when converting it would land inside the range.
             robot_name: Which robot the ordered form binds to, and whose
                 namespace resolves an unqualified joint name. Optional when the
                 world holds exactly one robot. When given it must name a robot
@@ -1714,7 +2050,21 @@ class PhysicsMixin:
                 continue
             lo, hi = (float(x) for x in model.jnt_range[jnt_id])
             if not lo <= float(value) <= hi:
-                out_of_range.append(f"{jnt_name}={float(value):.4g} outside [{lo:.4g}, {hi:.4g}]")
+                # Name the unit the bounds are in. Without it the cheapest reading
+                # of "outside [-1.92, 1.92]" is "clamp to the bound", which is the
+                # wrong pose whenever the caller is holding the same angle in
+                # another unit; and a degree reading is how a caller mirroring a
+                # real arm arrives here, because a driver reports degrees while
+                # this write takes radians. The degree sentence is added only when
+                # converting the value actually lands inside the range, so it
+                # states a fact about this call rather than guessing at intent.
+                unit = joint_position_unit(model, jnt_id, mj)
+                detail = f"{jnt_name}={float(value):.4g} outside [{lo:.4g}, {hi:.4g}]"
+                if unit:
+                    detail += f" {unit}"
+                if unit == "rad" and lo <= math.radians(float(value)) <= hi:
+                    detail += f" (radians, not degrees: {float(value):.4g} deg = {math.radians(float(value)):.4g} rad)"
+                out_of_range.append(detail)
         if out_of_range:
             return {
                 "status": "error",
@@ -1794,6 +2144,11 @@ class PhysicsMixin:
 
         Writes to qvel. Useful for initializing dynamics. Accepts dict or list
         (see set_joint_positions for list semantics).
+
+        Every value is in its joint's own unit per second -- rad/s for a hinge,
+        m/s for a slide, the per-second form of the unit
+        :func:`~strands_robots.simulation.mujoco.scene_ops.joint_position_unit`
+        names -- and not degrees per second.
 
         Every value must be a finite real number (Python or NumPy scalar), and
         must not be a boolean. A
@@ -2096,6 +2451,10 @@ class PhysicsMixin:
 
         mj = _ensure_mujoco()
         model = self._world._model
+        if err := self._refuse_ambiguous_bare_name(
+            mj.mjtObj.mjOBJ_BODY, body_name, "set_body_properties", "body", "Qualify the name"
+        ):
+            return err
         body_id = self._resolve_mj_name(mj.mjtObj.mjOBJ_BODY, body_name)
         if body_id < 0:
             return {"status": "error", "content": [{"text": self._unknown_mj_entity_msg("Body", body_name)}]}
@@ -2246,6 +2605,14 @@ class PhysicsMixin:
 
         gid = geom_id
         if geom_name:
+            if err := self._refuse_ambiguous_bare_name(
+                mj.mjtObj.mjOBJ_GEOM,
+                geom_name,
+                "set_geom_properties",
+                "geom",
+                "Pass geom_id= to name one, or qualify the name",
+            ):
+                return err
             gid = self._resolve_mj_name(mj.mjtObj.mjOBJ_GEOM, geom_name)
             # our add_object pipeline names geoms as ``{object_name}_geom``.
             # Accept the plain object name as a convenience alias.
@@ -2671,7 +3038,9 @@ class PhysicsMixin:
         (``"arm0/gripper"``), on the same terms as :meth:`get_body_state`,
         :meth:`get_jacobian`, :meth:`apply_force` and
         :meth:`set_body_properties`: ``add_robot`` namespaces every compiled
-        body, and a bare name is retried under each robot's namespace.
+        body, and a bare name is retried under each robot's namespace. When that
+        retry is what resolved the name, the answer names the entity it landed
+        on rather than echoing the request.
         """
         if self._world is None or self._world._model is None or self._world._data is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
@@ -2692,10 +3061,13 @@ class PhysicsMixin:
                     "position": data.xpos[bid].tolist(),
                     "quaternion": data.xquat[bid].tolist(),
                 }
+                text = f"FK for '{body_name}': pos={body_payload['position']}"
+                if note := self._resolved_name_note(mj.mjtObj.mjOBJ_BODY, body_name, bid):
+                    text += f"\n{note}"
                 return {
                     "status": "success",
                     "content": [
-                        {"text": f"FK for '{body_name}': pos={body_payload['position']}"},
+                        {"text": text},
                         {"json": {"body": body_name, **body_payload}},
                     ],
                 }
@@ -2815,10 +3187,16 @@ class PhysicsMixin:
         ``output_path`` is treated as untrusted (LLM-callable tool): a ``..``
         traversal segment, a symlinked target, shell metacharacters, and
         backslash separators are rejected with ``status=error``. An absolute
-        destination is accepted (the historic contract for this sink). The
-        write is atomic and the success text reports the RESOLVED path. A
-        destination the filesystem cannot accept (a directory, an unwritable
-        parent) is reported the same way; a missing parent is created.
+        destination is accepted (the historic contract for this sink). A
+        RELATIVE destination - a bare name or one with directories - lands
+        under the scenes directory (:func:`scene_root`:
+        ``~/.strands_robots/scenes``, or ``STRANDS_ROBOTS_SCENE_ROOT``), not the
+        process working directory: an agent asked to "save the scene" used to
+        drop ``scene.xml`` into whatever directory the process was started
+        from, the user's git checkout included. The write is atomic and the
+        success text reports the RESOLVED path. A destination the filesystem
+        cannot accept (a directory, an unwritable parent) is reported the same
+        way; a missing parent is created.
         """
         if self._world is None or self._world._model is None:
             return {"status": "error", "content": [{"text": _NO_WORLD_MSG}]}
@@ -2850,10 +3228,17 @@ class PhysicsMixin:
             # metacharacters before writing. Guards-only (no sandbox root) keeps
             # the historic contract that an absolute destination is accepted -
             # unlike render(), whose output_path is documented as a newer,
-            # sandboxed-by-design feature. The write is atomic so a crash
-            # mid-export cannot truncate an existing file at the destination.
+            # sandboxed-by-design feature. A relative destination is anchored
+            # to the scenes directory first: resolving it against the CWD made
+            # the most natural agent call ("save it as scene.xml") litter the
+            # directory the process was started from. The anchoring happens
+            # BEFORE the guard so the traversal, symlink and metacharacter
+            # checks inspect the destination actually opened. The write is
+            # atomic so a crash mid-export cannot truncate an existing file at
+            # the destination.
+            destination = anchor_relative_scene_path(output_path)
             try:
-                safe = validate_output_path(output_path, sandbox_root=None, allow_abs=True)
+                safe = validate_output_path(destination, sandbox_root=None, allow_abs=True)
             except ValueError as e:
                 return {"status": "error", "content": [{"text": f"export_xml: {e}"}]}
             try:

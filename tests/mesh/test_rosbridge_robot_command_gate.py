@@ -4,7 +4,7 @@ The fourth of four. ``tests/mesh/test_ros_bridge_command_gate.py``,
 ``tests/mesh/test_rtps_robot_command_gate.py`` and
 ``tests/mesh/test_ackermann_command_gate.py`` each pin that their bridge's
 commands reach the shared operator gate of
-:mod:`strands_robots.tools._command_gate`; the rosbridge bridge had no such
+:mod:`strands_robots._command_gate`; the rosbridge bridge had no such
 suite, and it was the one class that could not carry an operator's decision at
 all. Measured against the real ``use_rosbridge`` with an operator standing by to
 approve, on the same blocklisted ``/cmd_vel`` surface::
@@ -50,7 +50,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import strands_robots.mesh as mesh_pkg
-import strands_robots.tools.use_rosbridge as rb_mod
+import strands_robots.rosbridge as transport_mod
 from strands_robots.mesh import RosbridgeRobot
 
 # ``/turtle1/cmd_vel`` matches the ``/cmd_vel`` blocklist entry on the
@@ -120,10 +120,10 @@ def _install_doubles(monkeypatch: pytest.MonkeyPatch) -> None:
     module.Topic = _FakeTopic  # type: ignore[attr-defined]
     module.Message = dict  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "roslibpy", module)
-    monkeypatch.setattr(rb_mod._backend, "_available", None)
-    monkeypatch.setattr(rb_mod._backend, "_connections", {})
+    monkeypatch.setattr(transport_mod._backend, "_available", None)
+    monkeypatch.setattr(transport_mod._backend, "_connections", {})
     # publish sleeps for the advertise settle and for the inter-message period.
-    monkeypatch.setattr(rb_mod.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(transport_mod.time, "sleep", lambda *_: None)
 
 
 def _published() -> list[tuple[str, dict[str, Any]]]:

@@ -160,16 +160,6 @@ class TestConstructor:
         assert driver.tool_name == "so101"
         assert driver.tool_type == "robot"
 
-    def test_extras_pass_through_kwargs_are_kept(self) -> None:
-        """Unknown keywords are kept for a downstream driver package.
-
-        Refusing every unknown keyword here would refuse a valid future
-        extension, and the driver factory has no way to filter them at
-        construction time.
-        """
-        driver = FeetechDriver(tool_name="so101", weird_extension="yes")
-        assert driver._extras == {"weird_extension": "yes"}
-
     def test_ports_multi_bus_is_refused_by_name(self) -> None:
         """A caller passing ``ports=[...]`` gets a named refusal.
 
@@ -395,10 +385,15 @@ class TestLifecycle:
         port = _port(driver)
         port.writes.clear()
         asyncio.run(driver.stop())
-        assert len(port.writes) == len(SO_ARM_MOTORS)
-        for frame in port.writes:
-            assert frame[5] == 0x28  # Torque_Enable
-            assert frame[6] == 0  # released
+        # Two registers per motor: released, and its EEPROM left writable for
+        # the calibration step that follows - the pairing graded in
+        # :mod:`tests.drivers.test_feetech_torque_write_is_acknowledged`.
+        assert len(port.writes) == 2 * len(SO_ARM_MOTORS)
+        assert [(frame[5], frame[6]) for frame in port.writes] == [
+            register_and_value
+            for _ in SO_ARM_MOTORS
+            for register_and_value in ((0x28, 0), (0x37, 0))  # Torque_Enable, Lock
+        ]
 
     def test_stop_on_a_driver_with_no_port_does_not_raise(self) -> None:
         """``stop`` runs on teardown paths that cannot handle an exception."""

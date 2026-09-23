@@ -55,6 +55,15 @@ has no deadline, so a server that accepted the connection and then went quiet
 would otherwise hold the caller forever. An expired read is reported as a
 timeout, not as "start the server first", and discards the connection.
 
+A frame that *arrives* and cannot be read as msgpack+NumPy is a third case,
+reported as neither: it names the endpoint, which read it answered (metadata
+handshake or action chunk), what the codec could not do, and the frame's
+opening bytes. This package serves policies over a WebSocket in two wire
+formats, so the common cause is a port mixed up between them - dialling
+`strands_robots.inference.server`, which speaks JSON text frames, with this
+client. Telling that apart from an absent server matters because only one of
+the two is fixed by starting a server.
+
 ## Embodiments
 
 Embodiments: `droid` (10D, chunk 32, 15 fps), `umi`, `av`, `bridge`, `openarm`
@@ -215,7 +224,9 @@ The `diffusers` backend's raw unified action is **quantile-normalized to
 `[-1, 1]`** and encodes a *relative end-effector pose delta* per step, **not
 joint radians** - fed straight to MuJoCo joint actuators it is meaningless.
 Three geometric steps (`cosmos3-sim` extra: `mink` + `mujoco`, numpy>=2,
-co-installable with the other extras) turn it into joint targets:
+co-installable with the other extras) turn it into joint targets. The fence below
+also reads a robot model, which `robot_descriptions` ships and no cosmos3 extra
+declares, so add `sim-mujoco` when you run it:
 
 1. **De-normalize** - invert the quantile transform with the embodiment's
    bundled `q01`/`q99` action stats:

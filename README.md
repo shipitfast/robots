@@ -1,7 +1,10 @@
 <div align="center">
   <div>
     <a href="https://strandsagents.com">
-      <img src="https://strandsagents.com/latest/assets/logo-github.svg" alt="Strands Agents" width="55px" height="105px">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="https://strandsagents.com/latest/assets/wordmark-github-dark.svg">
+        <img src="https://strandsagents.com/latest/assets/wordmark-github-light.svg" alt="Strands" width="320">
+      </picture>
     </a>
   </div>
 
@@ -51,6 +54,7 @@ Agent(tools=[robot])("pick up the red cube")
 ## Install
 
 ```bash
+uv venv --python 3.12 && source .venv/bin/activate
 uv pip install "strands-robots[sim-mujoco]"   # plain pip works too
 ```
 
@@ -99,6 +103,7 @@ start with the [Quickstart](docs/getting-started/quickstart.md) and [Architectur
 ## Development
 
 ```bash
+uv venv --python 3.12 && source .venv/bin/activate
 uv pip install -e ".[all,dev]"
 hatch run test && hatch run lint   # pytest; ruff + mypy
 ```

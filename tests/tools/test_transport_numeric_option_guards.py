@@ -37,6 +37,9 @@ from typing import Any
 
 import pytest
 
+import strands_robots.ros as ros_transport_mod
+import strands_robots.rosbridge as rosbridge_transport_mod
+import strands_robots.rtps.participant as participant_mod
 import strands_robots.tools.use_ros as ros_mod
 import strands_robots.tools.use_rosbridge as rosbridge_mod
 import strands_robots.tools.use_rtps as rtps_mod
@@ -57,9 +60,9 @@ def _texts(result: dict[str, Any]) -> str:
 @pytest.fixture(autouse=True)
 def _every_backend_available(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default every transport to a present backend; opt out where needed."""
-    monkeypatch.setattr(ros_mod._backend, "available", lambda: True)
-    monkeypatch.setattr(rtps_mod._backend, "available", lambda: True)
-    monkeypatch.setattr(rosbridge_mod._backend, "available", lambda: True)
+    monkeypatch.setattr(ros_transport_mod._backend, "available", lambda: True)
+    monkeypatch.setattr(participant_mod._backend, "available", lambda: True)
+    monkeypatch.setattr(rosbridge_transport_mod._backend, "available", lambda: True)
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +98,9 @@ def published_at(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py", package)
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py.set_message", set_message)
 
-    monkeypatch.setattr(ros_mod._backend, "_ensure_node", lambda: FakeNode())
-    monkeypatch.setattr(ros_mod._backend, "spin_for", lambda predicate, timeout: None)
-    monkeypatch.setattr(ros_mod, "_get_message", lambda msg_type: object)
+    monkeypatch.setattr(ros_transport_mod._backend, "_ensure_node", lambda: FakeNode())
+    monkeypatch.setattr(ros_transport_mod._backend, "spin_for", lambda predicate, timeout: None)
+    monkeypatch.setattr(ros_transport_mod, "_get_message", lambda msg_type: object)
     return stamps
 
 
@@ -158,7 +161,7 @@ def test_a_refusal_names_the_option_even_with_no_ros_installed(
     A caller mistake must not be masked by an install hint on a machine without
     ROS 2 and then reported differently on a machine with it.
     """
-    monkeypatch.setattr(ros_mod._backend, "available", lambda: False)
+    monkeypatch.setattr(ros_transport_mod._backend, "available", lambda: False)
 
     result = _publish_twist(count=6, rate=0.0)
 
@@ -182,7 +185,7 @@ def test_publish_accepts_an_unusable_timeout_it_never_reads(published_at: list[f
 @pytest.mark.parametrize("action", ["status", "list_topics"])
 def test_an_action_reading_no_numeric_option_is_never_refused(monkeypatch: pytest.MonkeyPatch, action: str) -> None:
     """A query action must not fail for a value it does not look at."""
-    monkeypatch.setattr(ros_mod, "_list_topics", lambda: "/cmd_vel [geometry_msgs/msg/Twist]")
+    monkeypatch.setattr(ros_transport_mod, "_list_topics", lambda: "/cmd_vel [geometry_msgs/msg/Twist]")
 
     result = ros_mod.use_ros(action=action, count=-1, rate=float("nan"), timeout=-1.0)
 
@@ -212,7 +215,7 @@ def test_every_rosbridge_action_declares_the_options_it_reads() -> None:
     An action missing from the table is silently unguarded, which is how this
     transport shipped with none at all - so the table must stay exhaustive.
     """
-    assert set(rosbridge_mod._ACTION_NUMERIC_OPTIONS) == set(rosbridge_mod._ACTIONS)
+    assert set(rosbridge_mod._ACTION_NUMERIC_OPTIONS) == set(rosbridge_transport_mod._ACTIONS)
     for action, options in rosbridge_mod._ACTION_NUMERIC_OPTIONS.items():
         assert "timeout" in options, action
 
@@ -366,14 +369,14 @@ def rosbridge_published_at(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     module.Message = dict  # type: ignore[attr-defined]
     module.Service = object  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "roslibpy", module)
-    monkeypatch.setattr(rosbridge_mod._backend, "_connections", {})
+    monkeypatch.setattr(rosbridge_transport_mod._backend, "_connections", {})
     return stamps
 
 
 def _publish_over_rosbridge(**options: Any) -> dict[str, Any]:
     # Not a safety-critical command surface: these cases are about pacing, and a
     # drive topic would route the honored path through the operator gate in
-    # strands_robots.tools._command_gate. The unusable-value cases are unaffected
+    # strands_robots._command_gate. The unusable-value cases are unaffected
     # either way - the numeric guard is consulted before the gate.
     return rosbridge_mod.use_rosbridge(action="publish", topic="/demo/twist", type="geometry_msgs/Twist", **options)
 
@@ -450,14 +453,14 @@ def test_every_rosbridge_action_refuses_a_non_positive_timeout(
 
     assert result["status"] == "error"
     assert f"{action}: timeout must be > 0, got -1.0." in _texts(result)
-    assert rosbridge_mod._backend._connections == {}, "refused, yet the bridge was dialed"
+    assert rosbridge_transport_mod._backend._connections == {}, "refused, yet the bridge was dialed"
 
 
 def test_a_rosbridge_refusal_names_the_option_with_no_roslibpy_installed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The guard runs ahead of the availability probe, so the message is stable."""
-    monkeypatch.setattr(rosbridge_mod._backend, "available", lambda: False)
+    monkeypatch.setattr(rosbridge_transport_mod._backend, "available", lambda: False)
 
     result = _publish_over_rosbridge(count=6, rate=0.0)
 

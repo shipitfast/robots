@@ -20,6 +20,8 @@ it instead.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 pytest.importorskip("mujoco")
@@ -142,7 +144,7 @@ class TestValidActionKeyHint:
     short (prefix-stripped) form callers pass to ``send_action``.
 
     When a key cannot be applied, ``_warn_unresolved_action_key`` surfaces the
-    actuators the scene accepts via ``_get_valid_action_keys(pfx)``. In a
+    actuators the scene accepts via ``_get_valid_action_keys(robot_name)``. In a
     multi-robot world actuators are namespaced (``armA/shoulder``); the hint
     must strip the active robot's prefix so the operator sees exactly the keys
     ``send_action`` expects, not the internal fully-qualified names. Unnamed
@@ -173,24 +175,120 @@ class TestValidActionKeyHint:
     </mujoco>
     """
 
-    def _mixin(self):
+    def _mixin(self, namespace: str) -> Any:
+        """A mixin over a one-robot world whose actuators carry ``namespace``."""
         import mujoco
 
+        from strands_robots.simulation.models import SimRobot, SimWorld
         from strands_robots.simulation.mujoco.rendering import RenderingMixin
 
         model = mujoco.MjModel.from_xml_string(self._XML)
+        robot = SimRobot(name="armA", urdf_path="armA.xml")
+        robot.namespace = namespace
+        robot.actuator_ids = list(range(model.nu))
 
-        class _World:
-            _model = model
+        world = SimWorld()
+        world.robots["armA"] = robot
+        world._model = model
 
         mixin = RenderingMixin()
-        mixin._world = _World()
+        mixin._world = world
         return mixin
 
     def test_prefix_is_stripped_for_matching_robot(self):
         """A robot prefix yields the short keys send_action resolves."""
-        assert self._mixin()._get_valid_action_keys("armA/") == ["shoulder", "elbow"]
+        assert self._mixin("armA/")._get_valid_action_keys("armA") == ["shoulder", "elbow"]
 
     def test_no_prefix_returns_fully_qualified_names(self):
         """Without a prefix the raw namespaced actuator names are returned."""
-        assert self._mixin()._get_valid_action_keys("") == ["armA/shoulder", "armA/elbow"]
+        assert self._mixin("")._get_valid_action_keys("armA") == ["armA/shoulder", "armA/elbow"]
+
+
+class TestActionKeysFollowJointOrder:
+    """The keys a policy binds are ordered by the joints, not by the MJCF.
+
+    ``robot_action_keys`` names the actuators, and the engine hands that list to
+    ``Policy.set_robot_state_keys`` -- which orders the ``observation.state``
+    vector the policy reads. A recording writes that vector in the robot's JOINT
+    order. A model may declare its actuators in any order (``dynamixel_2r``
+    declares ``R2`` before ``R1``), so where the two rosters were the same names
+    in a different order a checkpoint was evaluated on a transposed state
+    vector, silently: every guard passed, the robot moved, the numbers were
+    wrong. The keys now follow the joint order, and an actuator that drives no
+    single joint (a tendon gripper) keeps the slot the model declared it in.
+    """
+
+    _XML = """
+    <mujoco>
+      <worldbody>
+        <body name="l1">
+          <joint name="j1" type="hinge" axis="0 0 1"/>
+          <geom type="box" size="0.02 0.02 0.02"/>
+          <body name="l2" pos="0 0 0.1">
+            <joint name="j2" type="hinge" axis="0 1 0"/>
+            <geom type="box" size="0.02 0.02 0.02"/>
+            <body name="l3" pos="0 0 0.1">
+              <joint name="j3" type="hinge" axis="1 0 0"/>
+              <geom type="box" size="0.02 0.02 0.02"/>
+            </body>
+          </body>
+        </body>
+      </worldbody>
+      <tendon>
+        <fixed name="t"><joint joint="j3" coef="1"/></fixed>
+      </tendon>
+      <actuator>
+        <position name="a2" joint="j2"/>
+        <position name="grip" tendon="t"/>
+        <position name="a1" joint="j1"/>
+        <position name="a2b" joint="j2"/>
+      </actuator>
+    </mujoco>
+    """
+
+    def _mixin(self, joint_names: list[str]) -> Any:
+        """A one-robot world whose robot declares ``joint_names`` in that order."""
+        import mujoco
+
+        from strands_robots.simulation.models import SimRobot, SimWorld
+        from strands_robots.simulation.mujoco.rendering import RenderingMixin
+
+        model = mujoco.MjModel.from_xml_string(self._XML)
+        robot = SimRobot(name="armA", urdf_path="armA.xml")
+        robot.joint_names = list(joint_names)
+        robot.actuator_ids = list(range(model.nu))
+        world = SimWorld()
+        world.robots["armA"] = robot
+        world._model = model
+        mixin = RenderingMixin()
+        mixin._world = world
+        return mixin
+
+    @pytest.mark.parametrize(
+        ("joint_names", "expected"),
+        [
+            # The MJCF declares a2 before a1; the joint roster decides.
+            (["j1", "j2", "j3"], ["a1", "grip", "a2", "a2b"]),
+            # A roster that agrees with the declaration order is left alone -
+            # the rule is the joint order, not a sort of the key names.
+            (["j2", "j1", "j3"], ["a2", "grip", "a2b", "a1"]),
+            # Two actuators on one joint keep their declared order between them.
+            (["j2"], ["a2", "grip", "a1", "a2b"]),
+            # A backend that knows no joint roster reports declaration order.
+            ([], ["a2", "grip", "a1", "a2b"]),
+        ],
+    )
+    def test_joint_driving_actuators_are_ranked_by_their_joint(self, joint_names, expected):
+        assert self._mixin(joint_names)._get_valid_action_keys("armA") == expected
+
+    def test_a_reversed_model_binds_the_roster_the_recording_writes(self, sim):
+        """dynamixel_2r declares R2 first; state is recorded R1, R2."""
+        from strands_robots.policies.mock import MockPolicy
+
+        sim.add_robot("dynamixel_2r")
+        assert sim.robot_action_keys("dynamixel_2r") == sim.robot_joint_names("dynamixel_2r") == ["R1", "R2"]
+        policy = MockPolicy()
+        result = sim.run_policy(robot_name="dynamixel_2r", policy_object=policy, instruction="move", n_steps=5)
+        assert result["status"] == "success", result
+        # The state vector the policy reads is ordered like the recorded columns.
+        assert policy.robot_state_keys == sim.robot_joint_names("dynamixel_2r")

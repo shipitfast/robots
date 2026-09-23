@@ -45,13 +45,14 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from strands_robots._async_utils import _resolve_coroutine
-from strands_robots.dataset_recorder import RecordingFrameError
-from strands_robots.policies.base import collect_required_bodies, resolve_chunk_length
+from strands_robots.policies.base import collect_required_bodies, instruction_not_read_notice, resolve_chunk_length
+from strands_robots.recording_errors import RecordingFrameError
 from strands_robots.rendering.video import require_clip_encoder
 from strands_robots.simulation.observers import (
     SCHEMA_VERSION as _OBSERVER_SCHEMA_VERSION,
@@ -259,9 +260,15 @@ def action_commands_robot(action: Mapping[str, Any]) -> bool:
 
     Counting such an action as applied is what makes an evaluation of nothing but
     those actions indistinguishable, in every published field, from one that
-    commanded every joint. The sibling ``run`` surface separates the two through
-    its per-actuator ``action_resolution_rate``; this is the rule the evaluation
-    routes read instead.
+    commanded every joint. Both rollout surfaces read this rule, and each reports
+    the tally it backs as ``actions_applied``: the evaluation routes refuse the
+    aggregate through :func:`uncommanded_eval_error`, and :meth:`PolicyRunner.run`
+    refuses it beside the total-unresolved refusal it mirrors. ``run``'s
+    per-actuator ``action_resolution_rate`` does not cover it: that map is keyed on
+    the robot's actuators, so a robot declaring none - the shipped ``talos`` and
+    ``asimov_v0`` descriptions both compile that way - contributes an empty map
+    and a ``partial_action_failure_rate`` of ``0.0``, which is what a robot with no
+    resolution problem looks like too.
 
     Args:
         action: One action dict from a chunk, as handed to ``send_action``.
@@ -563,6 +570,55 @@ def _criterion_verdict(
             "criterion cannot be evaluated, so the evaluation is aborted rather than reporting "
             "a success_rate over episodes whose outcome was never determined."
         ) from e
+
+
+# The exception classes that mean "the Hub was not reachable", by class name
+# anywhere in the raised type's MRO. Measured against a closed port, a bad host
+# and HF_HUB_OFFLINE=1: httpx.ConnectError (TransportError, NOT a builtin
+# ConnectionError) and huggingface_hub.errors.OfflineModeIsEnabled (which IS
+# one). Names rather than imported classes so the set survives lerobot swapping
+# its HTTP client again, and covers requests' ConnectionError/Timeout too.
+_HUB_UNREACHABLE_ERRORS = frozenset(
+    {"ConnectionError", "ConnectError", "TransportError", "Timeout", "TimeoutException", "OfflineModeIsEnabled"}
+)
+
+# How many datasets a refusal names before the list is noise.
+_DATASETS_SHOWN = 8
+
+# The one spelling of the remedy every replay refusal ends with. Named once so
+# the three branches cannot drift, and so no branch has to break the sentence
+# across two adjacent literals - a shape a reader cannot tell from a dropped
+# comma in the list these are joined from.
+_REPLAY_ROOT_REMEDY = "root='<the directory start_recording was given>'"
+
+
+def _datasets_on_disk_near(checked: Path) -> str | None:
+    """The sentence naming the datasets that ARE on disk near ``checked``.
+
+    A dataset directory is the one holding ``meta/``, so a directory without
+    one is some other directory and is not offered. Which directory is worth
+    listing depends on how the read missed:
+
+    * ``checked`` does not exist - the datasets in the parent it would have
+      been created in, which answers a typo;
+    * ``checked`` exists but is not a dataset - the datasets inside IT, which
+      answers a ``root=`` aimed one level too high.
+
+    Returns ``None`` when there is nothing to offer.
+    """
+    scanned = checked if checked.is_dir() else checked.parent
+    try:
+        if not scanned.is_dir():
+            return None
+        names = sorted(p.name for p in scanned.iterdir() if (p / "meta").is_dir())
+    except OSError:  # an unreadable directory must not replace the refusal
+        return None
+    if not names:
+        return None
+    shown = ", ".join(names[:_DATASETS_SHOWN])
+    if len(names) > _DATASETS_SHOWN:
+        shown += ", ..."
+    return f"Datasets on disk in {scanned}: {shown}."
 
 
 def _extract_frame_ndarray(render_result: dict) -> np.ndarray | None:
@@ -1044,7 +1100,7 @@ class _RolloutVideoWriter:
 # The counter resets on every success, so this bounds an ALWAYS-failing hook and
 # nothing else: a hook failing every other step never reaches the limit. That is
 # the right trade for caller telemetry, which is why
-# :class:`~strands_robots.dataset_recorder.RecordingFrameError` is excluded from
+# :class:`~strands_robots.recording_errors.RecordingFrameError` is excluded from
 # the tolerance entirely - a lost dataset frame is data loss, not telemetry, and
 # tolerating it writes a short, re-timestamped episode under a successful
 # rollout.
@@ -1080,6 +1136,28 @@ def _extract_result_json(result: object) -> dict[str, Any] | None:
             if isinstance(payload, dict):
                 return payload
     return None
+
+
+def _recorded_action_names(ds: object) -> list[str] | None:
+    """The names a LeRobotDataset wrote for its ``action`` column, or ``None``.
+
+    Read from ``ds.meta.features["action"]["names"]`` - the field
+    ``DatasetRecorder.create`` writes from the backend's ``robot_action_keys``
+    at record time and the resume path already diffs against the live scene.
+    ``None`` when the dataset object carries no such schema (a column-only
+    dataset, the replay tests' fakes) or the field is not a list of strings,
+    so a caller can fall back rather than trust a malformed schema.
+    """
+    features = getattr(getattr(ds, "meta", None), "features", None)
+    if not isinstance(features, dict):
+        return None
+    action = features.get("action")
+    if not isinstance(action, dict):
+        return None
+    names = action.get("names")
+    if not isinstance(names, (list, tuple)) or not names or not all(isinstance(n, str) for n in names):
+        return None
+    return list(names)
 
 
 def _validate_action_key_map(action_key_map: Any) -> dict[str, Any] | None:
@@ -1961,7 +2039,7 @@ class PolicyRunner:
             max_onframe_failures: Maximum *consecutive* exceptions from the
                 ``on_frame`` hook before the runner aborts the episode.
                 ``CooperativeStop`` and
-                :class:`~strands_robots.dataset_recorder.RecordingFrameError` are
+                :class:`~strands_robots.recording_errors.RecordingFrameError` are
                 exempt from the count rather than tolerated by it: the first is
                 the documented graceful stop and the second is data loss, so a
                 lost dataset frame aborts on the FIRST occurrence whatever this
@@ -2073,7 +2151,13 @@ class PolicyRunner:
             - the step/duration horizon was exhausted; ``"cancelled"`` - a
             cooperative stop, e.g. ``stop_policy``; on ``status="error"``
             results the field is ``"error"``), ``action_errors``,
-            ``video_path`` (``None`` when
+            ``actions_applied`` (actions that commanded at least one of the
+            robot's keys - see
+            :func:`~strands_robots.simulation.policy_runner.action_commands_robot`
+            - which is NOT the number of ``send_action`` calls, since an action
+            naming no key reaches the backend like any other; a rollout whose
+            count is ``0`` never commanded the robot and is returned as
+            ``status="error"``), ``video_path`` (``None`` when
             no MP4 was written), ``video_frames``, ``video_fps`` (the rate the
             MP4 plays at - the requested ``fps`` capped to
             ``control_frequency``, since a rollout renders at most one frame
@@ -2091,7 +2175,10 @@ class PolicyRunner:
             actuator confirmed on every known step, ``~0.83`` == only 1 of 6).
             Coarse backend errors are excluded from those denominators rather
             than fabricated as misses and remain visible in ``action_errors``
-            and the result text. This makes a rollout that silently drives only
+            and the result text, as is a step whose applied keys name driven
+            JOINTS rather than actuators - a spelling ``send_action`` resolves
+            without reporting which actuator it drove, so it is unknown here
+            rather than a miss. This makes a rollout that silently drives only
             a subset of the robot's joints visible instead of looking like a
             clean ``success`` with a zero success-rate.
 
@@ -2514,6 +2601,12 @@ class PolicyRunner:
         # observer event reports it, and setup inside the try (substep derivation,
         # actuator discovery) can raise before the loop assigns it.
         _action_errors = 0  # count send_action failures (unresolved keys)
+        # Actions that commanded at least one key (see ``action_commands_robot``),
+        # NOT completed ``send_action`` calls - ``_applied_actions`` is that, and an
+        # action naming no key reaches the backend like any other. Bound out here
+        # with ``_action_errors`` so the terminal report can read it even when
+        # setup raised before the loop.
+        _actions_commanding = 0
         # Bound before the rollout so the ``except CooperativeStop`` handler and
         # the ``_apply`` closure never see an unbound name, the same reason
         # ``start_mono`` is bound above.
@@ -2642,7 +2735,15 @@ class PolicyRunner:
                     nonlocal step_count, _action_errors, consecutive_onframe_failures
                     nonlocal _total_failure_steps, _coarse_failure_steps, _last_unresolved
                     nonlocal _last_coarse_error, _applied_actions, _known_resolution_steps
+                    nonlocal _actions_commanding
 
+                    # Read BEFORE the send, off the action as the policy emitted it,
+                    # so the tally is a fact about the policy's output rather than
+                    # about a backend verdict. ``action_commands_robot`` is the
+                    # module's rule for the dict form; a numeric vector binds
+                    # positionally to every actuator, so a non-empty one commands.
+                    if action_commands_robot(action_dict) if isinstance(action_dict, Mapping) else len(action_dict) > 0:
+                        _actions_commanding += 1
                     _send_result = self.sim.send_action(action_dict, robot_name=robot_name, n_substeps=n_substeps)
                     # ``send_action`` has returned. Count the call here rather than
                     # beside ``step_count`` below so the tally survives a legacy hook
@@ -2789,11 +2890,25 @@ class PolicyRunner:
                     # excluded too: empty applied keys mean "unknown" there, not a
                     # measured miss. Structured partial/none and successful answers
                     # are resolution-known and form the denominator.
-                    if not _is_error or _has_complete_breakdown:
+                    # Per-actuator credit needs the applied keys to NAME actuators.
+                    # A dict keyed by driven-JOINT names is a spelling
+                    # ``send_action`` documents and resolves (it looks the joint's
+                    # driving actuator up, tendon grippers included), so the step
+                    # drove the robot - but it credits no entry of this roster, and
+                    # counting it would record every actuator as a measured miss:
+                    # ``action_resolution_rate`` all 0.0 and a
+                    # ``partial_action_failure_rate`` of 1.0, the signature of a
+                    # rollout that never moved, for one the backend answered
+                    # ``"full"`` on. Which actuator each such key drove is known to
+                    # the backend's resolver and not to this loop, so the step is
+                    # resolution-UNKNOWN for per-actuator purposes - the same rule
+                    # this block already applies to a coarse answer - and is left
+                    # out of the denominator instead of being scored as a miss.
+                    _creditable = [_name for _name in _applied if _name in _actuator_resolved]
+                    if (not _is_error or _has_complete_breakdown) and len(_creditable) == len(_applied):
                         _known_resolution_steps += 1
-                        for _name in _applied:
-                            if _name in _actuator_resolved:
-                                _actuator_resolved[_name] += 1
+                        for _name in _creditable:
+                            _actuator_resolved[_name] += 1
 
                     # Fail fast when every opening probe step either explicitly
                     # resolved no keys or was atomically refused without a complete
@@ -3008,6 +3123,11 @@ class PolicyRunner:
         )
         if sim_time is not None:
             text += f" | sim_t={sim_time:.3f}s"
+        # A policy that never read the instruction says so beside the
+        # instruction it just echoed, or the line above reads as the task done.
+        _instruction_notice = instruction_not_read_notice(policy)
+        if _instruction_notice is not None:
+            text += f"\n{_instruction_notice}"
         if _stop_when_reset_warning is not None:
             text += f"\n{_stop_when_reset_warning}"
         if vwriter is not None:
@@ -3046,6 +3166,7 @@ class PolicyRunner:
             "robot_name": robot_name,
             "policy": type(policy).__name__,
             "instruction": instruction,
+            "instruction_read": _instruction_notice is None,
             "n_steps": step_count,
             # Alias of n_steps under the retry-loop name: the control steps
             # actually executed before the rollout ended. Paired with
@@ -3064,6 +3185,7 @@ class PolicyRunner:
             "stop_when_true_at_reset": stop_when_true_at_reset,
             "stop_when_reset_warning": _stop_when_reset_warning,
             "action_errors": _action_errors,
+            "actions_applied": _actions_commanding,
             "video_path": None,
             "video_frames": 0,
             # The rate the MP4 plays at, which is the requested ``fps`` capped
@@ -3165,6 +3287,47 @@ class PolicyRunner:
             if observer is not None:
                 payload["observer_failures"] = _obs_failures
             return {"status": "error", "content": [{"text": text}, {"json": payload}]}
+        # The mirror of the block above. That one covers a policy that emitted
+        # keys none of which resolved; this one covers a policy that emitted no
+        # key at all. Both leave the robot uncommanded for the whole rollout, but
+        # only the first produces an unresolved key to count, so this one was
+        # reported ``success`` - and every field a caller would gate on reads
+        # healthy: ``action_errors`` is 0 because nothing was refused, and
+        # ``action_resolution_rate`` / ``partial_action_failure_rate`` are keyed on
+        # the robot's actuators, so a robot that has none contributes an empty map
+        # and a 0.0 rate, which is what a robot with no resolution problem looks
+        # like too. Refused on the AGGREGATE only: a single empty action is
+        # legitimate policy behaviour (``action_commands_robot`` states the rule,
+        # and the evaluation routes read it the same way), so the per-step
+        # tolerance is unchanged.
+        if step_count > 0 and _actions_commanding == 0:
+            _n_keys = len(_robot_actuators)
+            text += (
+                f"\n\nALL {step_count} action steps commanded no actuator "
+                f"-- the robot did not move. Every action the policy emitted named "
+                f"no key, so nothing about '{robot_name}' was commanded and every "
+                f"reported figure describes the scene under gravity rather than the "
+                f"policy. "
+                + (
+                    f"'{robot_name}' declares no actuator at all (robot_action_keys "
+                    f"reports 0 keys), so a policy bound to that list can only emit "
+                    f"empty actions: check that the robot's model has an <actuator> "
+                    f"block."
+                    if _n_keys == 0
+                    else f"'{robot_name}' declares {_n_keys} actuator(s) "
+                    f"(robot_action_keys), so check that the policy decodes an action "
+                    f"chunk for them rather than rows carrying no joint value."
+                )
+            )
+            # An error result always reports stopped_reason="error", for the same
+            # reason the sibling refusal above does: the rollout may have run its
+            # full budget, but the outcome is not a retryable "budget" completion.
+            payload["stopped_reason"] = "error"
+            payload["actions_applied"] = _actions_commanding
+            _emit_ended(outcome="error", stopped_reason="error")
+            if observer is not None:
+                payload["observer_failures"] = _obs_failures
+            return {"status": "error", "content": [{"text": text}, {"json": payload}]}
         if _action_errors > 0:
             if _coarse_failure_steps == 0:
                 text += f"\n\n{_action_errors}/{step_count} action steps had unresolved keys."
@@ -3223,19 +3386,26 @@ class PolicyRunner:
             root: Local dataset directory. When omitted it is resolved from
                 ``repo_id`` by the rule recording writes through, so an id that
                 is itself a path replays the directory it recorded to
-                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
+                (:func:`~strands_robots.dataset_source.local_dataset_dir`).
             speed: Playback speed multiplier (1.0 = real time). Must be a
                 positive, finite number (any real scalar, including a NumPy
                 scalar such as ``np.float32(2.0)``); a non-positive,
                 non-finite or non-numeric value is rejected with a structured
                 error.
             action_key_map: Optional list of action keys, one per action
-                vector index. Required when dataset action ordering differs
-                from ``robot_action_keys(robot_name)``. If ``None``, positional
-                mapping to ``robot_action_keys`` is used - the robot's
-                *actuator* keys, which is the ordering the LeRobotDataset
-                recorder writes the ``action`` column in (a robot's actuators
-                are not always its joints; see :meth:`SimEngine.robot_action_keys`).
+                vector index. Required when the recording's action columns are
+                not this robot's actuators. If ``None``, the recorded column
+                is bound by the names the dataset wrote for it
+                (``features["action"]["names"]``) whenever those names are
+                exactly ``robot_action_keys(robot_name)`` in any order, so a
+                recording made before the keys were reordered still replays
+                onto the actuators it was recorded from. A dataset without
+                that schema, or one whose columns are another roster, falls
+                back to positional mapping onto ``robot_action_keys`` - the
+                robot's *actuator* keys, which is the ordering the
+                LeRobotDataset recorder writes the ``action`` column in (a
+                robot's actuators are not always its joints; see
+                :meth:`SimEngine.robot_action_keys`).
                 Must be a non-empty list/tuple of unique strings; a bare
                 string, a non-string entry or a duplicate key is rejected with
                 a structured error. Its length must equal the recorded action
@@ -3327,7 +3497,7 @@ class PolicyRunner:
         episode = int(episode)
 
         try:
-            from strands_robots.dataset_recorder import load_lerobot_episode
+            from strands_robots.dataset_source import load_lerobot_episode
         except ImportError:
             return {"status": "error", "content": [{"text": "lerobot not installed"}]}
 
@@ -3358,10 +3528,18 @@ class PolicyRunner:
                 "content": [{"text": f"Robot '{resolved_robot}' not found in sim. Available robots: {robots}"}],
             }
 
+        # A dataset this session recorded to a custom ``root=`` lives nowhere
+        # LeRobot derives from the id alone: forwarding an absent root sent the
+        # read to ``$HF_LEROBOT_HOME/{repo_id}`` and, on the miss, to the Hub,
+        # which answered a "Repository Not Found" 404 with request ids - for a
+        # dataset written a moment ago by the same sim. The sim knows where it
+        # put it, so resolve that first and say so in the reply.
+        root, root_note = self._replay_root(repo_id, root)
+
         try:
             ds, episode_start, episode_length = load_lerobot_episode(repo_id, episode, root)
         except Exception as e:  # noqa: BLE001 - library errors are opaque
-            return {"status": "error", "content": [{"text": f"{e}"}]}
+            return {"status": "error", "content": [{"text": self._replay_load_failure(repo_id, root, e)}]}
 
         # Resolve the action-key ordering for action-vector index -> action
         # dict. The recorded ``action`` column is written in the robot's
@@ -3372,7 +3550,26 @@ class PolicyRunner:
         # (send_action cannot resolve passive-joint names) while replay still
         # reports success - a silent round-trip corruption. Bind to the same
         # actuator keys the recorder used so record -> replay round-trips.
-        action_keys = list(action_key_map) if action_key_map else self.sim.robot_action_keys(resolved_robot)
+        #
+        # The recorder wrote those keys into the dataset as the column names,
+        # so read them back rather than assuming today's ``robot_action_keys``
+        # order is the one the recording was made under: the order is a
+        # property of the backend at record time, and a backend that changes
+        # it (#3851 moved MuJoCo from declaration to joint order) would
+        # otherwise replay every earlier recording transposed, with the width
+        # guard below satisfied and ``send_action`` resolving every name.
+        # ``send_action`` binds a dict by name, so the recorded names are the
+        # right keys in whatever order they were written - when they are this
+        # robot's actuators. Another roster (a different robot, a multi-robot
+        # recording's prefixed columns) is not an ordering question and keeps
+        # the positional path; ``action_key_map`` is the explicit answer there.
+        if action_key_map:
+            action_keys = list(action_key_map)
+        else:
+            action_keys = self.sim.robot_action_keys(resolved_robot)
+            recorded_keys = _recorded_action_names(ds)
+            if recorded_keys is not None and sorted(recorded_keys) == sorted(action_keys):
+                action_keys = recorded_keys
 
         dataset_fps = getattr(ds, "fps", 30)
         frame_interval = 1.0 / (dataset_fps * speed)
@@ -3585,7 +3782,7 @@ class PolicyRunner:
                         f"Replayed episode {episode} from {repo_id} on '{resolved_robot}'\n"
                         f"Frames: {frames_applied}/{episode_length} "
                         f"(actions applied: {frames_with_action}) | "
-                        f"Duration: {duration:.1f}s | Speed: {speed}x"
+                        f"Duration: {duration:.1f}s | Speed: {speed}x{root_note}"
                     )
                 },
                 {
@@ -3597,10 +3794,116 @@ class PolicyRunner:
                         "total_frames": episode_length,
                         "duration_s": round(duration, 2),
                         "speed": speed,
+                        "root": root,
                     }
                 },
             ],
         }
+
+    def _last_recorded(self) -> tuple[str | None, str | None]:
+        """``(repo_id, root)`` of the dataset this sim last recorded, or Nones."""
+        # Through the engine's own seams rather than ``_world._backend_state``:
+        # this runner serves every backend, and the Isaac backend's ``_world``
+        # is the Isaac Sim ``World`` handle, which holds no such mapping - so
+        # reading it directly would resolve nothing on exactly one backend.
+        return self.sim._active_dataset_repo_id(), self.sim._active_dataset_root()
+
+    def _replay_root(self, repo_id: str, root: str | None) -> tuple[str | None, str]:
+        """Resolve the directory a replay reads when the caller named only the id.
+
+        An explicit ``root`` and an id that is itself a path are left to
+        :func:`~strands_robots.dataset_source.load_lerobot_episode`, which
+        resolves them by the rule recording wrote through. An ``owner/name`` id
+        with no root normally keeps its absent root (LeRobot's Hub snapshot
+        cache) - except when THIS sim recorded that very id to a directory
+        LeRobot would not derive, in which case the recording is read back from
+        where it was written and the reply names the directory. The default
+        location wins when it exists, so a dataset there is never shadowed.
+
+        Returns:
+            ``(root, note)``: the root to read and a reply suffix (``""`` when
+            nothing was resolved here).
+        """
+        if root:
+            return root, ""
+        from strands_robots.dataset_source import local_dataset_dir, resolve_dataset_dir
+
+        if local_dataset_dir(repo_id) is not None:
+            return None, ""
+        last_repo, last_root = self._last_recorded()
+        if last_repo != repo_id or not last_root:
+            return None, ""
+        last_dir = Path(last_root)
+        default_dir = resolve_dataset_dir(repo_id, None)
+        if not last_dir.is_dir() or last_dir.resolve() == default_dir.resolve():
+            return None, ""
+        if (default_dir / "meta").exists():
+            # A finalized dataset already at the default location is what an
+            # absent root has always read. A recording elsewhere must not move
+            # the directory under a call that already worked.
+            return None, ""
+        return str(
+            last_dir
+        ), f"\nRoot: {last_dir} (where this session recorded {repo_id}; pass root= to read elsewhere)"
+
+    def _replay_load_failure(self, repo_id: str, root: str | None, error: BaseException) -> str:
+        """The text for a dataset that could not be opened.
+
+        ``LeRobotDataset`` resolves a miss on disk into a Hub download, so the
+        two ways a dataset is simply not there both arrive as a library error
+        about the network. Both are translated, because in both the useful fact
+        is the DIRECTORY that was read and the raw message never names it:
+
+        * **no such repository** - the caller means a local dataset, and the
+          404 carries a request id, ``repo_type`` advice and a gated-repo
+          paragraph instead. An explicit ``root=`` is named as the directory
+          it is: passing one and being told about ``repo_type`` names the one
+          input the caller chose nowhere in the reply.
+        * **the Hub could not be reached** - ``[Errno 111] Connection refused``
+          or ``[Errno -2] Name or service not known`` verbatim, which names
+          neither the dataset, the directory, nor the Hub. The library's own
+          text is kept in parentheses here (it names the endpoint, and offline
+          mode names the variable to unset), the 404's is not.
+
+        Either way the datasets that ARE on disk beside the one asked for are
+        listed, which is the answer to the common cause - a typo, or a root
+        the reader forgot. Every other load error (an episode out of range, an
+        unreadable parquet) is reported as the library said it.
+        """
+        text = f"{error}"
+        hub_miss = "Repository Not Found" in text or type(error).__name__ == "RepositoryNotFoundError"
+        # By the exception's class names, not the message: lerobot's Hub client
+        # moved from requests to httpx, so "Max retries exceeded" is no longer
+        # the wording, and httpx's ConnectError is not a builtin
+        # ConnectionError - while OfflineModeIsEnabled is one.
+        unreachable = not hub_miss and any(c.__name__ in _HUB_UNREACHABLE_ERRORS for c in type(error).__mro__)
+        if not (hub_miss or unreachable):
+            return text
+        from strands_robots.dataset_source import resolve_dataset_dir
+
+        checked = resolve_dataset_dir(repo_id, root)
+        if unreachable:
+            parts = [
+                f"No local copy of {repo_id!r} at {checked} and the Hugging Face Hub could not be reached ({text}).",
+                f"Pass {_REPLAY_ROOT_REMEDY} to read a dataset written elsewhere.",
+            ]
+        elif root:
+            parts = [
+                f"No dataset {repo_id!r} in the root= directory {checked} and no Hub repository by that name.",
+                f"A dataset directory is the one holding meta/ - pass {_REPLAY_ROOT_REMEDY}, not its parent.",
+            ]
+        else:
+            parts = [
+                f"No dataset {repo_id!r} at the local default {checked} and no Hub repository by that name.",
+                f"A dataset recorded with root= is read back with the same root= - pass {_REPLAY_ROOT_REMEDY} "
+                + "to replay_episode, or record without root= so the default location is used.",
+            ]
+        if (on_disk := _datasets_on_disk_near(checked)) is not None:
+            parts.insert(1, on_disk)
+        last_repo, last_root = self._last_recorded()
+        if last_repo and last_root:
+            parts.append(f"This session last recorded {last_repo} to {last_root}.")
+        return " ".join(parts)
 
     # evaluate(): multi-episode success metrics
 
@@ -3673,7 +3976,7 @@ class PolicyRunner:
                 legacy ``success_fn`` paths; ``step`` is a monotonic index
                 that continues across episode boundaries. A hook exception
                 other than ``CooperativeStop`` or
-                :class:`~strands_robots.dataset_recorder.RecordingFrameError` is
+                :class:`~strands_robots.recording_errors.RecordingFrameError` is
                 logged at WARN and never aborts the eval; a
                 ``RecordingFrameError`` is data loss rather than telemetry and
                 propagates on the first occurrence. Raising
@@ -4260,8 +4563,16 @@ class PolicyRunner:
                         )
                         + f"Episodes: {n_completed}"
                         + (f" of {n_episodes} (stopped early)" if stopped_early else "")
-                        + f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
-                        + ("" if success_measured else " [no success criterion - not measured]")
+                        + (
+                            f" | Success: {n_success}/{n_completed} ({success_rate:.1%})"
+                            if success_measured
+                            # No fraction when nothing measured it: "0/3 (0.0%)
+                            # [not measured]" was read as a 0% baseline and each
+                            # episode reported as failed. The json keeps the
+                            # documented success_rate=0.0 + success_measured=false.
+                            else " | Success: not measured (no success criterion - pass success_fn, "
+                            "e.g. 'contact', or a benchmark spec)"
+                        )
                         + "\n"
                         f"Avg steps: {avg_steps:.0f}/{max_steps}"
                         + f" | Actions applied: {total_actions}/{total_steps}"
@@ -4368,7 +4679,7 @@ class PolicyRunner:
         """
         # Lazy import to avoid circular reference (benchmark module imports
         # `SimEngine` from base which imports this module under TYPE_CHECKING).
-        from strands_robots.simulation.benchmark import BenchmarkCompatibilityError
+        from strands_robots.simulation.benchmark import BenchmarkCompatibilityError, spec_instruction
 
         # The per-episode horizon is read off the benchmark, so it is the one
         # rollout count with no parameter of its own to validate: every other
@@ -4416,6 +4727,12 @@ class PolicyRunner:
             set_eval_seed(seed)
         master_rng = random.Random(seed)
         spec_name = type(spec).__name__
+        # The registered id when the spec carries one, for the lines a caller
+        # reads: "benchmark DeclarativeBenchmark supports [...]" named the
+        # class every declarative benchmark shares, not which one refused.
+        spec_label = getattr(spec, "name", None) or spec_name
+        if not isinstance(spec_label, str) or not spec_label:
+            spec_label = spec_name
         max_steps = spec.max_steps
         results: list[dict[str, Any]] = []
         episodes_successful_at_reset = 0
@@ -4435,12 +4752,8 @@ class PolicyRunner:
         # the per-task language with the benchmark, so the spec is the
         # right source of truth. User-provided ``instruction`` still
         # wins when non-empty, preserving back-compat.
-        spec_instruction = ""
-        try:
-            spec_instruction = spec.instruction or ""
-        except Exception as e:  # noqa: BLE001 - back-compat for specs without the property
-            logger.debug("spec.instruction lookup raised %s; defaulting to empty", e)
-        effective_instruction = instruction or spec_instruction
+        spec_language = spec_instruction(spec)
+        effective_instruction = instruction or spec_language
         if not effective_instruction:
             logger.warning(
                 "evaluate_benchmark: instruction is empty (user passed %r, spec.instruction=%r). "
@@ -4448,7 +4761,7 @@ class PolicyRunner:
                 "string and may produce off-task actions. Pass instruction=... explicitly or "
                 "override BenchmarkProtocol.instruction on your spec.",
                 instruction,
-                spec_instruction,
+                spec_language,
             )
 
         # Optional per-episode rollout video (evaluate_benchmark video=). One
@@ -4523,7 +4836,7 @@ class PolicyRunner:
                                 "text": (
                                     f"Benchmark compatibility error: robot '{e.robot_name}' "
                                     f"has data_config={e.data_config!r}, but benchmark "
-                                    f"{spec_name} supports {e.supported}."
+                                    f"{spec_label} supports {e.supported}."
                                 )
                             }
                         ],
@@ -4830,7 +5143,7 @@ class PolicyRunner:
             "content": [
                 {
                     "text": (
-                        f"Benchmark: {spec_name} | policy {type(policy).__name__} on '{robot_name}'\n"
+                        f"Benchmark: {spec_label} | policy {type(policy).__name__} on '{robot_name}'\n"
                         + (
                             f"Stopped after a lost recording episode - {recording_save_error}\n"
                             if recording_save_error is not None
@@ -4955,6 +5268,33 @@ class PolicyRunner:
             return success_fn
         if success_fn == "contact":
             sim = self.sim
+            # Refuse up front on a backend that cannot answer a contact query,
+            # BEFORE any rollout is spent. ``get_contacts`` on the base class is
+            # a raising stub, and the predicate DSL's never-raise contract turns
+            # that raise into ``False`` on every tick - so
+            # ``eval_policy(success_fn="contact")`` on such a backend used to
+            # run the full evaluation (GPU-hours on Isaac) and report
+            # ``success_rate: 0.0`` with ``success_measured: True``: a wrong
+            # answer shaped exactly like a policy that failed every episode,
+            # with nothing anywhere saying success was never measurable. The
+            # ``ValueError`` is returned to the caller as this method's
+            # documented structured-error envelope.
+            #
+            # The test is structural (did the subclass override the stub?)
+            # rather than a probe call, because ``get_contacts`` on a real
+            # backend can fail for world-lifecycle reasons that say nothing
+            # about the capability.
+            from strands_robots.simulation.base import SimEngine
+
+            if type(sim).get_contacts is SimEngine.get_contacts:
+                raise ValueError(
+                    f"success_fn='contact' cannot be measured on this backend: "
+                    f"{type(sim).__name__} does not implement get_contacts, so every "
+                    f"episode would score 0.0 while the payload claimed the rate was "
+                    f"measured. Pass a callable success_fn that reads the observation "
+                    f"(e.g. an object-pose check via body.<name>.pos), or evaluate on "
+                    f"a backend with a contact query (MuJoCo)."
+                )
             # Share the DSL's reader instead of keeping a second one. The
             # inline copy this replaces indexed the engine result as if it
             # were the payload, so it never saw a real backend's envelope and
@@ -4979,7 +5319,12 @@ class PolicyRunner:
                 return bool(contact_any(sim))
 
             return _contact_check
-        raise ValueError(f"Unknown success_fn string: {success_fn!r}")
+        raise ValueError(
+            f"Unknown success_fn string: {success_fn!r}. The only named criterion is 'contact' (any "
+            "robot-object contact). For a condition on the scene pass success_when instead - a predicate "
+            "clause in the stop_when DSL, e.g. {'predicate': 'body_above_z', 'body': 'cube', 'z': 0.2} or "
+            "{'predicate': 'base_beyond_x', 'x': 0.5}; or evaluate_benchmark with a registered benchmark."
+        )
 
 
 __all__ = [

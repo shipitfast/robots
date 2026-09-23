@@ -34,7 +34,7 @@ parameter, as ``streaming_encoding="false"`` did on both entry points.
 
 **Three of the four posture-flag surfaces in this module already check.**
 :meth:`~strands_robots.dataset_recorder.DatasetRecorder.push_to_hub` checks
-``private``, :func:`~strands_robots.dataset_recorder.sync_dataset_to_bucket`
+``private``, :func:`~strands_robots.dataset_transfer.sync_dataset_to_bucket`
 checks its three, and every backend's ``start_recording`` facade checks the
 ``overwrite`` it forwards *here*
 (:func:`~strands_robots.simulation.recording.dataset_recording_posture_error`).
@@ -50,7 +50,7 @@ measured on ``51cbede7`` against a dataset whose every fourth write fails,
 ``strict=None`` (also ``0``, ``0.0``, ``""``, ``[]``, ``{}``) wrote 75 of 100
 attempted frames, counted the other 25 in ``dropped_frame_count`` and let
 ``save_episode`` complete - the short episode with re-timestamped frames that
-:class:`~strands_robots.dataset_recorder.RecordingFrameError`'s own docstring
+:class:`~strands_robots.recording_errors.RecordingFrameError`'s own docstring
 exists to prevent. The truthy half is not clean either: it selected fail-fast and
 then reported ``strict=True`` in the refusal text whatever the caller wrote, so
 ``strict="false"`` raised a message naming the opposite of the value it was given.
@@ -76,6 +76,7 @@ from typing import Any
 import pytest
 
 from strands_robots import dataset_recorder as recorder_mod
+from strands_robots import dataset_transfer
 from strands_robots.simulation.recording import dataset_recording_posture_error
 from strands_robots.utils import boolean_flag_error
 
@@ -556,7 +557,9 @@ class TestNeighbouringSurfacesStayOutOfScope:
         """The in-module precedent this guard follows, not scope it adds."""
         source = Path(inspect.getfile(DatasetRecorder)).read_text(encoding="utf-8")
         assert "private" in _flags_checked_by(source, "push_to_hub")
-        bucket = _flags_checked_by(source, "sync_dataset_to_bucket")
+        # The bucket surface sits a layer below, in dataset_transfer.
+        transfer = Path(inspect.getfile(dataset_transfer)).read_text(encoding="utf-8")
+        bucket = _flags_checked_by(transfer, "sync_dataset_to_bucket")
         assert {"create", "private", "delete"} <= bucket, sorted(bucket)
 
     def test_resume_declares_no_rate_of_its_own(self) -> None:

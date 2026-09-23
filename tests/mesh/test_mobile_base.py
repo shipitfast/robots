@@ -552,11 +552,11 @@ def _shipped_transports() -> list[tuple[type, Any]]:
     matrix below.
     """
     from strands_robots.mesh.ros_bridge import _UseRosTransport
-    from strands_robots.mesh.rtps_robot import _UseRtpsTransport
+    from strands_robots.mesh.rtps_robot import _RtpsTransport
     from strands_robots.tools.use_ros import use_ros
     from strands_robots.tools.use_rtps import use_rtps
 
-    return [(_UseRosTransport, use_ros), (_UseRtpsTransport, use_rtps)]
+    return [(_UseRosTransport, use_ros), (_RtpsTransport, use_rtps)]
 
 
 def _tool_takes_a_context(agent_tool: Any) -> bool:
@@ -566,12 +566,21 @@ def _tool_takes_a_context(agent_tool: Any) -> bool:
 
 
 def _forwards_a_context(method: Any) -> bool:
+    """Does the method hand ``tool_context`` to something it calls?
+
+    Either spelling counts: a transport that passes the context on as a keyword
+    and one that hands its transport a gate closed over it are both carrying the
+    operator's decision to the surface. What this reports is a transport that
+    names the context in its signature and then drops it.
+    """
     source = textwrap.dedent(inspect.getsource(method))
     return any(
-        keyword.arg == "tool_context"
+        isinstance(node, ast.Call)
+        and any(
+            isinstance(value, ast.Name) and value.id == "tool_context"
+            for value in [*node.args, *(keyword.value for keyword in node.keywords)]
+        )
         for node in ast.walk(ast.parse(source))
-        if isinstance(node, ast.Call)
-        for keyword in node.keywords
     )
 
 
@@ -687,7 +696,7 @@ def test_every_shipped_transport_onto_a_ros2_graph_gates_its_commands() -> None:
     ``use_ros`` and ``use_rtps`` reach the same physical ``/cmd_vel`` over two
     different wires, so a gate on one but not the other makes the tool name the
     whole difference - the defect
-    :mod:`strands_robots.tools._command_gate` exists to prevent, and one it
+    :mod:`strands_robots._command_gate` exists to prevent, and one it
     already shipped once. Stated as the positive security claim rather than as a
     count of the two sides of a split, because the ungated side is empty and a
     check that it is non-empty is not something to want.

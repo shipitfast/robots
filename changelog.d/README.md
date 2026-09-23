@@ -16,7 +16,8 @@ reconcile.
 release bookkeeping (collapsing `[Unreleased]` into a dated section). It is
 fragments, not the log, that behavioural PRs write to.
 
-This rule is enforced by `.github/workflows/changelog-fragment.yml`, which names
+This rule is enforced by the `Guards` step of the required check
+(`scripts/ci_guards.py` runs `scripts/check_changelog_fragment.py`), which names
 any `### ` entry a branch adds to `[Unreleased]` that no fragment accounts for.
 It is a base diff rather than a test because `[Unreleased]` already carries
 entries from before this convention, so no static assertion about that section
@@ -27,7 +28,9 @@ editing or reordering an entry already in the log adds no heading.
 ## Adding a fragment
 
 Create `changelog.d/<number>-<slug>.md`, where `<number>` is your PR (or issue)
-number and `<slug>` is a short lowercase description:
+number and `<slug>` is a short lowercase description. `0000` and `999x` are
+placeholders, not numbers, and are refused by `--check`, by `--apply` and by the
+pull-request convention check; rename the file once the PR number exists:
 
 ```
 changelog.d/1692-teleop-slew-bound.md
@@ -59,7 +62,7 @@ Rules, all enforced by `tests/test_changelog_fragments.py`:
 Validate locally with:
 
 ```bash
-python scripts/assemble_changelog.py --check    # names + headings
+python scripts/assemble_changelog.py --check    # names, numbers + headings
 python scripts/assemble_changelog.py --print    # preview the assembled section
 ```
 

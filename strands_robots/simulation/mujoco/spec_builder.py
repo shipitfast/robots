@@ -37,6 +37,7 @@ from strands_robots.simulation.terrain import (
     generate_heightfield,
     terrain_elevation,
 )
+from strands_robots.simulation.tool_frame import ToolFrame, ToolFrameRefused
 
 logger = logging.getLogger(__name__)
 
@@ -639,9 +640,10 @@ class SpecBuilder:
         # collides with an existing scene body, and the steps after it (the geom
         # type lookup, ``add_geom``) can raise as well. Any raise in this block
         # must undo only what THIS call inserted, then re-raise so the caller
-        # reports the real reason - hence the body count taken before the insert
-        # and :meth:`remove_surplus_bodies` after it, never a delete by name.
-        pre_count = SpecBuilder.count_bodies_named(spec, obj.name)
+        # reports the real reason - hence the body snapshot taken before the
+        # insert and :meth:`remove_bodies_not_in` after it, never a delete by
+        # name: what name the orphan carries depends on the MuJoCo build.
+        before = SpecBuilder.snapshot_bodies(spec)
         try:
             body = spec.worldbody.add_body(
                 name=obj.name,
@@ -699,7 +701,7 @@ class SpecBuilder:
 
             body.add_geom(**geom_kwargs)
         except (ValueError, RuntimeError):
-            SpecBuilder.remove_surplus_bodies(spec, obj.name, pre_count)
+            SpecBuilder.remove_bodies_not_in(spec, before)
             raise
 
     # material build
@@ -832,7 +834,7 @@ class SpecBuilder:
         ``add_camera(name=...)`` inserts the duplicate even when the name
         collides with a camera the scene already declares, so - exactly as in
         :meth:`add_object` - a raise from the insert rolls only the cameras THIS
-        call appended back out (:meth:`remove_surplus_cameras`) before
+        call appended back out (:meth:`remove_cameras_not_in`) before
         re-raising. Without that, a refused camera left an orphan in the spec and
         every later scene mutation kept failing to recompile on the duplicate
         name, bricking the world after one bad add.
@@ -865,11 +867,11 @@ class SpecBuilder:
         else:
             attach_to = spec.worldbody
 
-        pre_count = SpecBuilder.count_cameras_named(spec, cam.name)
+        before = SpecBuilder.snapshot_cameras(spec)
         try:
             attach_to.add_camera(**kwargs)
         except (ValueError, RuntimeError):
-            SpecBuilder.remove_surplus_cameras(spec, cam.name, pre_count)
+            SpecBuilder.remove_cameras_not_in(spec, before)
             raise
 
     # deferred (body-mounted) cameras
@@ -942,46 +944,51 @@ class SpecBuilder:
 
     # surplus rollback (identify what THIS call inserted, never by name)
     @staticmethod
-    def count_bodies_named(spec: Any, name: str) -> int:
-        """Count the bodies in ``spec`` that carry ``name``.
+    def snapshot_bodies(spec: Any) -> tuple[Any, ...]:
+        """The bodies ``spec`` holds right now, for :meth:`remove_bodies_not_in`.
 
-        Take this BEFORE an insert that may have to be rolled back, and pass it
-        as the ``keep`` argument of :meth:`remove_surplus_bodies`. A plain count
-        rather than a membership test because a spec can legitimately hold two
-        bodies under one name between an insert and the compile that refuses it.
-
-        Args:
-            spec: The ``mjSpec`` to enumerate.
-            name: The body name to count.
-
-        Returns:
-            How many bodies currently carry ``name`` (0 when none do).
-        """
-        return sum(1 for body in getattr(spec, "bodies", ()) if body.name == name)
-
-    @staticmethod
-    def count_cameras_named(spec: Any, name: str) -> int:
-        """Count the cameras in ``spec`` that carry ``name``.
-
-        The camera-side counterpart of :meth:`count_bodies_named`; pair it with
-        :meth:`remove_surplus_cameras`.
+        Take this BEFORE an insert that may have to be rolled back. The surplus
+        is identified by element identity rather than by name because a refused
+        insert does not leave a predictable name behind: through MuJoCo 3.13 a
+        duplicate ``add_body(name=...)`` appended a body carrying the colliding
+        name, and from 3.14 the failed rename preserves the element's previous
+        name, so the same call appends a body whose name is ``""`` (and whose
+        ``pos`` is the default, since the kwargs after ``name`` are never
+        applied). A rollback keyed on the colliding name found the orphan on the
+        first build and nothing on the second, leaving a nameless body at the
+        origin in a spec that then compiled. Identity is the same set on both.
 
         Args:
             spec: The ``mjSpec`` to enumerate.
-            name: The camera name to count.
 
         Returns:
-            How many cameras currently carry ``name`` (0 when none do).
+            Every body currently in ``spec``, in enumeration order.
         """
-        return sum(1 for camera in getattr(spec, "cameras", ()) if camera.name == name)
+        return tuple(getattr(spec, "bodies", ()))
 
     @staticmethod
-    def remove_surplus_bodies(spec: Any, name: str, keep: int) -> int:
-        """Delete the bodies named ``name`` beyond the first ``keep`` of them.
+    def snapshot_cameras(spec: Any) -> tuple[Any, ...]:
+        """The cameras ``spec`` holds right now, for :meth:`remove_cameras_not_in`.
+
+        The camera-side counterpart of :meth:`snapshot_bodies`, for the same
+        reason: a refused ``add_camera(name=...)`` leaves an orphan whose name
+        depends on the MuJoCo build.
+
+        Args:
+            spec: The ``mjSpec`` to enumerate.
+
+        Returns:
+            Every camera currently in ``spec``, in enumeration order.
+        """
+        return tuple(getattr(spec, "cameras", ()))
+
+    @staticmethod
+    def remove_bodies_not_in(spec: Any, before: tuple[Any, ...]) -> int:
+        """Delete every body in ``spec`` that is absent from ``before``.
 
         This is the rollback a refused insert needs, and it is deliberately NOT
         :meth:`remove_body`. A scene injection mutates the live spec before the
-        compile that validates it, so at rollback time a colliding name is
+        compile that validates it, so at rollback time a colliding name may be
         carried by TWO bodies: the healthy pre-existing one and the orphan the
         refused call appended. ``remove_body`` resolves the name through
         ``spec.body(name)``, which answers with the body present at the last
@@ -990,46 +997,50 @@ class SpecBuilder:
         successfully with the original geometry gone: a rejected add silently
         rewrote the scene.
 
-        Identifying the surplus by position instead can never touch a body this
-        call did not create. MuJoCo appends new elements, so the bodies to delete
-        are the tail of the run carrying ``name``; ``keep`` is the count taken
-        before the insert (:meth:`count_bodies_named`). ``keep`` at or above the
-        current count is a no-op, so a rollback is safe to attempt on a path that
-        may not have inserted anything.
+        Nor is it a delete of the surplus copies carrying the name, which was the
+        previous shape here: on MuJoCo 3.14 the orphan carries no name at all
+        (see :meth:`snapshot_bodies`), so a name-keyed rollback leaves it in the
+        spec. Membership in the snapshot is the one test that can never touch a
+        body this call did not create, whatever the failed insert left in the
+        name field. Spec element wrappers are identity-stable and compare
+        equal for one underlying element, so the membership test is by
+        equality. ``before`` equal to the current set is a no-op, so a rollback
+        is safe to attempt on a path that may not have inserted anything.
 
         Args:
             spec: The ``mjSpec`` to mutate.
-            name: The body name whose surplus copies to delete.
-            keep: How many bodies with that name to leave in place.
+            before: The snapshot :meth:`snapshot_bodies` took before the insert.
 
         Returns:
             The number of bodies deleted.
         """
-        surplus = [body for body in getattr(spec, "bodies", ()) if body.name == name][keep:]
+        surplus = [body for body in getattr(spec, "bodies", ()) if body not in before]
         for body in surplus:
             spec.delete(body)
         return len(surplus)
 
     @staticmethod
-    def remove_surplus_cameras(spec: Any, name: str, keep: int) -> int:
-        """Delete the cameras named ``name`` beyond the first ``keep`` of them.
+    def remove_cameras_not_in(spec: Any, before: tuple[Any, ...]) -> int:
+        """Delete every camera in ``spec`` that is absent from ``before``.
 
-        The camera-side counterpart of :meth:`remove_surplus_bodies`, and for the
+        The camera-side counterpart of :meth:`remove_bodies_not_in`, and for the
         same reason: :meth:`remove_camera` deletes the FIRST camera carrying the
         name, which on a collision is the one the scene already declared, so
         rolling a refused camera back with it moved the scene's camera to the
         rejected pose. Every later render from that name then answered with a
-        view the caller was told had been refused.
+        view the caller was told had been refused. A camera is also the case
+        where a positional tail would be wrong: ``spec.cameras`` enumerates in
+        tree order, so a camera appended to the worldbody sits BEFORE the
+        cameras of every child body, not last.
 
         Args:
             spec: The ``mjSpec`` to mutate.
-            name: The camera name whose surplus copies to delete.
-            keep: How many cameras with that name to leave in place.
+            before: The snapshot :meth:`snapshot_cameras` took before the insert.
 
         Returns:
             The number of cameras deleted.
         """
-        surplus = [camera for camera in getattr(spec, "cameras", ()) if camera.name == name][keep:]
+        surplus = [camera for camera in getattr(spec, "cameras", ()) if camera not in before]
         for camera in surplus:
             spec.delete(camera)
         return len(surplus)
@@ -1076,6 +1087,7 @@ class SpecBuilder:
         scene_spec: Any,
         robot: SimRobot,
         robot_file_path: str,
+        tool_frame: ToolFrame | None = None,
     ) -> list[str]:
         """Attach a URDF/MJCF file into the scene spec with a name prefix.
 
@@ -1091,11 +1103,19 @@ class SpecBuilder:
             robot: ``SimRobot`` carrying ``name`` (used as prefix) and
                 ``position`` / ``orientation`` (used as attach frame).
             robot_file_path: absolute or relative path to an MJCF/URDF file.
+            tool_frame: a registry-declared tool point to add to the model
+                before the attach (:mod:`strands_robots.simulation.tool_frame`),
+                for a model that ships no tool site. Added to the child spec so
+                ``attach`` namespaces it with the rest of the robot.
 
         Returns:
             List of joint names belonging to the attached robot, in the order
             MuJoCo discovered them (no prefix - caller namespaces via
             ``robot.namespace`` when it resolves IDs post-compile).
+
+        Raises:
+            ToolFrameRefused: ``tool_frame`` names a body the model does not
+                have, or a site name the model already uses.
         """
         mujoco = _ensure_mujoco()
 
@@ -1171,6 +1191,9 @@ class SpecBuilder:
         for top_body in robot_spec.worldbody.bodies:
             _walk(top_body)
 
+        if tool_frame is not None:
+            SpecBuilder.add_tool_site(robot_spec, robot.name, tool_frame)
+
         # Read the solver settings the robot model declares for itself. The read
         # has to happen here, before ``attach`` consumes the child spec, but the
         # scene is only written once the attach below has succeeded: everything
@@ -1189,6 +1212,46 @@ class SpecBuilder:
         SpecBuilder.adopt_declared_options(scene_spec, declared_options, robot.name)
 
         return source_joint_names
+
+    @staticmethod
+    def add_tool_site(robot_spec: Any, robot_name: str, tool_frame: ToolFrame) -> Any:
+        """Add the registry-declared tool site to a robot's (un-attached) spec.
+
+        The site goes on ``tool_frame.body`` at ``tool_frame.pos`` under the
+        name ``tool_frame.site``. Called before ``attach`` so MuJoCo prefixes
+        the site with the robot's namespace like every other element, and
+        :func:`~strands_robots.simulation.ik.discover_ee_frame` finds it as
+        the robot's own tool point.
+
+        Raises:
+            ToolFrameRefused: the body is not in the model (names the bodies
+                that are), or the model already has a site of that name (the
+                declaration is then redundant or mis-targeted - either way a
+                second site of one name would be refused at compile).
+        """
+        bodies = [b.name for b in robot_spec.bodies if b.name and b.name != "world"]
+        if tool_frame.body not in bodies:
+            raise ToolFrameRefused(
+                f"tool_frame for robot '{robot_name}' names body {tool_frame.body!r}, which the model "
+                f"does not have. Bodies in the model: {bodies}. Fix the registry entry's tool_frame.body."
+            )
+        existing = [st.name for st in robot_spec.sites if st.name]
+        if tool_frame.site in existing:
+            raise ToolFrameRefused(
+                f"tool_frame for robot '{robot_name}' would add site {tool_frame.site!r}, but the model "
+                f"already has a site of that name (sites: {existing}). Drop the registry tool_frame, or "
+                "give the declared site another name."
+            )
+        body = robot_spec.body(tool_frame.body)
+        site = body.add_site(name=tool_frame.site, pos=list(tool_frame.pos))
+        logger.debug(
+            "attach_robot: added tool site %r on body %r at %r for %r (registry tool_frame)",
+            tool_frame.site,
+            tool_frame.body,
+            list(tool_frame.pos),
+            robot_name,
+        )
+        return site
 
     @staticmethod
     def declared_options(robot_spec: Any) -> dict[str, Any]:

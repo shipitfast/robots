@@ -172,8 +172,16 @@ def _module_available(name: str) -> bool:
 # side and the matching AbsoluteActionsProcessorStep on the output side, both
 # built from ``config.use_relative_actions`` and saved into the checkpoint's
 # pre/post processors). Discovered live per policy type off the config class
-# (see :func:`_policy_supports_relative_actions`); the static set is the offline
-# FALLBACK. Currently the pi0 family and groot expose the field.
+# (see :func:`_policy_supports_relative_actions`); the static set below is the
+# offline FALLBACK and the only written roster - prose that re-lists it goes
+# stale silently, so the docs roster is graded against this gate instead.
+#
+# The snapshot answers for the lerobot the manifest FLOORS at, not for every
+# release it admits: lerobot gave ``VLAJEPAConfig`` this field after v0.6.1, so a
+# newer in-range lerobot accepts a type this set omits. The live probe above
+# reports that type correctly; the snapshot gains it when the floor is raised
+# onto the release that added it, and never before - naming it earlier would make
+# an offline gate accept a run the floor's lerobot has no field for.
 _RELATIVE_ACTION_POLICY_TYPES_FALLBACK = frozenset({"pi0", "pi05", "pi0_fast", "groot"})
 
 # LeRobot policy types whose config exposes ``train_expert_only`` (freeze the
@@ -483,7 +491,7 @@ def _format_version_major(version: str) -> int | None:
     Returns ``None`` for anything this cannot read a leading major out of, so an
     unrecognized version string fails OPEN (no problem reported) rather than
     blocking a possibly-loadable dataset on a cosmetic format - the same posture
-    as :func:`~strands_robots.dataset_recorder._huggingface_hub_version_error`.
+    as :func:`~strands_robots.dataset_transfer._huggingface_hub_version_error`.
     """
     match = re.match(r"v?(\d+)", version.strip())
     return int(match.group(1)) if match else None
@@ -977,11 +985,12 @@ class LerobotTrainer(Trainer):
         pipeline) restores the inverse decode automatically - no separate
         inference-side wiring is needed.
 
-        Only some policy configs expose ``use_relative_actions`` (currently the
-        ``pi0`` family and ``groot``); the supported set is discovered live from
-        lerobot's registry (:func:`_policy_supports_relative_actions`), and
-        :meth:`validate` rejects the flag for any policy type whose config lacks
-        the field rather than letting it become a silent no-op.
+        Only some policy configs expose ``use_relative_actions``; the supported
+        set is discovered live from lerobot's registry
+        (:func:`_policy_supports_relative_actions`) and named by the refusal, so
+        it is not re-listed here. :meth:`validate` rejects the flag for any
+        policy type whose config lacks the field rather than letting it become a
+        silent no-op.
         """
         return bool(spec.extra.get("relative_actions", False))
 
@@ -1576,8 +1585,6 @@ class LerobotTrainer(Trainer):
                 f"method '{spec.method}' applies to policy training; reward-model training uses method='full'"
             )
 
-        import importlib.util
-
         if importlib.util.find_spec("lerobot.rewards") is None:
             problems.append(
                 "the installed lerobot has no reward-model support (no 'lerobot.rewards'); "
@@ -1933,7 +1940,6 @@ class LerobotTrainer(Trainer):
 
     def _build_policy_config(self, spec: TrainSpec) -> TrainPipelineConfig:
         """Build a policy ``TrainPipelineConfig`` (``cfg.policy`` set)."""
-        import dataclasses
         from pathlib import Path
 
         from lerobot.configs.default import PeftConfig

@@ -1,13 +1,17 @@
 """Policy factory - create_policy() and runtime registration."""
 
+import difflib
+import importlib
+import inspect
 import logging
 import os
 from collections.abc import Callable, Mapping
+from typing import Any
 
 from strands_robots import refusal_codes
 from strands_robots.policies.base import Policy
 from strands_robots.registry import (
-    import_policy_class,
+    get_policy_provider,
     list_policy_aliases,
     list_policy_providers,
     resolve_policy,
@@ -71,7 +75,7 @@ def list_aliases() -> dict[str, str]:
 
     That is every *registered* spelling, not every spelling
     :func:`create_policy` resolves.
-    :func:`~strands_robots.registry.policies.import_policy_class` falls back
+    :func:`import_policy_class` falls back
     to auto-discovery, so a module under ``strands_robots.policies`` that
     exports a :class:`~strands_robots.policies.base.Policy` subclass resolves
     under its own module name with no registry entry. Two ship, and neither is
@@ -170,6 +174,149 @@ def _check_trust_remote_code(provider: str) -> None:
     )
 
 
+def _is_smart_string(provider: str) -> bool:
+    """Whether ``provider`` is a spelling :func:`resolve_policy` interprets (HF id, URL)."""
+    return (
+        "/" in provider
+        or (":" in provider and not provider.replace("_", "").isalpha())
+        or provider.startswith("ws://")
+        or provider.startswith("grpc://")
+        or provider.startswith("zmq://")
+    )
+
+
+def provider_can_be_created(provider: Any) -> bool:
+    """Whether :func:`create_policy` could resolve ``provider`` - without importing it.
+
+    A pre-flight check refuses a provider *before* spending something expensive
+    on it (energizing an arm, asking an operator), so it must answer exactly the
+    question :func:`create_policy` answers, from the same three stages
+    :func:`_resolve_policy_class` walks - the runtime registry that the public
+    :func:`register_policy` API fills (a name or one of its aliases), a smart
+    string :func:`resolve_policy` interprets, then the shipped registry and the
+    ``strands_robots.policies.<name>`` auto-discovery that
+    :func:`~strands_robots.registry.policies.policy_provider_resolves` mirrors.
+    Asking only the last stage refused every runtime-registered provider as
+    unknown at every hardware entry point, while ``create_policy`` built it.
+
+    Optimistic where resolution is: a smart string is reported as resolving
+    (its refusal, if any, needs the network or the Hub), and a registered
+    loader is never invoked here.
+
+    Args:
+        provider: Any spelling a caller may supply. ``None``/empty/non-string
+            resolves to nothing.
+
+    Returns:
+        True when ``create_policy(provider)`` would get past provider lookup.
+    """
+    if not provider or not isinstance(provider, str):
+        return False
+    if _runtime_aliases.get(provider, provider) in _runtime_registry:
+        return True
+    if _is_smart_string(provider):
+        return True
+    from strands_robots.registry.policies import policy_provider_resolves
+
+    return policy_provider_resolves(provider)
+
+
+def _provider_import_error(provider: str, exc: ImportError, extra: str | None) -> ImportError:
+    """Translate a failed provider-module import into an actionable error.
+
+    A policy provider's module may import an optional dependency at import time
+    (e.g. ``lerobot_local`` imports ``torch``). When that dependency is absent
+    the import machinery raises a bare ``ModuleNotFoundError: No module named
+    'torch'`` which names neither the provider the caller asked for nor the way
+    to fix it -- so a caller who asked for one provider is left holding an error
+    about a package they never mentioned.
+
+    Every other provider defers its heavy import and reports the remedy through
+    :func:`~strands_robots.utils.require_optional` /
+    :func:`~strands_robots.utils.require_optionals`, which name the extra that
+    ships the dependency. This is the same report for the providers whose
+    dependency is needed to import the module at all, so the remedy does not
+    depend on WHERE a provider happens to import its dependency.
+
+    Args:
+        provider: Canonical provider name the caller asked for.
+        exc: The ``ImportError`` raised while importing the provider's module.
+        extra: ``pyproject.toml`` extras group that ships the dependency, as
+            declared by the provider's ``extra`` field in ``policies.json``.
+            ``None`` when the provider declares none, in which case the missing
+            module is named without an install command for a specific extra.
+
+    Returns:
+        An ``ImportError`` naming the provider, the missing module and the
+        remedy. The caller should ``raise ... from exc`` to keep the original
+        traceback.
+    """
+    missing = getattr(exc, "name", None) or "an optional dependency"
+    if extra:
+        remedy = f"Install the extra that ships it:\n  uv pip install 'strands-robots[{extra}]'"
+    else:
+        remedy = f"Install {missing!r} (or the strands-robots extra that ships it) and retry."
+    return ImportError(
+        f"Policy provider {provider!r} needs an optional dependency that is not installed:\n  {exc}\n\n{remedy}"
+    )
+
+
+def import_policy_class(provider: str) -> type:
+    """Dynamically import and return the Policy class for a provider.
+
+    Uses the module + class paths from policies.json.  Falls back to
+    auto-discovery (strands_robots.policies.<name>) if not in JSON.
+
+    Args:
+        provider: Canonical provider name.
+
+    Returns:
+        The Policy subclass.
+
+    Raises:
+        ValueError: If the provider does not exist.
+        ImportError: If the provider exists but its module cannot be imported,
+            naming the provider, the missing module and the remedy (see
+            :func:`_provider_import_error`). A provider whose module is present
+            but whose optional dependency is missing reports that rather than
+            being misreported as an unknown provider.
+    """
+    config = get_policy_provider(provider)
+    if config:
+        # get_policy_provider already keyed the lookup on the canonical name,
+        # so config IS the canonical entry; the name is needed for the report.
+        canonical = _canonical_provider_name(provider)
+        try:
+            mod = importlib.import_module(config["module"])
+        except ImportError as exc:
+            # A provider whose module needs an optional dependency at import
+            # time (lerobot_local imports torch) otherwise raises a bare
+            # "No module named 'torch'" naming neither this provider nor the
+            # remedy - the dead end _provider_import_error exists to close.
+            raise _provider_import_error(canonical, exc, config.get("extra")) from exc
+        return getattr(mod, config["class"])
+
+    # Auto-discovery fallback
+    try:
+        mod = importlib.import_module(f"strands_robots.policies.{provider}")
+        class_name = f"{provider.capitalize()}Policy"
+        if hasattr(mod, class_name):
+            return getattr(mod, class_name)
+        for attr_name in dir(mod):
+            attr = getattr(mod, attr_name)
+            if isinstance(attr, type) and issubclass(attr, Policy) and attr is not Policy:
+                return attr
+    except ImportError as exc:
+        # Distinguish "this provider does not exist" from "it exists but its
+        # optional dependency is missing". Only the former is an unknown
+        # provider; reporting the latter that way sends the caller to check a
+        # name that was correct.
+        if getattr(exc, "name", None) != f"strands_robots.policies.{provider}":
+            raise _provider_import_error(provider, exc, None) from exc
+
+    raise ValueError(f"Unknown policy provider: '{provider}'. Available: {list_policy_providers()}")
+
+
 def _resolve_policy_class(provider: str, **kwargs) -> tuple[str, type[Policy], dict]:
     """Resolve ``provider`` to its policy class WITHOUT instantiating it.
 
@@ -197,14 +344,7 @@ def _resolve_policy_class(provider: str, **kwargs) -> tuple[str, type[Policy], d
         return resolved_name, _runtime_registry[resolved_name](), dict(kwargs)
 
     # 2. Smart string (HF ID, URL, etc.).
-    _needs_resolution = (
-        "/" in provider
-        or (":" in provider and not provider.replace("_", "").isalpha())
-        or provider.startswith("ws://")
-        or provider.startswith("grpc://")
-        or provider.startswith("zmq://")
-    )
-    if _needs_resolution:
+    if _is_smart_string(provider):
         try:
             resolved_provider, resolved_kwargs = resolve_policy(provider, **kwargs)
         except ImportError:
@@ -314,6 +454,169 @@ def policy_object_error(value: object, param: str = "policy_object") -> str | No
     )
 
 
+# A residual keyword scoring at least this against a declared constructor
+# parameter is a misspelling of it, not another option. The cutoff is the one
+# ``simulation.base.reject_misspelled_kwargs`` uses for engine kwargs, so a typo
+# is judged the same way whichever sink it lands in; not imported from there
+# because the policies package does not depend on the simulation package.
+_MISSPELLING_RATIO = 0.8
+
+
+def _constructor_keywords(PolicyClass: type) -> tuple[tuple[str, ...], bool]:
+    """The keyword names a provider's constructor binds, and whether it has a sink.
+
+    Returns:
+        ``(accepted, tolerates_unknown)`` - the parameters a caller can spell by
+        keyword (``self`` and the sinks omitted, in declaration order) and
+        whether the constructor declares ``**kwargs``. Empty and ``True`` when
+        the class has no introspectable signature, which turns screening into
+        a no-op rather than refusing every keyword.
+    """
+    try:
+        params = inspect.signature(PolicyClass).parameters
+    except (TypeError, ValueError):
+        return (), True
+    accepted = tuple(
+        name
+        for name, p in params.items()
+        if name != "self" and p.kind not in (p.VAR_KEYWORD, p.VAR_POSITIONAL, p.POSITIONAL_ONLY)
+    )
+    tolerates_unknown = any(p.kind is p.VAR_KEYWORD for p in params.values())
+    return accepted, tolerates_unknown
+
+
+def _mistyped_in_place(name: str, candidate: str) -> bool:
+    """Whether ``name`` is ``candidate`` with a character mistyped in place.
+
+    One wrong character, or two adjacent characters in each other's place - the
+    two typos that leave a name's length alone, and the only ones
+    :data:`_MISSPELLING_RATIO` cannot see. ``difflib``'s ratio is
+    ``2 * matches / total``: a dropped or doubled character costs one match but
+    also changes the total (0.857 and 0.889 against a four-letter name, and
+    higher for every longer one), while a wrong character costs a match with the
+    total unchanged, scoring ``2 * (n - 1) / 2n`` - 0.750 at four characters,
+    0.800 at five. So the cutoff screens every length-changing typo of every
+    parameter this package declares, and leaves exactly one class open: a wrong
+    character in a four-letter name. Five parameters are four characters -
+    ``host``, ``port``, ``mode``, ``seed``, ``walk`` - and ``host`` and ``port``
+    are the two the most providers declare.
+
+    Args:
+        name: The keyword the caller spelled.
+        candidate: A parameter the constructor binds.
+
+    Returns:
+        Whether one typo in ``candidate`` produces ``name``.
+    """
+    if len(name) != len(candidate):
+        return False
+    differing = [i for i, (a, b) in enumerate(zip(name, candidate, strict=True)) if a != b]
+    if len(differing) == 1:
+        return True
+    if len(differing) == 2:
+        first, second = differing
+        # Adjacency is implied by the swap identity below (the character between
+        # two non-adjacent differences matches, which the identity contradicts),
+        # and stated because it is the invariant a reader needs.
+        return second == first + 1 and name[first] == candidate[second] and name[second] == candidate[first]
+    return False
+
+
+def _misspelling_of(name: str, accepted: tuple[str, ...]) -> str | None:
+    """The accepted parameter ``name`` misspells, or ``None``.
+
+    Two tests, because neither covers the other. A close match at
+    :data:`_MISSPELLING_RATIO` catches a name off a parameter by a character it
+    dropped, doubled, or by several characters. :func:`_mistyped_in_place`
+    catches the one class the ratio scores too low to see - a wrong character
+    in a four-letter name: ``hoat`` and ``hots`` for ``host``, ``porr`` and
+    ``prot`` for ``port`` all score 0.750. A provider whose constructor has a
+    ``**kwargs`` sink drops such a name silently, which is byte-identical to
+    omitting the argument, so the policy dials the default host and reports
+    success.
+
+    Nothing legitimate is one typo from a parameter the same constructor binds:
+    a pass-through option is another subsystem's name, not a near-miss of this
+    one's. Measured over the parameters of every registered provider, no name
+    any of them declares is one typo from a parameter of another.
+    """
+    match = difflib.get_close_matches(name, list(accepted), n=1, cutoff=_MISSPELLING_RATIO)
+    if match:
+        return match[0]
+    for candidate in accepted:
+        if _mistyped_in_place(name, candidate):
+            return candidate
+    return None
+
+
+def policy_kwargs_error(provider: str, PolicyClass: type, kwargs: Mapping[str, Any]) -> str | None:
+    """Why ``kwargs`` cannot be handed to ``PolicyClass`` as written, or ``None``.
+
+    One rule for every provider, applied before construction. Pre-fix each
+    provider had its own: a constructor with ``**kwargs`` dropped
+    ``create_policy("groot", hots="x")`` silently (the client dialled the
+    default host under ``status="success"``), ``remote`` and ``lerobot_async``
+    logged "ignoring unexpected constructor kwarg(s)" where no agent reads it,
+    and a constructor without a sink raised CPython's
+    ``__init__() got an unexpected keyword argument 'acton_space'`` - which
+    names neither the provider nor the parameter meant.
+
+    A name the constructor binds passes. A name that misspells one it binds
+    (:data:`_MISSPELLING_RATIO`) is refused naming the parameter meant: no
+    call can intend it, and a sink makes it byte-identical to omitting the
+    argument. A name that is neither is refused when the constructor has no
+    sink (it would have raised anyway - this names the provider and lists
+    what it does accept) and tolerated when it has one, because a provider's
+    ``**kwargs`` is its documented pass-through (model-loader options,
+    another provider's keys on a shared ``policy_config``), logged at DEBUG so
+    it is visible somewhere.
+
+    Args:
+        provider: The canonical provider name, quoted in the report.
+        PolicyClass: The class about to be constructed.
+        kwargs: The resolved constructor kwargs.
+
+    Returns:
+        The refusal, or ``None`` when every name is usable.
+    """
+    accepted, tolerates_unknown = _constructor_keywords(PolicyClass)
+    if not accepted:
+        return None
+    owner = f"{PolicyClass.__name__} (policy provider {provider!r})"
+    misspelled: list[str] = []
+    unknown: list[str] = []
+    for name in kwargs:
+        if name in accepted:
+            continue
+        meant = _misspelling_of(name, accepted)
+        if meant is not None:
+            misspelled.append(f"{name!r} (did you mean {meant!r}?)")
+        else:
+            unknown.append(name)
+    if misspelled:
+        return (
+            f"{owner} does not accept {', '.join(misspelled)}. A misspelling of a parameter it does read "
+            "cannot be a pass-through option, so it is refused rather than dropped - dropped, it would be "
+            "byte-identical to omitting the argument and the policy would run on the default. Fix the "
+            f"spelling, or drop the argument. It accepts: {', '.join(accepted)}."
+        )
+    if unknown and not tolerates_unknown:
+        names = ", ".join(repr(n) for n in unknown)
+        return (
+            f"{owner} does not accept {names}: its constructor declares no **kwargs, so there is nothing "
+            f"to forward them to. It accepts: {', '.join(accepted)}. Drop the argument, or check the "
+            "provider's docs for the name it uses."
+        )
+    if unknown:
+        logger.debug(
+            "%s forwarded %s to its **kwargs: no parameter of that name, and no close match to one. "
+            "Expected for a pass-through option; otherwise it is an unsupported name.",
+            owner,
+            sorted(unknown),
+        )
+    return None
+
+
 def create_policy(provider: str, **kwargs) -> Policy:
     """Create a policy instance.
 
@@ -336,9 +639,15 @@ def create_policy(provider: str, **kwargs) -> Policy:
         UntrustedRemoteCodeError: If the provider loads HF models with
             ``trust_remote_code=True`` and ``STRANDS_TRUST_REMOTE_CODE``
             is not set.
+        TypeError: If a keyword misspells one the provider's constructor
+            binds, or names one it cannot bind at all (no ``**kwargs``) - see
+            :func:`policy_kwargs_error`. Raised before construction, so no
+            model is downloaded and no server dialled on a typo.
     """
     canonical, PolicyClass, resolved_kwargs = _resolve_policy_class(provider, **kwargs)
     _check_trust_remote_code(canonical)
+    if (kwargs_error := policy_kwargs_error(canonical, PolicyClass, resolved_kwargs)) is not None:
+        raise TypeError(kwargs_error)
     return PolicyClass(**resolved_kwargs)
 
 

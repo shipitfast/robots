@@ -56,6 +56,35 @@ logger = logging.getLogger(__name__)
 _LOCAL_ROBOTS: dict[str, Mesh] = {}
 _LOCAL_ROBOTS_LOCK = threading.Lock()
 
+#: Startup posture warnings this process has already emitted, by kind.
+#: ``STRANDS_MESH_OVERRIDE_CODE`` and ``STRANDS_MESH_MULTICAST`` describe the
+#: process, not a peer: every :class:`Mesh` in it reads the same environment,
+#: so the second instance (a sim's per-robot child peer, a fleet of arms in
+#: one process) would only repeat the banner under another name. Emit once.
+_POSTURE_WARNINGS_EMITTED: set[str] = set()
+_POSTURE_WARNINGS_LOCK = threading.Lock()
+
+
+def _warn_posture_once(kind: str, msg: str, *args: Any) -> bool:
+    """Log ``msg`` at WARNING the first time ``kind`` is seen in this process.
+
+    Returns ``True`` when the warning was emitted, ``False`` when an earlier
+    :meth:`Mesh.start` in this process already said it.
+    """
+    with _POSTURE_WARNINGS_LOCK:
+        if kind in _POSTURE_WARNINGS_EMITTED:
+            return False
+        _POSTURE_WARNINGS_EMITTED.add(kind)
+    logger.warning(msg, *args)
+    return True
+
+
+def _reset_posture_warnings() -> None:
+    """Forget which posture warnings were emitted (tests that assert on them)."""
+    with _POSTURE_WARNINGS_LOCK:
+        _POSTURE_WARNINGS_EMITTED.clear()
+
+
 #: Why ``Mesh.start`` refuses under mTLS with a permissive ACL, and the four
 #: ways out. Logged by :meth:`Mesh._refuse_under_permissive_default_acl` and
 #: printed by ``strands-robots doctor`` for the same posture, so the two never
@@ -757,8 +786,11 @@ class Mesh(SensorLoopsMixin):
             # turns a silent operational landmine into an explicit, logged
             # decision. Operators who genuinely want no remote-resume posture
             # (e.g. physical-only recovery) see the warning and accept it.
+            # Once per process: the posture is the environment's, and a
+            # second Mesh here (a sim's child peer) reads the same one.
             if not os.getenv("STRANDS_MESH_OVERRIDE_CODE", "").strip():
-                logger.warning(
+                _warn_posture_once(
+                    "override_code",
                     "[safety:%s] No emergency-stop resume code set. If any peer "
                     "broadcasts an e-stop, this robot stays locked until you "
                     "physically restart it (one message can freeze the whole "
@@ -787,7 +819,8 @@ class Mesh(SensorLoopsMixin):
             )
 
             if _zc_bool_env("STRANDS_MESH_MULTICAST", default=False):
-                logger.warning(
+                _warn_posture_once(
+                    "multicast",
                     "[safety:%s] Multicast scouting is ON "
                     "(STRANDS_MESH_MULTICAST=true). Any device on the LAN can "
                     "discover and attract fleet robots without credentials "
@@ -2325,6 +2358,21 @@ class Mesh(SensorLoopsMixin):
                             "ok": False,
                             "error": f"{type(r).__name__} cannot enumerate rollouts in flight; nothing was stopped",
                         }
+                    # Lower every target's cooperative flag BEFORE the first
+                    # join. ``stop_policy`` waits (bounded) for the worker it
+                    # flagged to exit, and this fanout is sequential, so
+                    # without this pre-pass one robot whose policy server is
+                    # wedged inside inference holds the stop REQUEST off every
+                    # robot behind it in ``targets`` - measured on a 3-robot
+                    # world with one wedged server, the two healthy workers
+                    # exited a full second later than they do without the
+                    # wait, still driving their arms for that second. The
+                    # engine's own teardown sequences its multi-robot stop the
+                    # same way: request on every robot, then join. Engines
+                    # without the pre-pass are unaffected - their
+                    # ``stop_policy`` is what answers either way.
+                    if hasattr(r, "_request_policy_stop_all"):
+                        r._request_policy_stop_all(targets)
                     results = {name: dict(r.stop_policy(name)) for name in targets}
                     # ``ok`` is derived from the per-robot answers, never
                     # assumed. Reporting ok=True here counted a refused
@@ -3365,7 +3413,32 @@ class Mesh(SensorLoopsMixin):
         return resps
 
     def tell(self, target: str, instruction: str, **kw: Any) -> dict[str, Any]:
-        """Shorthand: ask a peer to execute a natural-language instruction."""
+        """Shorthand: ask a peer to run a policy with a natural-language instruction.
+
+        Sends ``{"action": "execute", "instruction": instruction, **kw}``.
+        The instruction alone is not a command the peer can act on - it is
+        the text a policy conditions on - so ``policy_provider=`` is
+        required: :func:`~strands_robots.mesh.security.validate_command`
+        refuses an execute without one before it leaves this process
+        ("Silent defaults are not honoured on the security boundary").
+        Checkpoints travel as Hub ids (``pretrained_name_or_path="lerobot/…"``,
+        an org in ``STRANDS_MESH_HF_REPO_ALLOW``); a local path is refused on
+        the wire. ``duration`` defaults to 30 s when omitted.
+
+        Example::
+
+            mesh.tell(peer, "hold the tray steady", policy_provider="lerobot_local",
+                      pretrained_name_or_path="lerobot/smolvla_base", duration=10.0)
+
+        Args:
+            target: The peer id to address.
+            instruction: Natural-language instruction the policy conditions on.
+            **kw: The policy - ``policy_provider`` (required), its checkpoint or
+                port, ``duration`` and any provider keyword the wire allows.
+
+        Returns:
+            The peer's reply for the ``execute`` command.
+        """
         return self.send(target, {"action": "execute", "instruction": instruction, **kw})
 
     # Subscribe / publish_step / on_stream

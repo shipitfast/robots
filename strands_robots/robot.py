@@ -43,12 +43,15 @@ import contextlib
 import difflib
 import logging
 import os
+import re
 import threading
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 from strands_robots._mesh_switch import mesh_env_request
 from strands_robots._serial_discovery import scan_serial_devices
 from strands_robots.drivers import (
+    constructor_keywords,
     driver_choice_error,
     get_native_driver_class,
     list_native_drivers,
@@ -63,6 +66,7 @@ from strands_robots.registry import (
     list_robots,
     resolve_name,
 )
+from strands_robots.utils import refusal_repr
 
 if TYPE_CHECKING:
     from strands_robots.drivers import HardwareDriver
@@ -85,8 +89,14 @@ def _auto_detect_mode(canonical: str) -> str:
 
     Priority:
         1. ``STRANDS_ROBOT_MODE`` env var (explicit override)
-        2. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
-        3. Default to sim (safest - never accidentally send commands to hardware)
+        2. For a robot that declares hardware, its native driver's own
+           ``probe_hardware()`` - a robot reached over the network rather than a
+           serial bus answers for itself (a Reachy Mini's daemon answers ``GET
+           /api/daemon/status``; no USB scan can see it). Opt-in per driver: a
+           class that declares no such classmethod is not asked, and the probe
+           is asked once.
+        3. Robot-specific USB detection (Feetech/Dynamixel servo controllers)
+        4. Default to sim (safest - never accidentally send commands to hardware)
     """
     env_mode = os.getenv("STRANDS_ROBOT_MODE", "").lower().strip()
     if env_mode in ("sim", "real"):
@@ -107,6 +117,22 @@ def _auto_detect_mode(canonical: str) -> str:
     # a host that cannot enumerate reports no devices and falls back to sim,
     # which is always safe.
     if has_hardware(canonical):
+        # A native driver whose robot is not a serial servo bus (the Microduck's
+        # robotd socket, reached locally or over an ssh forward) answers the
+        # question itself through an opt-in ``probe_hardware()`` classmethod.
+        # A probe that raises is a probe that found nothing: detection must
+        # never be the reason ``Robot()`` fails, and sim is the safe answer.
+        driver_cls = get_native_driver_class(canonical)
+        probe = getattr(driver_cls, "probe_hardware", None) if driver_cls is not None else None
+        if driver_cls is not None and callable(probe):
+            try:
+                found = bool(probe())
+            except Exception as exc:  # noqa: BLE001 - detection is best-effort by contract
+                logger.debug("%s.probe_hardware() failed; treating as no hardware: %s", canonical, exc)
+                found = False
+            if found:
+                logger.info("Auto-detected %s hardware via %s.probe_hardware()", canonical, driver_cls.__name__)
+                return "real"
         servo_ports = [device.port for device in scan_serial_devices() if device.likely_servo_bus]
         if servo_ports:
             logger.info("Auto-detected robot hardware: %s", servo_ports)
@@ -190,11 +216,113 @@ def _validate_known_robot(canonical: str, original: str, urdf_path: str | None) 
         )
 
 
+# The two things a model provider requires of a tool name. The *local* Strands
+# tool registry validates nothing - a name with a space, a slash or 80
+# characters registers fine and survives ``Agent(tools=[...])`` - so a bad name
+# does not surface until the first model call, as a provider validation error
+# about ``toolConfig.tools.N.member.toolSpec.name`` that never mentions the
+# robot. Bedrock's Converse API states both constraints: the name must match
+# ``[a-zA-Z0-9_-]+`` and be at most 64 characters. The anchor is ``\Z`` and not
+# ``$``, which would also match before a trailing newline and admit
+# ``"left_arm\n"`` - a name that provider pattern rejects.
+_TOOL_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+\Z")
+_TOOL_NAME_MAX_LEN = 64
+
+
+def _tool_name_error(tool_name: Any) -> str | None:
+    """Refuse a ``tool_name`` no model provider would accept, with the remedy.
+
+    ``None`` means "use the default" and is fine. Anything else must be a
+    string of letters, digits, ``_`` or ``-``, at most
+    :data:`_TOOL_NAME_MAX_LEN` characters - the constraints a provider puts on
+    a tool name - so the refusal lands here, naming the parameter, instead of
+    at ``Agent(tools=[...])`` naming an object repr or at the first model call
+    naming a slot in the request body.
+
+    The value is rendered through :func:`~strands_robots.utils.refusal_repr`,
+    like every other guard in the package: a refusal must not raise while it is
+    being built, and ``repr`` can - of an ``int`` wider than
+    :func:`sys.get_int_max_str_digits`, or of any object whose ``__repr__``
+    raises.
+
+    Args:
+        tool_name: The value passed to :func:`Robot`; any type, since the
+            refusal has to cover a caller who passed the wrong one.
+
+    Returns:
+        The refusal to raise, or ``None`` if the name is usable. Each reason
+        names itself: the character set for a name a provider's pattern
+        rejects, the measured length for one that is merely too long.
+    """
+    if tool_name is None:
+        return None
+    if not isinstance(tool_name, str) or not _TOOL_NAME_PATTERN.match(tool_name):
+        return (
+            f"Robot(tool_name={refusal_repr(tool_name)}) is not a valid tool name: "
+            "use letters, digits, '_' or '-' (e.g. tool_name='left_arm'). "
+            "Two robots in one Agent need two distinct names."
+        )
+    if len(tool_name) > _TOOL_NAME_MAX_LEN:
+        return (
+            f"Robot(tool_name=...) is {len(tool_name)} characters long, over the "
+            f"{_TOOL_NAME_MAX_LEN}-character limit a model provider puts on a tool name: shorten it "
+            f"(e.g. tool_name={refusal_repr(tool_name[:_TOOL_NAME_MAX_LEN])}). "
+            "Two robots in one Agent need two distinct names."
+        )
+    return None
+
+
+def _reject_hardware_kwargs_in_sim(kwargs: Mapping[str, Any], canonical: str, requested_mode: str) -> None:
+    """Refuse a hardware-only keyword on a simulated robot, naming the mode.
+
+    The sim backend drops any keyword it does not own, by design, so one call
+    can carry another backend's options (``num_envs``, ``device``). That
+    tolerance also swallowed ``port=`` - the one keyword that only ever means
+    "a physical robot": ``Robot("so101", port="/dev/cu.usbmodem…")`` with
+    ``mode="real"`` forgotten built a simulator under ``status=success`` while
+    the arm on the desk stayed still. The real branch already reports the
+    sim-only spawn keywords it cannot honour; this is the mirror. The list is
+    the hardware class's own forwardable set, so it cannot drift from it.
+
+    What the set has in common is the driver, not the physicality: ``mock=``
+    asks for a mocked servo bus and ``is_simulation=`` points the lerobot
+    driver at a simulator, so neither "describes a physical robot" - but every
+    one of them configures a hardware driver that ``mode="sim"`` never builds,
+    and ``mode='real'`` is the remedy for all of them alike.
+
+    Args:
+        kwargs: The caller's residual keyword arguments.
+        canonical: Canonical robot name, for the message.
+        requested_mode: The mode as the caller wrote it (``"sim"`` or
+            ``"auto"``), so the message says how this became a simulation.
+
+    Raises:
+        TypeError: naming every hardware keyword supplied and the remedy.
+    """
+    from strands_robots.hardware_robot import _FORWARDABLE_KWARGS
+
+    supplied = [key for key in _FORWARDABLE_KWARGS if key in kwargs]
+    if not supplied:
+        return
+    names = ", ".join(f"{key}=" for key in supplied)
+    how = (
+        "mode='auto' found no servo bus and fell back to sim"
+        if requested_mode == "auto"
+        else "mode='sim' is the default"
+    )
+    raise TypeError(
+        f"Robot({canonical!r}) is a simulation ({how}) and would ignore {names}: "
+        "these configure a hardware driver, which a simulation does not have. "
+        "Add mode='real' to drive the hardware, or drop them to simulate."
+    )
+
+
 def _build_native_driver(
     canonical: str,
     cameras: dict[str, dict[str, Any]] | None,
     data_config: str | None,
     kwargs: dict[str, Any],
+    tool_name: str | None = None,
 ) -> HardwareDriver:
     """Build the native driver registered for ``canonical``.
 
@@ -203,9 +331,11 @@ def _build_native_driver(
         cameras: Camera configuration, forwarded verbatim to a driver that
             declares it opens them, and refused for one that does not.
         data_config: Data-config name, forwarded verbatim.
-        kwargs: The caller's remaining keyword arguments, forwarded verbatim -
-            ``port=`` among them, which stays polymorphic (a serial path, an IP
-            address or a URL) because only the driver knows how to read it.
+        kwargs: The caller's remaining keyword arguments, forwarded once the
+            driver declares them - ``port=`` among them, which stays polymorphic
+            (a serial path, an IP address or a URL) because only the driver knows
+            how to read it.
+        tool_name: The caller's tool name; ``None`` keeps the canonical name.
 
     Returns:
         The constructed driver.
@@ -215,7 +345,9 @@ def _build_native_driver(
             rather than silently falling back to lerobot: a caller who asked for
             a native driver and got the lerobot one would debug the wrong robot.
             Also if ``cameras`` is non-empty and this driver does not declare
-            that it opens cameras.
+            that it opens cameras, and if a keyword is not one this driver's
+            constructor declares - the native mirror of the lerobot path's
+            unknown-keyword refusal.
     """
     driver_cls = get_native_driver_class(canonical)
     if driver_cls is None:
@@ -253,13 +385,28 @@ def _build_native_driver(
             "backends, or capture the frames outside the driver."
         )
 
+    # A keyword this driver does not declare is refused rather than forwarded.
+    # Every driver used to end in ``**kwargs`` and park the remainder, so
+    # ``Robot('so101', mode='real', driver='strands', prot='/dev/ttyACM0')``
+    # reported success having configured nothing: the arm auto-detected a port
+    # while the caller believed they had named one, and the same typo on
+    # ``driver='lerobot'`` is refused by name. The roster is the driver's own
+    # signature (:func:`~strands_robots.drivers.base.constructor_keywords`), so a
+    # driver that grows a keyword is graded on it with nothing to update here.
+    accepted = constructor_keywords(driver_cls)
+    if unknown := sorted(set(kwargs) - set(accepted)):
+        raise ValueError(
+            f"Unknown kwarg(s) for {canonical!r} on driver='strands': {unknown}. "
+            f"{driver_cls.__name__} accepts: {list(accepted)}. (If this is a typo, fix it.)"
+        )
+
     # The constructor contract documented on strands_robots.drivers.base: the
-    # three keywords every driver takes, plus the caller's extras. ``robot=`` is
-    # deliberately NOT forwarded - it carries the lerobot type name, which means
-    # nothing to a driver that does not go through lerobot.
+    # three keywords every driver takes, and the keywords it declares itself.
+    # ``robot=`` is deliberately NOT forwarded - it carries the lerobot type
+    # name, which means nothing to a driver that does not go through lerobot.
     return cast(
         "HardwareDriver",
-        driver_cls(tool_name=canonical, cameras=cameras, data_config=data_config, **kwargs),
+        driver_cls(tool_name=tool_name or canonical, cameras=cameras, data_config=data_config, **kwargs),
     )
 
 
@@ -276,6 +423,7 @@ def Robot(
     orientation: list[float] | None = ...,
     keyframe: str | int | None = ...,
     driver: str = ...,
+    tool_name: str | None = ...,
     **kwargs: Any,
 ) -> Simulation: ...
 
@@ -293,6 +441,7 @@ def Robot(
     orientation: list[float] | None = ...,
     keyframe: str | int | None = ...,
     driver: Literal["strands"],
+    tool_name: str | None = ...,
     **kwargs: Any,
 ) -> HardwareDriver: ...
 
@@ -310,6 +459,7 @@ def Robot(
     orientation: list[float] | None = ...,
     keyframe: str | int | None = ...,
     driver: str = ...,
+    tool_name: str | None = ...,
     **kwargs: Any,
 ) -> HardwareRobot: ...
 
@@ -327,6 +477,7 @@ def Robot(
     orientation: list[float] | None = ...,
     keyframe: str | int | None = ...,
     driver: str = ...,
+    tool_name: str | None = ...,
     **kwargs: Any,
 ) -> Simulation | HardwareRobot: ...
 
@@ -347,6 +498,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
     orientation: list[float] | None = None,
     keyframe: str | int | None = None,
     driver: str = "auto",
+    tool_name: str | None = None,
     **kwargs: Any,
 ) -> Simulation | HardwareRobot | HardwareDriver:
     """Create a robot - returns a Simulation or HardwareRobot instance.
@@ -427,7 +579,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
               env default. ``STRANDS_MESH=false`` is a hard kill switch.
         peer_id: Optional mesh peer identifier. Auto-generated when omitted.
         driver: Which implementation drives the robot in ``mode="real"``, one of
-            :data:`~strands_robots.drivers.base.DRIVER_CHOICES`. ``"auto"``
+            :data:`~strands_robots.registry.DRIVER_CHOICES`. ``"auto"``
             (default) states no preference: it honours the robot's registry
             ``hardware.driver`` and otherwise builds the lerobot driver, so a
             call that does not mention ``driver`` behaves exactly as before.
@@ -437,6 +589,16 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
             refused by name when none is - never quietly served the lerobot one.
             The value is checked in every mode, but only ``mode="real"`` acts on
             it; ``mode="sim"`` reports it as ignored at debug level.
+        tool_name: The name the agent sees this robot under. Defaults to
+            ``"<name>_sim"`` in simulation and to the canonical robot name on
+            hardware - which is why two ``Robot("so101")`` in one ``Agent``
+            used to fail at registration ("Tool name 'so101_sim' already
+            exists"). Name each one (``tool_name="left_arm"``) to put a
+            bimanual pair, or a real arm beside its sim twin, in one agent.
+            Must be letters, digits, ``_`` or ``-``, at most 64 characters -
+            what a model provider accepts as a tool name. Anything else is
+            refused here, before the backend builds, rather than at the first
+            model call as a validation error about the request body.
         **kwargs: Forwarded to the underlying backend constructor.
 
     Returns:
@@ -445,7 +607,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
 
     Raises:
         ValueError: If ``mode`` is not 'sim'/'real'/'auto', if ``driver`` is not
-                    one of :data:`~strands_robots.drivers.base.DRIVER_CHOICES`,
+                    one of :data:`~strands_robots.registry.DRIVER_CHOICES`,
                     if ``driver="strands"`` names a robot with no registered
                     native driver, if ``cameras=``
                     is passed in sim mode, if the robot name is empty
@@ -482,6 +644,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
     _validate_known_robot(canonical, name, urdf_path)
 
     mode = _normalize_mode(mode)
+    requested_mode = mode
 
     if mode == "auto":
         mode = _auto_detect_mode(canonical)
@@ -493,6 +656,10 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
     driver_reason = driver_choice_error(driver, "driver", "Robot")
     if driver_reason is not None:
         raise ValueError(driver_reason)
+
+    tool_name_reason = _tool_name_error(tool_name)
+    if tool_name_reason is not None:
+        raise ValueError(tool_name_reason)
 
     # Resolve the mesh opt-in. Mesh is OFF by default so a bare
     # ``Robot("so100")`` is quiet and never spins up Zenoh/ACL/e-stop
@@ -538,6 +705,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
         # option (``default_timestep``, ``num_envs``) is untouched and the
         # backend screens it against its own names in turn.
         reject_misspelled_kwargs(kwargs, own_keyword_names(Robot), owner="Robot(mode='sim')")
+        _reject_hardware_kwargs_in_sim(kwargs, canonical, requested_mode)
 
         # Resolve the backend through create_simulation - the single source of
         # truth for backend selection (built-in registry + entry-point plugins +
@@ -550,7 +718,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
         # agnostic SimEngine ABC methods, so it works for every backend.
         # The sim-mode overloads contract a ``Simulation`` return; create_simulation
         # is typed to the SimEngine ABC, so cast to keep that public contract.
-        sim = cast("Simulation", create_simulation(backend, tool_name=f"{name}_sim", **kwargs))
+        sim = cast("Simulation", create_simulation(backend, tool_name=tool_name or f"{name}_sim", **kwargs))
 
         try:
             result = sim.create_world()
@@ -672,7 +840,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
         resolved_driver = resolve_driver(canonical, driver)
         hw: HardwareRobot | HardwareDriver
         if resolved_driver == "strands":
-            hw = _build_native_driver(canonical, cameras, data_config, kwargs)
+            hw = _build_native_driver(canonical, cameras, data_config, kwargs, tool_name=tool_name)
         elif resolved_driver != "lerobot":
             # Every branch is named, so a driver added to DRIVER_CHOICES without
             # a route here is refused instead of quietly taking a neighbour's
@@ -687,7 +855,7 @@ def Robot(  # noqa: N802 - uppercase by design (factory mimicking a class constr
 
             real_type = get_hardware_type(canonical) or canonical
             hw = HardwareRobotCls(
-                tool_name=canonical,
+                tool_name=tool_name or canonical,
                 robot=real_type,
                 cameras=cameras,
                 # Forwarded, not reported: unlike the spawn parameters above,

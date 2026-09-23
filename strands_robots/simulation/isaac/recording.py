@@ -61,6 +61,7 @@ from strands_robots.simulation.recording import (
     camera_schema_key_collision_error,
     dataset_recording_option_error,
     dataset_recording_posture_error,
+    recorded_cameras_line,
     undriven_robot_state,
 )
 from strands_robots.utils import camera_schema_key, name_list_error
@@ -168,7 +169,7 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
         Args:
             repo_id: HuggingFace dataset id (``owner/name``) or a local path. The
                 directory it records into is resolved by
-                :func:`~strands_robots.dataset_recorder.resolve_dataset_dir` -
+                :func:`~strands_robots.dataset_source.resolve_dataset_dir` -
                 the same resolver ``DatasetRecorder.create`` uses - so an
                 ``owner/name`` id lands in ``$HF_LEROBOT_HOME/{repo_id}`` while a
                 value that is itself a path is taken as the directory. That home
@@ -191,7 +192,7 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                 on-disk rate, which a resume cannot change.
             root: Explicit on-disk dataset directory, used verbatim - it replaces
                 the ``repo_id`` resolution above rather than being joined to it.
-                See :func:`~strands_robots.dataset_recorder.resolve_dataset_dir`
+                See :func:`~strands_robots.dataset_source.resolve_dataset_dir`
                 for the full precedence.
             push_to_hub: Publish to the Hub at ``stop_recording``. Must be a
                 boolean - a publication posture is not read by truthiness
@@ -275,36 +276,11 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
         if error := self._validate_recording_start_rate(fps, "start_recording"):
             return error
 
-        _DatasetRecorder: Any = None
-        unavailable: str | None = None
-        try:
-            from strands_robots.dataset_recorder import DatasetRecorder as _DatasetRecorder
-            from strands_robots.dataset_recorder import lerobot_dataset_import_error
-
-            unavailable = lerobot_dataset_import_error()
-        except ImportError as exc:
-            # strands_robots.dataset_recorder itself did not import (a partial or
-            # drifted install); report that rather than blaming the lerobot extra.
-            unavailable = f"strands_robots.dataset_recorder is unavailable ({exc})."
-        if unavailable is None and _DatasetRecorder is None:
-            unavailable = "strands_robots.dataset_recorder did not provide DatasetRecorder."
-
-        if unavailable is not None:
-            return {
-                "status": "error",
-                "content": [
-                    {
-                        "text": (
-                            "start_recording produces a LeRobotDataset (parquet + video), which "
-                            "needs lerobot's dataset stack:\n"
-                            "\n"
-                            f"  {unavailable}\n"
-                            "\n"
-                            "For plain MP4 video, use start_cameras_recording instead."
-                        )
-                    }
-                ],
-            }
+        _DatasetRecorder, refusal = self._dataset_recorder_or_refusal(
+            "For plain MP4 video, use start_cameras_recording instead.",
+        )
+        if refusal is not None:
+            return refusal
 
         # A dataset column is named by camera_schema_key, which collapses a
         # camera's "/" namespace separator to "__" because a LeRobot feature name
@@ -327,6 +303,11 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
         # the renderer and this runs on a worker thread, the probe must run
         # on the pump thread (run_on_main), and holding self._lock across
         # that handoff would deadlock against the probe re-acquiring it.
+        # Same refusal MuJoCo gives: a second start while one recording is
+        # live must not replace the recorder and drop its buffered frames.
+        if error := self._already_recording_error("start_recording", repo_id):
+            return error
+
         probe_obs = self._probe_recording_observation()
 
         with self._lock:
@@ -334,14 +315,9 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
             state["trajectory"] = []
             state["push_to_hub"] = push_to_hub
 
-            # Resolve the on-disk dataset dir with the same resolver
-            # DatasetRecorder.create() uses (honours $HF_LEROBOT_HOME) and
-            # stash it so verify_dataset_episodes can find the parquet after
-            # stop_recording drops the recorder.
-            from strands_robots.dataset_recorder import resolve_dataset_dir
-
-            dataset_dir = resolve_dataset_dir(repo_id, root)
-            state["last_dataset_root"] = str(dataset_dir)
+            # Resolve the on-disk dataset dir and stash it with the id it is
+            # recorded under (see ``_stash_dataset_target``).
+            dataset_dir = self._stash_dataset_target(repo_id, root)
 
             try:
                 (
@@ -351,11 +327,21 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                     camera_dims,
                     robot_type,
                     recording_cameras,
+                    base_state_specs,
                 ) = self._collect_recording_schema(probe_obs)
 
                 # Optional camera scoping (parity with MuJoCo/Newton). Names
                 # may be raw (``arm0/wrist``) or schema-safe (``arm0__wrist``);
                 # an unknown name fails loudly listing what exists.
+                # Scene camera name -> dataset column key, in dataset column
+                # order. The scene's own camera registry - not recording_cameras
+                # - is the scene truth: _collect_recording_schema returns no
+                # recording camera under render_mode='headless' even though the
+                # scene HAS cameras, and "no camera in the scene, call
+                # add_camera" would be a false errand there.
+                recorded_cameras = {src: safe for src, safe, _w, _h in recording_cameras}
+                scene_cameras = list(self._cameras)
+
                 if cameras is not None:
                     raw_to_safe = {src: safe for src, safe, _w, _h in recording_cameras}
                     safe_to_raw = {safe: src for src, safe in raw_to_safe.items()}
@@ -392,6 +378,7 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                     camera_keys = selected_safe
                     camera_dims = {safe: camera_dims[safe] for safe in selected_safe}
                     recording_cameras = [tpl for tpl in recording_cameras if tpl[0] in selected_raw]
+                    recorded_cameras = {safe_to_raw[safe]: safe for safe in selected_safe}
 
                 state["recording_cameras"] = recording_cameras
 
@@ -414,16 +401,34 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
 
                 if resume_existing:
                     logger.info("Resuming existing dataset for append: %s", dataset_dir)
-                    resumed = _DatasetRecorder.resume(repo_id=repo_id, root=root, task=task, vcodec=vcodec)
-                    self._verify_resume_schema(resumed, joint_names, camera_keys, camera_dims, action_names, fps=fps)
-                    state["dataset_recorder"] = resumed
+                    resumed = _DatasetRecorder.resume(
+                        repo_id=repo_id,
+                        root=root,
+                        task=task,
+                        vcodec=vcodec,
+                        joint_names=joint_names,
+                        extra_state_specs=base_state_specs,
+                    )
+                    # The expanded names, not the bare joint list: a resumed
+                    # dataset's on-disk observation.state includes the base columns,
+                    # so validating against joint_names alone would report a
+                    # mismatch on every floating-base append. Same construction as
+                    # the MuJoCo backend's ``state_names_full``.
+                    state_names_full = list(joint_names) + [
+                        f"{src}.{comp}" for src, comps in base_state_specs for comp in comps
+                    ]
+                    self._verify_resume_schema(
+                        resumed, state_names_full, camera_keys, camera_dims, action_names, fps=fps
+                    )
+                    recorder = resumed
                 else:
-                    state["dataset_recorder"] = _DatasetRecorder.create(
+                    recorder = _DatasetRecorder.create(
                         repo_id=repo_id,
                         fps=fps,
                         robot_type=robot_type,
                         joint_names=joint_names,
                         action_names=action_names,
+                        extra_state_specs=base_state_specs,
                         camera_keys=camera_keys,
                         camera_dims=camera_dims,
                         task=task,
@@ -432,13 +437,15 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                         video_width=int(self._config.camera_width),
                         video_height=int(self._config.camera_height),
                     )
+                resumed_line = self._arm_dataset_recorder(state, recorder, resumed=resume_existing)
                 return {
                     "status": "success",
                     "content": [
                         {
                             "text": (
                                 f"Recording Isaac scene to LeRobotDataset: {repo_id}\n"
-                                f"{len(joint_names)} joints, {len(camera_keys)} cameras @ {fps}fps\n"
+                                f"{resumed_line}"
+                                f"{recorded_cameras_line(joint_names, recorded_cameras, scene_cameras, cameras, fps)}"
                                 f"Codec: {vcodec} | Task: {task or '(set per policy)'}\n"
                                 f"Run policies to capture frames, then stop_recording to save the episode"
                             )
@@ -470,7 +477,15 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
 
     def _collect_recording_schema(
         self, probe_obs: dict[str, Any]
-    ) -> tuple[list[str], list[str], list[str], dict[str, tuple[int, int]], str, list[tuple[str, str, int, int]]]:
+    ) -> tuple[
+        list[str],
+        list[str],
+        list[str],
+        dict[str, tuple[int, int]],
+        str,
+        list[tuple[str, str, int, int]],
+        list[tuple[str, list[str]]],
+    ]:
         """Build the dataset schema from the live Isaac scene.
 
         Args:
@@ -490,11 +505,18 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
               * ``recording_cameras``: per-camera ``(source_name, safe_name,
                 width, height)`` tuples the on_frame hook maps observation
                 keys through each step.
+              * ``base_state_specs``: ``(source_key, [components])`` pairs for a
+                floating-base robot's ``base_pos`` / ``base_quat`` /
+                ``base_lin_vel`` / ``base_ang_vel``, appended to the
+                ``observation.state`` schema so a locomotion policy trained on
+                the dataset is not base-blind. Empty for a fixed-base arm, which
+                leaves its schema unchanged.
         """
         joint_names: list[str] = []
         action_names: list[str] = []
         robot_type = "unknown"
         multi_robot = len(self._robots) > 1
+        base_state_specs: list[tuple[str, list[str]]] = []
         for rname, robot in self._robots.items():
             if multi_robot:
                 joint_names.extend(f"{rname}__{jn}" for jn in robot.joint_names)
@@ -503,6 +525,31 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                 joint_names.extend(robot.joint_names)
                 action_names.extend(self.robot_action_keys(rname))
             robot_type = getattr(robot, "data_config", None) or rname
+            # A floating-base robot exposes its full base kinematics through
+            # get_observation - base_pos (world x,y,z incl. height), base_quat
+            # (w,x,y,z), base_lin_vel (m/s) and base_ang_vel (rad/s, BODY frame) -
+            # but the observation.state schema above is derived from scalar joint
+            # names, so those signals would be DROPPED and a locomotion /
+            # velocity-tracking / whole-body-control policy trained on the dataset
+            # would be base-blind.
+            #
+            # Both sibling backends already pass these
+            # (:mod:`strands_robots.simulation.mujoco.recording`,
+            # :mod:`strands_robots.simulation.newton.recording`, with this same
+            # reasoning); Isaac was the only one
+            # that did not, so adding base_* to get_observation without this left an
+            # Isaac humanoid dataset missing 13 columns a MuJoCo one has.
+            #
+            # Detected from ``fixed_base`` - the field the MJCF free-joint read
+            # records - rather than from a joint id, because this backend has no
+            # compiled model to ask. A fixed-base arm adds no columns, so its schema
+            # is unchanged.
+            if not getattr(robot, "fixed_base", True):
+                prefix = f"{rname}__" if multi_robot else ""
+                base_state_specs.append((f"{prefix}base_pos", ["x", "y", "z"]))
+                base_state_specs.append((f"{prefix}base_quat", ["w", "x", "y", "z"]))
+                base_state_specs.append((f"{prefix}base_lin_vel", ["x", "y", "z"]))
+                base_state_specs.append((f"{prefix}base_ang_vel", ["x", "y", "z"]))
 
         camera_keys: list[str] = []
         camera_dims: dict[str, tuple[int, int]] = {}
@@ -518,7 +565,7 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                 len(self._cameras),
                 sorted(self._cameras),
             )
-            return joint_names, action_names, camera_keys, camera_dims, robot_type, recording_cameras
+            return joint_names, action_names, camera_keys, camera_dims, robot_type, recording_cameras, base_state_specs
 
         for cam_name, cam in self._cameras.items():
             safe_name = camera_schema_key(cam_name)
@@ -542,10 +589,10 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
             camera_keys.append(safe_name)
             camera_dims[safe_name] = (height, width)
             recording_cameras.append((cam_name, safe_name, width, height))
-        return joint_names, action_names, camera_keys, camera_dims, robot_type, recording_cameras
+        return joint_names, action_names, camera_keys, camera_dims, robot_type, recording_cameras, base_state_specs
 
-    def _make_run_policy_hook(self, robot_name: str, instruction: str) -> Any:
-        """Build the per-step ``on_frame`` recording hook for Isaac.
+    def _make_recording_on_frame(self, robot_name: str, instruction: str) -> Any:
+        """The recording half of the per-step ``on_frame`` hook for Isaac.
 
         Returns an ``on_frame(step, observation, action)`` closure that, while
         a recording session is active, appends a step to the trajectory mirror
@@ -560,8 +607,11 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
         scenes scalar observation/action keys are namespaced
         (``robot__joint``) to match the declared schema.
 
-        Returns ``None`` when there is no world or the robot is unknown, so
-        the base run-policy loop runs without recording.
+        Returns ``None`` when there is no world or the robot is unknown. No
+        rollout claim is made here: :meth:`_make_run_policy_hook` layers that
+        on top, and the evaluation facades (``eval_policy``,
+        ``evaluate_benchmark``) install this hook alone when a recording is
+        open and the caller passed no ``on_frame``.
         """
         import time
 
@@ -571,10 +621,6 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
         if state is None or not registered(self._robots, robot_name):
             return None
 
-        robot = self._robots[robot_name]
-        robot.policy_running = True
-        robot.policy_instruction = instruction
-        robot.policy_steps = 0
         multi_robot = len(self._robots) > 1
 
         # Action columns this rollout is responsible for: the driven robot's own
@@ -600,8 +646,7 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                 action_key_cache[prefixed] = cached
             return cached
 
-        def _hook(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
-            robot.policy_steps = step + 1
+        def _record(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
             if not state.get("recording", False):
                 return
             rec = state.get("dataset_recorder")
@@ -661,6 +706,31 @@ class IsaacRecordingMixin(DatasetRecordingMixin):
                     task=instruction,
                     required_action_keys=_required_action_keys(False),
                 )
+
+        return _record
+
+    def _make_run_policy_hook(self, robot_name: str, instruction: str) -> Any:
+        """Build the per-step ``on_frame`` hook for a rollout: claim + recording.
+
+        Marks the robot as driven (``policy_running`` / ``policy_instruction`` /
+        ``policy_steps``, released by :meth:`_release_run_policy_hook`) and
+        forwards every frame to :meth:`_make_recording_on_frame`. ``None``
+        when there is no world or the robot is unknown, so the base
+        run-policy loop runs without recording.
+        """
+        state = self._recording_state()
+        if state is None or not registered(self._robots, robot_name):
+            return None
+        robot = self._robots[robot_name]
+        robot.policy_running = True
+        robot.policy_instruction = instruction
+        robot.policy_steps = 0
+        record_frame = self._make_recording_on_frame(robot_name, instruction)
+
+        def _hook(step: int, observation: dict[str, Any], action: dict[str, Any]) -> None:
+            robot.policy_steps = step + 1
+            if record_frame is not None:
+                record_frame(step, observation, action)
 
         return _hook
 

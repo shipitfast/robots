@@ -13,9 +13,9 @@ from strands_robots.training import create_trainer
 
 result = create_trainer("ppo").train(spec)      # -> result.checkpoint_dir
 
-sim = Robot("so101", mode="sim")
+sim = Robot("so100", mode="sim")        # the robot the training spec's make_env built
 sim.run_policy(
-    robot_name="so101",
+    robot_name="so100",
     policy_provider="rl",
     policy_config={"checkpoint_dir": result.checkpoint_dir},
     duration=10.0,
@@ -60,7 +60,9 @@ whitening the trained weights expect.
 
 Actions are one tick per call - an RL actor is a per-step controller trained on
 the state it is given, so it has no horizon to predict over. `instruction` is
-ignored: the actor was trained against a reward function, not language.
+ignored: the actor was trained against a reward function, not language, and the
+policy declares `reads_instruction = False`, so the `run_policy` envelope says
+the instruction it echoes was never read (`instruction_read: false`).
 
 Needs `torch`, which the RL trainers already require; no extra beyond them.
 Reading a checkpoint's actor without the policy wrapper is

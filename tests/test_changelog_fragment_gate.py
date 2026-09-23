@@ -578,7 +578,7 @@ def test_reserved_names_match_the_assembler() -> None:
 
 def test_no_emoji_in_the_script_or_its_output() -> None:
     """Project rule: agent-read strings are plain ASCII, including U+FE0F."""
-    for path in (_SCRIPT_PATH, _REPO_ROOT / ".github" / "workflows" / "changelog-fragment.yml"):
+    for path in (_SCRIPT_PATH, _REPO_ROOT / "scripts" / "ci_guards.py"):
         text = path.read_text(encoding="utf-8")
         offenders = [(index, char) for index, char in enumerate(text) if ord(char) > 0x7F]
         assert not offenders, f"{path.name} holds non-ASCII characters: {offenders[:5]}"
@@ -629,23 +629,27 @@ def test_a_recorded_change_still_passes_from_the_base_checkout(repo: Path) -> No
     assert _run(repo, head) == 0
 
 
-def test_the_workflow_reads_the_script_from_the_base_and_names_the_head() -> None:
-    """The workflow must not require its own script in the tree under review.
+def test_the_workflow_names_the_head_rather_than_checking_it_out() -> None:
+    """The step must grade the pull request head without checking it out.
 
-    A ``pull_request`` workflow definition is read from the merge commit, so this job
-    runs against heads that contain neither it nor the script -- #1786's head
-    ``2c98cfb6`` carries neither, and the check ran against it regardless. Checking
-    such a head out and invoking ``scripts/check_changelog_fragment.py`` from it is
-    what produced the exit 2 in issue #1791.
+    The gate used to be its own workflow, checked out from the *base* so a head
+    that predates the script could not exit 2 (#1791). It now runs as a guard
+    inside the required check (scripts/ci_guards.py), whose checkout is the pull
+    request's merge commit -- a tree that carries every script on the base tip by
+    construction, so the same property holds without a base checkout. What has to
+    stay explicit is the commit under test: the head sha is named with ``--head``
+    and never checked out, because a merge-commit head sees the branch's append
+    but reports it against the wrong tree.
     """
-    workflow = (_REPO_ROOT / ".github" / "workflows" / "changelog-fragment.yml").read_text(encoding="utf-8")
-
-    assert "ref: ${{ github.base_ref }}" in workflow, "the gate's script must come from the base branch"
+    workflow = (_REPO_ROOT / ".github" / "workflows" / "test-lint.yml").read_text(encoding="utf-8")
+    assert "HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in workflow
     assert "ref: ${{ github.event.pull_request.head.sha }}" not in workflow, (
         "checking the head out is what made the script's presence a precondition"
     )
-    assert "HEAD_SHA: ${{ github.event.pull_request.head.sha }}" in workflow
-    assert '--head "$HEAD_SHA"' in workflow, "the commit under test is named, not checked out"
+    guards = (_REPO_ROOT / "scripts" / "ci_guards.py").read_text(encoding="utf-8")
+    assert '"check_changelog_fragment.py"), "--base-ref", base_ref, "--head", head' in guards, (
+        "the commit under test is named, not checked out"
+    )
 
 
 # --- the fragment the branch actually wrote -------------------------------------
@@ -995,6 +999,27 @@ def test_fragment_problems_is_empty_for_a_valid_fragment(repo: Path) -> None:
     head = _commit(repo, "add a valid fragment")
 
     assert check.fragment_problems(("changelog.d/2163-valid.md",), head, repo=repo) == ()
+
+
+def test_a_placeholder_numbered_fragment_is_refused_on_the_pull_request(repo: Path) -> None:
+    """The job named for the convention must refuse the placeholder name.
+
+    A ``0000-`` fragment is valid in every other respect, so while the rule lived
+    only in ``tests/test_changelog_fragments.py`` this job reported SUCCESS and
+    the branch learned about the rename from the required suite twenty minutes
+    later - and a branch that merged in between put an untraceable entry on the
+    log. The verdict is the assembler's, so asking for the rename here costs no
+    second copy of the rule.
+    """
+    _branch(repo)
+    _write(repo, "changelog.d/0000-a-placeholder.md", _VALID_FRAGMENT)
+    head = _commit(repo, "add a placeholder-numbered fragment")
+
+    problems = check.fragment_problems(("changelog.d/0000-a-placeholder.md",), head, repo=repo)
+
+    assert [path for path, _ in problems] == ["changelog.d/0000-a-placeholder.md"]
+    assert "placeholder" in problems[0][1], problems
+    assert _run(repo) == 1, "the job must exit non-zero on a fragment the assembler would refuse"
 
 
 def test_fragment_problems_names_the_path_it_was_given(repo: Path) -> None:

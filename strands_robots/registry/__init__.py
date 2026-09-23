@@ -21,7 +21,8 @@ Usage::
 
 Architecture (this package re-exports the public API of its sibling modules):
     - :mod:`~strands_robots.registry.loader` - JSON loading + mtime hot-reload
-      + validation.
+      + validation, and the vocabularies a declared entry is validated
+      against (:data:`DEFAULT_DRIVER`, :data:`DRIVER_CHOICES`).
     - :mod:`~strands_robots.registry.robots` - robot query/resolve/list functions.
     - :mod:`~strands_robots.registry.policies` - policy resolve/import/kwargs
       functions.
@@ -40,11 +41,16 @@ from .discovery import (
     is_discoverable,
     list_discoverable,
 )
-from .loader import invalidate_cache, normalize_robot_name, reload
+from .loader import (
+    DEFAULT_DRIVER,
+    DRIVER_CHOICES,
+    invalidate_cache,
+    normalize_robot_name,
+    reload,
+)
 from .policies import (
     build_policy_kwargs,
     get_policy_provider,
-    import_policy_class,
     list_policy_aliases,
     list_policy_providers,
     resolve_policy,
@@ -57,6 +63,7 @@ from .robots import (
     get_robot,
     has_hardware,
     has_sim,
+    joint_labels,
     list_aliases,
     list_robots,
     list_robots_by_category,
@@ -72,12 +79,15 @@ __all__ = [
     # Robot registry
     "resolve_name",
     "get_robot",
+    "joint_labels",
     "has_sim",
     "has_hardware",
     "get_driver",
     "get_hardware_type",
     "list_robots",
     "LIST_ROBOTS_MODES",
+    "DEFAULT_DRIVER",
+    "DRIVER_CHOICES",
     "list_robots_by_category",
     "list_aliases",
     "format_robot_table",
@@ -91,7 +101,6 @@ __all__ = [
     "list_policy_providers",
     "list_policy_aliases",
     "resolve_policy",
-    "import_policy_class",
     "build_policy_kwargs",
     # User-local registry
     "register_robot",

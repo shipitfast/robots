@@ -21,13 +21,17 @@ creeping back into the user-facing docs.
 
 from __future__ import annotations
 
+import re
 import tomllib
+from importlib import metadata
 from pathlib import Path
 
 from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from strands_robots import dataset_recorder
+from strands_robots import dataset_transfer
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT = _REPO_ROOT / "pyproject.toml"
@@ -35,7 +39,7 @@ _PYPROJECT = _REPO_ROOT / "pyproject.toml"
 
 def _bucket_cli_floor_spec() -> str:
     """The requirement string the library's bucket-sync guidance must quote."""
-    return dataset_recorder._HF_BUCKET_CLI_MIN_SPEC
+    return dataset_transfer._HF_BUCKET_CLI_MIN_SPEC
 
 
 def _extras() -> dict[str, list[str]]:
@@ -234,11 +238,11 @@ def test_molmoact2_doc_install_line_is_not_from_source() -> None:
 #     require the current one. ---
 
 _STREAMING_DATASET = _REPO_ROOT / "strands_robots" / "streaming_dataset.py"
-_RECORDING = _REPO_ROOT / "docs" / "recording.md"
+_READING_BACK = _REPO_ROOT / "docs" / "data" / "reading-back.md"
 
 
 def test_no_userfacing_file_invokes_removed_lerobot_scripts_train() -> None:
-    for path in (_STREAMING_DATASET, _RECORDING):
+    for path in (_STREAMING_DATASET, _READING_BACK):
         text = path.read_text()
         assert "lerobot.scripts.train" not in text, (
             f"{path.name} instructs the removed `python -m lerobot.scripts.train`; "
@@ -265,20 +269,23 @@ def test_no_userfacing_file_invokes_removed_lerobot_scripts_train() -> None:
 #     * The shard-size claim understated lerobot's defaults: 100 MB is the
 #       data-parquet default; video MP4 shards default to 200 MB. ---
 
-_README = _REPO_ROOT / "docs" / "recording.md"  # the bucket / streamed-training guidance page (was README)
+_STREAMED_TRAINING = _REPO_ROOT / "docs" / "data" / "reading-back.md"  # the streamed-training page (was README)
+_BUCKET_GUIDANCE = _REPO_ROOT / "docs" / "data" / "dataset-recorder.md"  # the sync_to_bucket page (was README)
 _DATASET_RECORDER = _REPO_ROOT / "strands_robots" / "dataset_recorder.py"
+_DATASET_TRANSFER = _REPO_ROOT / "strands_robots" / "dataset_transfer.py"  # the bucket-sync source
 
 
 def test_readme_streamed_training_invocation_is_current() -> None:
-    text = _README.read_text()
+    text = _STREAMED_TRAINING.read_text()
     assert "lerobot.scripts.train" not in text, (
-        "docs/recording.md instructs the removed `python -m lerobot.scripts.train`; "
+        f"{_STREAMED_TRAINING.name} instructs the removed `python -m lerobot.scripts.train`; "
         "lerobot renamed the trainer module to `lerobot.scripts.lerobot_train`"
     )
     # the documented invocation is the entry point with draccus --dotted flags
-    assert "lerobot-train" in text, "docs/recording.md lost its `lerobot-train` reference"
+    assert "lerobot-train" in text, f"{_STREAMED_TRAINING.name} lost its `lerobot-train` reference"
     assert "--dataset.streaming=true" in text, (
-        "docs/recording.md streamed-training example must use draccus `--dotted.key=value` flags, not Hydra `key=value` args"
+        f"{_STREAMED_TRAINING.name} streamed-training example must use draccus `--dotted.key=value` "
+        "flags, not Hydra `key=value` args"
     )
 
 
@@ -288,7 +295,7 @@ def test_hf_cli_install_guidance_pins_the_bucket_cli_floor() -> None:
     # without the `buckets`/`sync` subcommands; every install line next to
     # `sync_to_bucket` guidance must name the floor that ships them.
     floor = _bucket_cli_floor_spec()
-    for path in (_README, _DATASET_RECORDER):
+    for path in (_BUCKET_GUIDANCE, _DATASET_TRANSFER):
         text = path.read_text()
         assert "pip install -U huggingface_hub" not in text, (
             f"{path.name} recommends an unversioned huggingface_hub install; "
@@ -298,11 +305,11 @@ def test_hf_cli_install_guidance_pins_the_bucket_cli_floor() -> None:
 
 
 def test_shard_size_claim_names_both_lerobot_defaults() -> None:
-    text = _DATASET_RECORDER.read_text()
+    text = _DATASET_TRANSFER.read_text()
     # lerobot defaults: 100 MB data parquet / 200 MB video MP4 - "100 MB
     # default" alone understates the video shard size.
     assert "100 MB default" not in text, (
-        "dataset_recorder.py understates the shard defaults; lerobot uses 100 MB data parquet / 200 MB video MP4"
+        f"{_DATASET_TRANSFER.name} understates the shard defaults; lerobot uses 100 MB data parquet / 200 MB video MP4"
     )
     assert "100 MB data parquet / 200 MB video" in text
 
@@ -360,7 +367,7 @@ def test_wbc_extra_huggingface_hub_floor_ships_the_bucket_cli() -> None:
     # floor raise falsifies the substring while the property it stands for -
     # "the resolved `hf` CLI carries the buckets/sync subcommands" - still holds.
     lower = min(Version(s.version) for s in Requirement(spec).specifier if s.operator == ">=")
-    minimum = Version(".".join(str(part) for part in dataset_recorder._HF_BUCKET_CLI_MIN_VERSION))
+    minimum = Version(".".join(str(part) for part in dataset_transfer._HF_BUCKET_CLI_MIN_VERSION))
     assert lower >= minimum, (
         f"[wbc] huggingface_hub floor must be >= {minimum} (the `hf buckets`/`hf sync` "
         f"CLI subcommands the bucket-sync docs instruct first ship there); got {spec!r}"
@@ -461,3 +468,111 @@ def test_troubleshooting_has_a_remedy_for_the_missing_trainer_extra() -> None:
     assert 'uv pip install "lerobot[training]"' in text, (
         "docs/troubleshooting.md names the accelerate symptom without the lerobot[training] remedy"
     )
+
+
+# --- negative contract: no docs install line prescribes a numpy that the
+#     lerobot the [lerobot] extra resolves cannot run on. The Jetson block told
+#     readers to `uv pip install "numpy<2" "pandas==2.1.4"` before installing
+#     `strands-robots[sim-mujoco,lerobot]`; lerobot >= 0.6 declares
+#     numpy>=2.0.0,<2.3.0, so the resolver replaced the pin on the very next
+#     line and the only thing the pre-pin conveyed was a numpy-1 requirement
+#     that does not exist. Derived from lerobot's own metadata rather than
+#     spelled here, so a future numpy range change re-grades the docs. ---
+
+
+def _lerobot_numpy_specifier() -> SpecifierSet:
+    """The numpy range the installed lerobot declares (e.g. ``>=2.0.0,<2.3.0``)."""
+    reqs = [Requirement(r) for r in metadata.requires("lerobot") or ()]
+    numpy_reqs = [r for r in reqs if canonicalize_name(r.name) == "numpy" and r.marker is None]
+    assert numpy_reqs, "installed lerobot declares no unconditional numpy requirement"
+    spec = SpecifierSet()
+    for req in numpy_reqs:
+        spec &= req.specifier
+    return spec
+
+
+def _numpy_versions_lerobot_accepts() -> list[Version]:
+    """Concrete numpy versions inside lerobot's declared range.
+
+    The lower bound of every ``>=`` is itself an accepted release, and the numpy
+    resolved into this environment alongside lerobot is another when it agrees
+    with the declared range. A docs pin has to admit at least one of them.
+    """
+    spec = _lerobot_numpy_specifier()
+    probes = [Version(s.version) for s in spec if s.operator == ">="]
+    installed = Version(metadata.version("numpy"))
+    if spec.contains(installed):
+        probes.append(installed)
+    assert probes, f"cannot derive an accepted numpy version from {spec}"
+    return probes
+
+
+def _code_fragments(text: str) -> list[str]:
+    """Every command a page presents as code: fenced-block lines and inline spans.
+
+    A pip command reaches a reader either inside a ```bash block (the platform
+    install steps) or as an inline span in a troubleshooting table row, and a
+    numpy pin is only advice in those two places -- prose that merely names
+    ``numpy < 2`` to warn against it must not be graded as an instruction.
+    """
+    fragments: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            fragments.append(line)
+        else:
+            fragments.extend(re.findall(r"`([^`\n]+)`", line))
+    return fragments
+
+
+_NUMPY_PIN = re.compile(r"numpy\s*(==|>=|<=|~=|!=|<|>)\s*([0-9][0-9a-zA-Z.*+!-]*)")
+
+
+def test_no_docs_install_command_pins_a_numpy_lerobot_forbids() -> None:
+    """An install step must not pin a numpy outside lerobot's declared range.
+
+    Such a pin cannot survive the install it precedes -- the resolver replaces
+    it while pulling lerobot -- so it only misinforms the reader about which
+    numpy the stack needs.
+    """
+    accepted = _numpy_versions_lerobot_accepts()
+    offenders: list[str] = []
+    for path in sorted((_REPO_ROOT / "docs").rglob("*.md")):
+        for fragment in _code_fragments(path.read_text()):
+            if "pip install" not in fragment:
+                continue
+            for operator, version in _NUMPY_PIN.findall(fragment):
+                pin = SpecifierSet(f"{operator}{version}")
+                if not any(pin.contains(candidate) for candidate in accepted):
+                    offenders.append(f"{path.relative_to(_REPO_ROOT)}: {fragment.strip()}")
+    assert not offenders, (
+        "docs install command pins a numpy that the installed lerobot "
+        f"({_lerobot_numpy_specifier()}) forbids, so the same command line undoes it: " + "; ".join(offenders)
+    )
+
+
+def test_numpy_abi_remedy_reinstalls_through_the_lerobot_extra() -> None:
+    """The numpy-ABI remedy must resolve through a declared extra, not bare.
+
+    Reinstalling the offending wheel on its own lets the resolver move numpy
+    freely: a bare ``uv pip install --reinstall pandas`` next to lerobot 0.6.1
+    resolves pandas 3 and numpy 2.5, which lerobot's ``numpy<2.3.0`` forbids.
+    Naming the extra keeps the repair inside the ranges the project declares.
+    """
+    rows = [
+        line.split("|")
+        for line in _TROUBLESHOOTING.read_text().splitlines()
+        if line.startswith("|") and "numpy" in line.split("|")[1] and "Jetson" in line.split("|")[1]
+    ]
+    assert len(rows) == 1, f"expected exactly one numpy-on-Jetson troubleshooting row, found {len(rows)}"
+    remedy = rows[0][3]
+    installs = [f for f in _code_fragments(remedy) if "pip install" in f]
+    assert installs, "the numpy ABI row names no install command"
+    for command in installs:
+        assert "strands-robots[" in command, (
+            f"the numpy ABI remedy reinstalls a package outside any declared extra: {command!r}; "
+            "the resolver is then free to move numpy out of lerobot's range"
+        )
