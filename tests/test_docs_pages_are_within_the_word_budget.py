@@ -55,7 +55,6 @@ _OVER_BUDGET = frozenset(
         "robots/arms.md",
         "robots/humanoids.md",
         "robots/mobile.md",
-        "ros2-integration.md",
         "rosbridge-integration.md",
         "rtps-integration.md",
         "simulation/domain-randomization.md",
@@ -63,7 +62,6 @@ _OVER_BUDGET = frozenset(
         "simulation/newton.md",
         "simulation/rollouts.md",
         "training/overview.md",
-        "training/rl.md",
         "troubleshooting.md",
     }
 )
