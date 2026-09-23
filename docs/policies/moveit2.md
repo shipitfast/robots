@@ -58,9 +58,7 @@ policy = create_policy(
 )
 
 actions = policy.get_actions_sync(
-    # The start state, read in order onto panda_arm's seven joints. This is the
-    # Panda's home keyframe: the model's zero pose is a start state in collision,
-    # which the planner refuses.
+    # panda_arm's home keyframe; the zero pose starts in collision.
     observation_dict={"observation.state": [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, -0.7853]},
     instruction="reach for the red block",   # ignored by planners
     target_pose=[0.3, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0],   # [x,y,z, qw,qx,qy,qz]
