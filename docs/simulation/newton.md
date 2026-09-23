@@ -96,6 +96,14 @@ no-op until then.
   names use the short trailing segment (`Rotation`, `Pitch`, ...), matching the
   MuJoCo backend exactly so policies and observation mappings transfer
   unchanged.
+- MJCF **position-servo gains** are carried onto the model. Newton's importer
+  reads a `<position>` actuator's `kp` and drops the rest of the servo: the
+  `dampratio` MuJoCo compiles into a velocity gain and the `forcerange` that
+  caps the torque. A P-only servo with a 1e6 torque ceiling does not track - a
+  constant `Rotation = 0.5` on the shipped `so100` oscillated between 0.05 and
+  0.96 rad indefinitely - so both are read off the compiled model and written
+  onto the builder before `finalize`. A model MuJoCo cannot compile keeps the
+  gains Newton did carry and logs the reason.
 - `render()` returns the same agent-tool image block (`{"image": {"format":
   "png", ...}}`) as MuJoCo, so the shared `PolicyRunner` video pipeline works
   without modification.
@@ -109,7 +117,11 @@ no-op until then.
   the arm. `remove_camera(name)` / `list_cameras()` round out the API and
   `describe()["cameras"]` lists every registered camera.
 - `run_policy` / `eval_policy` / `replay_episode` / `start_policy` are
-  inherited from the `SimEngine` ABC - no backend-specific re-implementation.
+  inherited from the `SimEngine` ABC - no backend-specific re-implementation. A
+  policy needing an action controller only MuJoCo can install is refused there
+  rather than rolled out without it: `run_policy` with a `WBCPolicy` reports the
+  missing torque shim and names both remedies (the MuJoCo backend, or
+  `wbc_install_torque_control=False` for a torque-actuated scene).
   `start_policy` is the ABC's synchronous passthrough to `run_policy` here;
   only the MuJoCo backend runs a policy on a background thread. All four are
   advertised in `describe()["methods"]`, as is every other base-contract
@@ -174,7 +186,9 @@ method names:
 
 - `get_robot_state(robot_name=None)` returns each joint's `position` and
   `velocity` (read from `joint_q` / `joint_qd` respectively) in a `json`
-  block, plus a human-readable summary.
+  block, plus a human-readable summary. `get_observation` carries that same
+  velocity beside each position under `<joint>.vel` - the spelling the
+  velocity-feedback locomotion policies (Microduck, WBC, ProtoMotions) read.
 - `list_robots_info()` and `list_objects()` return pretty-printed listings of
   the robots and primitive objects in the world. Both report **live** poses,
   read from the solver's `body_q` rather than from the `add_robot` /
@@ -371,15 +385,12 @@ and every rendered camera frame until reconfigured (pass all-zero to disable):
 ```python
 sim.set_obs_noise(
     joint_pos_std=0.01,     # radians, added to joint positions
-    joint_vel_std=0.05,     # rad/s, added to joint velocities (get_robot_state)
+    joint_vel_std=0.05,     # rad/s, added to the joint velocities
     camera_jitter_px=2,     # max integer pixel shift on rendered frames
     seed=0,                 # reproducible noise stream
 )
 obs = sim.get_observation("so100")   # joint positions now carry +/- noise
 ```
-
-`describe()` advertises both `randomize` and `set_obs_noise` so a single call
-surfaces their signatures.
 
 ## Mesh objects
 

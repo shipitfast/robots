@@ -2175,7 +2175,10 @@ class PolicyRunner:
             actuator confirmed on every known step, ``~0.83`` == only 1 of 6).
             Coarse backend errors are excluded from those denominators rather
             than fabricated as misses and remain visible in ``action_errors``
-            and the result text. This makes a rollout that silently drives only
+            and the result text, as is a step whose applied keys name driven
+            JOINTS rather than actuators - a spelling ``send_action`` resolves
+            without reporting which actuator it drove, so it is unknown here
+            rather than a miss. This makes a rollout that silently drives only
             a subset of the robot's joints visible instead of looking like a
             clean ``success`` with a zero success-rate.
 
@@ -2887,11 +2890,25 @@ class PolicyRunner:
                     # excluded too: empty applied keys mean "unknown" there, not a
                     # measured miss. Structured partial/none and successful answers
                     # are resolution-known and form the denominator.
-                    if not _is_error or _has_complete_breakdown:
+                    # Per-actuator credit needs the applied keys to NAME actuators.
+                    # A dict keyed by driven-JOINT names is a spelling
+                    # ``send_action`` documents and resolves (it looks the joint's
+                    # driving actuator up, tendon grippers included), so the step
+                    # drove the robot - but it credits no entry of this roster, and
+                    # counting it would record every actuator as a measured miss:
+                    # ``action_resolution_rate`` all 0.0 and a
+                    # ``partial_action_failure_rate`` of 1.0, the signature of a
+                    # rollout that never moved, for one the backend answered
+                    # ``"full"`` on. Which actuator each such key drove is known to
+                    # the backend's resolver and not to this loop, so the step is
+                    # resolution-UNKNOWN for per-actuator purposes - the same rule
+                    # this block already applies to a coarse answer - and is left
+                    # out of the denominator instead of being scored as a miss.
+                    _creditable = [_name for _name in _applied if _name in _actuator_resolved]
+                    if (not _is_error or _has_complete_breakdown) and len(_creditable) == len(_applied):
                         _known_resolution_steps += 1
-                        for _name in _applied:
-                            if _name in _actuator_resolved:
-                                _actuator_resolved[_name] += 1
+                        for _name in _creditable:
+                            _actuator_resolved[_name] += 1
 
                     # Fail fast when every opening probe step either explicitly
                     # resolved no keys or was atomically refused without a complete
@@ -3369,7 +3386,7 @@ class PolicyRunner:
             root: Local dataset directory. When omitted it is resolved from
                 ``repo_id`` by the rule recording writes through, so an id that
                 is itself a path replays the directory it recorded to
-                (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
+                (:func:`~strands_robots.dataset_source.local_dataset_dir`).
             speed: Playback speed multiplier (1.0 = real time). Must be a
                 positive, finite number (any real scalar, including a NumPy
                 scalar such as ``np.float32(2.0)``); a non-positive,
@@ -3480,7 +3497,7 @@ class PolicyRunner:
         episode = int(episode)
 
         try:
-            from strands_robots.dataset_recorder import load_lerobot_episode
+            from strands_robots.dataset_source import load_lerobot_episode
         except ImportError:
             return {"status": "error", "content": [{"text": "lerobot not installed"}]}
 
@@ -3795,7 +3812,7 @@ class PolicyRunner:
         """Resolve the directory a replay reads when the caller named only the id.
 
         An explicit ``root`` and an id that is itself a path are left to
-        :func:`~strands_robots.dataset_recorder.load_lerobot_episode`, which
+        :func:`~strands_robots.dataset_source.load_lerobot_episode`, which
         resolves them by the rule recording wrote through. An ``owner/name`` id
         with no root normally keeps its absent root (LeRobot's Hub snapshot
         cache) - except when THIS sim recorded that very id to a directory
@@ -3809,7 +3826,7 @@ class PolicyRunner:
         """
         if root:
             return root, ""
-        from strands_robots.dataset_recorder import local_dataset_dir, resolve_dataset_dir
+        from strands_robots.dataset_source import local_dataset_dir, resolve_dataset_dir
 
         if local_dataset_dir(repo_id) is not None:
             return None, ""
@@ -3862,7 +3879,7 @@ class PolicyRunner:
         unreachable = not hub_miss and any(c.__name__ in _HUB_UNREACHABLE_ERRORS for c in type(error).__mro__)
         if not (hub_miss or unreachable):
             return text
-        from strands_robots.dataset_recorder import resolve_dataset_dir
+        from strands_robots.dataset_source import resolve_dataset_dir
 
         checked = resolve_dataset_dir(repo_id, root)
         if unreachable:
@@ -5251,6 +5268,33 @@ class PolicyRunner:
             return success_fn
         if success_fn == "contact":
             sim = self.sim
+            # Refuse up front on a backend that cannot answer a contact query,
+            # BEFORE any rollout is spent. ``get_contacts`` on the base class is
+            # a raising stub, and the predicate DSL's never-raise contract turns
+            # that raise into ``False`` on every tick - so
+            # ``eval_policy(success_fn="contact")`` on such a backend used to
+            # run the full evaluation (GPU-hours on Isaac) and report
+            # ``success_rate: 0.0`` with ``success_measured: True``: a wrong
+            # answer shaped exactly like a policy that failed every episode,
+            # with nothing anywhere saying success was never measurable. The
+            # ``ValueError`` is returned to the caller as this method's
+            # documented structured-error envelope.
+            #
+            # The test is structural (did the subclass override the stub?)
+            # rather than a probe call, because ``get_contacts`` on a real
+            # backend can fail for world-lifecycle reasons that say nothing
+            # about the capability.
+            from strands_robots.simulation.base import SimEngine
+
+            if type(sim).get_contacts is SimEngine.get_contacts:
+                raise ValueError(
+                    f"success_fn='contact' cannot be measured on this backend: "
+                    f"{type(sim).__name__} does not implement get_contacts, so every "
+                    f"episode would score 0.0 while the payload claimed the rate was "
+                    f"measured. Pass a callable success_fn that reads the observation "
+                    f"(e.g. an object-pose check via body.<name>.pos), or evaluate on "
+                    f"a backend with a contact query (MuJoCo)."
+                )
             # Share the DSL's reader instead of keeping a second one. The
             # inline copy this replaces indexed the engine result as if it
             # were the payload, so it never saw a real backend's envelope and

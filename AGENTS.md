@@ -1851,7 +1851,7 @@ hatch run format            # ruff check --fix, ruff format
     1. `asset.robot_descriptions_module` (preferred)
     2. `asset.source` with `type: "github"`
     3. `asset.auto_download: false` (explicit opt-out)
-  Enforced by `tests/test_registry_integrity.py`.
+  Enforced by `tests/registry/test_integrity.py`.
 
 
 ## Review Learnings (PR #85 - MuJoCo Backend)
@@ -1879,6 +1879,36 @@ Corrections from code review that apply to all future contributions:
 
 ### Data Integrity
 - **Per-name state copy, not flat index** - When recompiling MuJoCo models (inject/eject), copy qpos/qvel per-joint by name. Flat-index slicing breaks when body-tree order shifts.
+- **A scene rebuild trusts the compiler with nothing a reset would write** - which
+  entries of the ``MjData`` that ``spec.recompile(model, data)`` hands back are
+  undefined is a property of the MuJoCo build, not of this package. Through 3.13 it
+  was the new tail of ``qpos``/``qvel``/``ctrl``/``act``; 3.14.0 carries
+  ``qacc_warmstart``, ``eq_active``, both applied-force buffers and mocap poses by
+  element and, when the spec was grown by attaching a sub-spec with a ``<keyframe>``
+  (every registry robot), hands back heap garbage for the attached elements' slices
+  in all of them - measured `nan`, `6.98e-316`, `1.12e+219`, pre-existing slices
+  intact. So `_recompile_preserving_state` writes every such buffer from the value a
+  reset gives (`qpos0`, `eq_active0`, a mocap body's `body_pos`/`body_quat`, zero)
+  and zeroes both force buffers whole before the name-keyed restore, rather than
+  defining the four the old build left undefined. The symptom of assuming zero was
+  `Nan, Inf or huge value in QACC at DOF 0` on the first step after `add_robot`,
+  against a healthy parked joint, on the runs where the freed memory happened to be
+  non-finite - so pin such a rule with a transfer that is poisoned deliberately, not
+  with the physics that fails only sometimes. Pinned by
+  `tests/simulation/mujoco/test_recompile_defines_every_buffer_it_grows.py` (#3945).
+- **A spec rollback identifies the surplus by identity, never by name or position** -
+  a refused `add_body(name=...)` / `add_camera(name=...)` appends the orphan on every
+  build, and what its name field holds afterwards is the build's business: the
+  colliding name through 3.13, `""` from 3.14 (the failed rename now preserves the
+  previous name). A rollback keyed on the colliding name deleted the orphan on one
+  build and nothing on the other, leaving a nameless body at the origin in a spec
+  that then compiled. Position is not the answer either - `spec.cameras` enumerates
+  in tree order, so a worldbody camera sits before every child body's cameras, not
+  last. Snapshot the element list before the insert and delete what is present
+  afterwards and absent from it (`SpecBuilder.snapshot_bodies` /
+  `remove_bodies_not_in`); spec element wrappers are identity-stable and compare
+  equal for one element, so membership is the test. Pinned by
+  `tests/simulation/mujoco/test_spec_builder.py::TestSurplusRollbackTargetsOnlyWhatThisCallAppended`.
 - **Sanitize user inputs into XML** - Validate names against `^[a-zA-Z0-9_-]+$` before interpolating into MJCF. LLM-provided strings are untrusted.
 - **Match schema and data keys** - If a feature is declared with sanitized names (e.g., `__`), the data producer must emit the same sanitized keys.
 
@@ -2342,6 +2372,25 @@ which side the enum is on.
 - **Use `monkeypatch.setenv`, never `os.environ[...] = ...`** - direct mutation leaks if the test raises before `finally`, and `del os.environ[...]` can `KeyError` under parallel runs. The pytest fixture handles teardown atomically.
 - **Restore a `sys.modules` entry you remove** - a removal does not undo an import, it *orphans* every reference already bound to that module: the next `import X` re-executes the package and returns a *different* object, so a sibling test module's `monkeypatch.setattr(X, "attr", double)` installs the double where nothing will look and the real package is used instead. `monkeypatch.setitem(sys.modules, name, None)` makes `import name` raise `ImportError` *and* restores. A bare `sys.modules.pop("boto3", None)` in one camera-offload test left the IoT fan-out tests building a real client and attempting signed AWS requests, dormant only because they happened to sort ahead of the pop. Purging a module nothing patches, to force a re-import, stays legal - `tests/test_sys_modules_removal_leaves_no_orphan.py` grades the difference from the tree. **Blocking an optional dependency borrows the entry, so put back what you displaced**: `sys.modules[name] = None` makes the import fail, and the way out is re-assigning the module that was there, never `del sys.modules[name]` - deleting the key is the same orphaning by another spelling, and `require_optional`'s memo is no fallback because it is populated on the first *success*. `tests/_blocked_module.py`'s `blocked(name)` restores both entries and is the one owner of that pair.
 - **Import a tool from its own submodule, never off the tools package** - `strands_robots.tools` maps each tool name to the `@tool` object inside the submodule of the *same* name, so `from strands_robots.tools import pose_tool` resolves to whichever of the two this process bound first: CPython's `_handle_fromlist` imports the submodule only when the attribute is *absent*, and here the lookup triggers the package `__getattr__`, which succeeds, so the name binds to the tool object and the submodule is never imported. A source that binds a name that way and then reads it as a module - `ur.__file__`, `pose_mod.pose_tool`, any of the module's private names - therefore passes or fails on the import order of the whole process rather than on the behaviour it is about, and surfaces as an `AttributeError` naming the read rather than the import that decided it. Write `import strands_robots.tools.pose_tool as pose_mod` or `from strands_robots.tools.pose_tool import pose_tool`, which cannot resolve to anything else. `tests/tools/test_lazy_tool_name_is_not_read_as_a_module.py` derives both halves of the rule - which names are ambiguous, and which attributes only a module can answer - so a tool added to the mapping and a call site added to any scanned tree are graded on arrival.
+- **A nested `pytest` over real test files runs without the parent's coverage hook** -
+  `pytest-cov` hands its measurement to every child interpreter through `COV_CORE_*`
+  and a `.pth` file that starts coverage at interpreter start, before the child's
+  own `pytest` reads `--no-cov`, so that flag on the child's command line changes
+  nothing. For the synthetic one-file modules most nested runs here collect that
+  costs nothing worth naming. For a child that re-runs *real* test files it is the
+  parent's whole measurement paid a second time for lines the parent already has,
+  because those files are in the parent's own session: measured on
+  `tests/test_device_connect_stand_in_is_not_handed_back.py`, the two-file child
+  went from 9.6 s to 44.2 s locally with only the three variables added, and its
+  two cells were 124 s of a 2642 s CI suite - the largest single file in the run
+  (#3869). Build the child's environment without the `COV_CORE_` names and pass
+  it as `env=`; it is the environment, not the flag, that decides. Pin it on the
+  nested run itself rather than on the helper that builds the environment - a
+  probe module asserting `coverage.Coverage.current() is None` under the real
+  `_run_pytest` fails when the `env=` is dropped, where a test of the helper
+  alone does not - and keep a control showing the hook does start under the
+  ambient environment, so a rename on pytest-cov's side is reported rather than
+  silently paid. Pinned by `TestTheNestedRunStartsNoCoverage` in that file.
 - **Happy-path tests, not just error-paths** - if you have `test_factory_raises_on_bad_xml`, you also need `test_factory_returns_working_sim` gated behind `pytest.importorskip("mujoco")`. Steps physics, asserts state, destroys cleanly.
 - **Never read a tool name off `strands_robots.tools`** - the package maps each exported name to the `@tool` object inside the submodule of the *same* name and caches it in the package `__dict__`, so `from strands_robots.tools import pose_tool` binds either the tool or the module depending on what the process imported first: cold it is the tool, and after any import of the submodule it is the module. That read is also the only spelling that writes the *tool* into the slot, which is what makes the module-alias form used widely here as a monkeypatch target (`import strands_robots.tools.use_rosbridge as rb_mod`) resolve to the tool instead - `rb_mod.roslibpy` then raises `AttributeError` naming the tool class rather than an import order. Both directions shipped, each passing in the selection it was written against: two tests read the name and used the result as a module (`'DecoratedFunctionTool' object has no attribute '__file__'`), two examples read it and used the result as a tool (`module ... has no attribute '__wrapped__'`). Write `import strands_robots.tools.<name> as <name>_mod` when the module object is wanted and `from strands_robots.tools.<name> import <name>` when the tool is wanted; both read the submodule, so no import order changes them. Pinned by `tests/tools/test_lazy_tool_name_imports_are_unambiguous.py`.
 - **Pin every reviewed fix with a regression test** - every behavioral fix in this PR (warning on bad env var, rejecting `cameras=` in sim, default `mode="sim"`, etc.) has a dedicated test. "Trust me, the diff fixes it" is not a review-pass condition.
@@ -2494,6 +2543,7 @@ Corrections from code review that apply to all future contributions:
   | `strands_robots/policies/persistent.py::get_actions` | `handoff.abandon()`, bare `raise` | no |
   | `strands_robots/robot.py::Robot` | `sim.destroy()`, bare `raise` | no |
   | `strands_robots/simulation/safe_output.py::atomic_write_bytes` | `os.unlink(tmp)`, bare `raise` | no |
+  | `strands_robots/simulation/isaac/mjcf_assets.py::convert_mjcf_to_usd` | `_remove_tree(staging)`, bare `raise` | no |
   | `strands_robots/simulation/isaac/simulation.py::_job` | `box["exc"] = exc`, no lexical raise | **yes** |
 
   The handlers under `tests/`, `examples/` and `scripts/` re-raise lexically too,

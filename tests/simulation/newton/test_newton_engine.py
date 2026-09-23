@@ -72,8 +72,22 @@ class TestRobotManagement:
 
 class TestObservationAction:
     def test_observation_keys_match_joints(self, engine_with_so100):
+        """Each joint contributes a position and its ``<joint>.vel`` companion.
+
+        so100 is a fixed-base arm, so the surface is exactly one position key and
+        one ``<joint>.vel`` key per scalar joint - no ``base_*``. The pairing
+        rather than the key count is the contract a policy reads; see
+        ``test_observation_pairs_joint_velocity.py`` for what consumes it.
+
+        Derived from ``robot_joint_names`` rather than filtering ``.vel`` out:
+        measured, the filtering form still passes with ``.vel`` emission deleted
+        from the observation builder, so it would re-permit the very gap this
+        closed.
+        """
+        joints = set(engine_with_so100.robot_joint_names("so100"))
         obs = engine_with_so100.get_observation("so100")
-        assert set(obs) == set(engine_with_so100.robot_joint_names("so100"))
+
+        assert set(obs) == joints | {f"{j}.vel" for j in joints}
         assert all(isinstance(v, float) for v in obs.values())
 
     def test_send_action_moves_joint(self, engine_with_so100):
@@ -158,8 +172,13 @@ class TestSolverParity:
             sim.create_world()
             sim.add_robot("so100")
             assert sim.step(5)["status"] == "success"
+            joints = sim.robot_joint_names("so100")
             obs = sim.get_observation("so100")
-            assert len(obs) == 6
+            # Kept as an assertion on the whole surface rather than dropped:
+            # get_observation has refusal paths that return {}, and `all()` over
+            # an empty dict is trivially True, so this is what stops the finite
+            # check below from passing on no readings at all.
+            assert set(obs) == set(joints) | {f"{j}.vel" for j in joints}
             assert all(np.isfinite(v) for v in obs.values())
         finally:
             sim.destroy()

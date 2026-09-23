@@ -67,6 +67,7 @@ from strands import tool
 from strands.types.tools import ToolContext
 
 from strands_robots._command_gate import gate_motion
+from strands_robots._motion_grants import consume_grant
 from strands_robots.drivers.feetech.protocol import (
     BROADCAST_ID,
     MAX_GOAL_POSITION,
@@ -75,6 +76,8 @@ from strands_robots.drivers.feetech.protocol import (
     Register,
     encode_word,
     max_magnitude,
+    ping_packet,
+    write_packet,
 )
 from strands_robots.utils import (
     finite_number_error,
@@ -279,30 +282,6 @@ WRITE_ACTIONS = frozenset({"send", "send_read", "feetech_position", "feetech_vel
 COMMAND_ALLOW_ENV = "STRANDS_SERIAL_COMMAND_ALLOW"
 
 
-def _dashboard_grant(tool_input: dict[str, Any]) -> bool:
-    """Spend a grant the dashboard's motion hook deposited for this exact call.
-
-    The dashboard registers :class:`~strands_robots.dashboard.agent_hitl.MotionInterruptHook`
-    on its agent, which asks the operator before the tool runs and records a
-    one-shot grant keyed on what they were shown. Asking again here would be
-    the same question twice, so a grant is consumed and the call proceeds. The
-    dashboard extra may be absent, and a missing module must read as "no
-    grant", never as a crash: the gate below then asks the operator itself.
-
-    Args:
-        tool_input: The call as the hook saw it - the same field names, with
-            the unset ones omitted.
-
-    Returns:
-        True when a grant for this exact call existed and was spent.
-    """
-    try:
-        from strands_robots.dashboard import agent_hitl
-    except ImportError:
-        return False
-    return bool(agent_hitl.consume_grant("serial_tool", tool_input))
-
-
 def _write_payload_error(
     action: str,
     *,
@@ -365,7 +344,7 @@ def _gate_write(action: str, tool_input: dict[str, Any], tool_context: ToolConte
     Returns:
         A refusal message, or None to let the write proceed.
     """
-    if _dashboard_grant(tool_input):
+    if consume_grant("serial_tool", tool_input):
         return None
     port = str(tool_input.get("port") or "")
     detail = " ".join(f"{k}={v}" for k, v in tool_input.items() if k not in ("action", "port"))
@@ -466,13 +445,6 @@ def serial_tool(
                 }
             )
         return ports
-
-    def build_feetech_packet(motor_id: int, instruction: int, params: list[int]) -> bytes:
-        """Build Feetech servo protocol packet."""
-        packet = [0xFF, 0xFF, motor_id, len(params) + 2, instruction] + params
-        checksum = ~sum(packet[2:]) & 0xFF
-        packet.append(checksum)
-        return bytes(packet)
 
     try:
         if action not in _ACTIONS:
@@ -601,9 +573,9 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and position required"}]}
 
-            # Feetech position command: INST_WRITE (0x03), Goal_Position address (0x2A)
-            params = [0x2A, *encode_word(position)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            # The broadcast is allowed here: this write expects no reply, and
+            # ``_motor_id_error`` refuses it only for the actions that read one.
+            packet = write_packet(motor_id, Register.GOAL_POSITION, encode_word(position), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -622,9 +594,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id and velocity required"}]}
 
-            # Feetech velocity command: Goal_Velocity address (0x2E)
-            params = [0x2E, *encode_word(velocity)]
-            packet = build_feetech_packet(motor_id, 0x03, params)
+            packet = write_packet(motor_id, Register.GOAL_VELOCITY, encode_word(velocity), allow_broadcast=True)
             ser.write(packet)
             ser.close()
 
@@ -635,8 +605,7 @@ def serial_tool(
                 ser.close()
                 return {"status": "error", "content": [{"text": "motor_id required"}]}
 
-            # Feetech ping command
-            packet = build_feetech_packet(motor_id, 0x01, [])  # INST_PING
+            packet = ping_packet(motor_id)
             ser.write(packet)
 
             time.sleep(0.1)
