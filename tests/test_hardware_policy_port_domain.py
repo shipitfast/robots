@@ -48,9 +48,9 @@ import pytest
 import strands_robots.hardware_robot as hardware_robot
 from strands_robots.hardware_robot import Robot as HwRobot
 from strands_robots.hardware_robot import RobotTaskState, TaskStatus
+from strands_robots.policies.factory import import_policy_class
 from strands_robots.registry.policies import (
     get_policy_provider,
-    import_policy_class,
     list_policy_providers,
 )
 from strands_robots.utils import tcp_port_error
@@ -569,9 +569,10 @@ class TestTheDeviceConnectRelayDoesNotCollapseTheValue:
     @staticmethod
     def _relay(port: Any, provider: str = "groot") -> tuple[Any, dict[str, Any]]:
         """Invoke the real ``execute`` RPC; report what ``start_task`` saw."""
-        from tests.test_device_connect_hardening import _force_real_device_connect_edge, _run
+        from tests._device_connect_real import use_the_real_edge
+        from tests.test_device_connect_hardening import _run
 
-        _force_real_device_connect_edge()
+        use_the_real_edge()
         from strands_robots.device_connect.robot_driver import RobotDeviceDriver
 
         seen: list[Any] = []

@@ -6,9 +6,10 @@ without a robot attached:
 - ``RobotPose`` dataclass round-trips to and from dicts.
 - ``PoseManager`` persists, retrieves, lists, deletes, and validates poses
   against safety bounds, surviving a reload from disk.
-- ``MotorController`` builds correct Feetech protocol packets and converts
-  between degrees and raw servo positions (including gripper percentage units),
-  with the serial connection mocked.
+- ``MotorController`` converts between degrees and raw servo positions
+  (including gripper percentage units) with the serial connection mocked. The
+  frames it sends are the codec's, and are graded there:
+  ``tests/tools/test_feetech_tool_frames_come_from_the_codec.py``.
 - ``pose_tool`` dispatches every action branch and returns the
   ``{"status", "content"}`` contract on both success and error paths.
 
@@ -139,47 +140,36 @@ def test_pose_manager_validate_within_and_outside_bounds() -> None:
 # --------------------------------------------------------------------------- #
 # MotorController
 # --------------------------------------------------------------------------- #
-def test_feetech_packet_header_and_checksum() -> None:
-    ctrl = MotorController("/dev/null")
-    packet = ctrl.build_feetech_packet(1, 0x03, [0x2A, 0x00, 0x08])
-    assert packet[0] == 0xFF and packet[1] == 0xFF
-    assert packet[2] == 1  # motor id
-    assert packet[3] == len([0x2A, 0x00, 0x08]) + 2  # length
-    assert packet[4] == 0x03  # instruction
-    # Checksum is the bitwise inverse of the sum of bytes from index 2 onward.
-    expected = ~sum(packet[2:-1]) & 0xFF
-    assert packet[-1] == expected
-
-
 def test_degrees_position_round_trip_joint() -> None:
     ctrl = MotorController("/dev/null")
-    # Mid-range degree maps near mid-resolution and back.
-    pos = ctrl.degrees_to_position("shoulder_pan", 0.0)
+    # Mid-travel degree maps near mid-resolution and back.
+    pos = ctrl.units.to_counts("shoulder_pan", 0.0)
     assert pos == pytest.approx(4095 // 2, abs=2)
-    deg = ctrl.position_to_degrees("shoulder_pan", pos)
+    deg = ctrl.units.to_value("shoulder_pan", pos)
     assert deg == pytest.approx(0.0, abs=0.2)
 
 
-def test_degrees_to_position_clamps_out_of_range() -> None:
+def test_a_target_the_encoder_cannot_hold_is_refused_not_clamped() -> None:
     ctrl = MotorController("/dev/null")
-    # shoulder_lift range is (-90, 90); 999 deg clamps to the max position.
-    assert ctrl.degrees_to_position("shoulder_lift", 999.0) == 4095
-    assert ctrl.degrees_to_position("shoulder_lift", -999.0) == 0
+    # An uncalibrated arm spans the servo's turn, so 999 deg is off the encoder.
+    for target in (999.0, -999.0):
+        with pytest.raises(ValueError, match="outside the travel the encoder can hold"):
+            ctrl.units.to_counts("shoulder_lift", target)
 
 
 def test_gripper_uses_percentage_units() -> None:
     ctrl = MotorController("/dev/null")
-    half = ctrl.degrees_to_position("gripper", 50.0)
+    half = ctrl.units.to_counts("gripper", 50.0)
     assert half == pytest.approx(4095 * 0.5, abs=1)
-    assert ctrl.position_to_degrees("gripper", half) == pytest.approx(50.0, abs=0.1)
+    assert ctrl.units.to_value("gripper", half) == pytest.approx(50.0, abs=0.1)
 
 
 def test_unknown_motor_raises() -> None:
     ctrl = MotorController("/dev/null")
-    with pytest.raises(ValueError, match="Unknown motor"):
-        ctrl.degrees_to_position("not_a_motor", 0.0)
-    with pytest.raises(ValueError, match="Unknown motor"):
-        ctrl.position_to_degrees("not_a_motor", 0)
+    with pytest.raises(ValueError, match="unknown motor"):
+        ctrl.units.to_counts("not_a_motor", 0.0)
+    with pytest.raises(ValueError, match="unknown motor"):
+        ctrl.units.to_value("not_a_motor", 0)
 
 
 def test_connect_disconnect_and_move(fake_serial) -> None:

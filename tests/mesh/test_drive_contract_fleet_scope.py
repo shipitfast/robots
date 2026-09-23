@@ -56,13 +56,21 @@ import strands_robots.mesh.rtps_robot as rtps_mod
 
 
 class _Recorder:
-    """Records the kwargs of each forwarded transport call."""
+    """Records the payload of each forwarded transport call.
+
+    The operator gate a bridge hands its transport is dropped: it is the channel
+    the human decision arrives on, not part of what goes on the wire, and it
+    closes over the call's ``tool_context``, so it is a fresh object every call.
+    Keeping it would make ``_clamps_velocity`` - which reads a ceiling as two
+    over-ceiling requests forwarding the *same* thing - compare closure identity
+    and report every gated bridge as unclamped.
+    """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> dict[str, Any]:
-        self.calls.append(kwargs)
+        self.calls.append({name: value for name, value in kwargs.items() if name != "gate"})
         return {"status": "success", "content": [{"text": "ok"}]}
 
 
@@ -72,14 +80,14 @@ _BRIDGES: list[tuple[str, Any, str, Callable[[], Any]]] = [
     (
         "RosBridgedRobot",
         ros_bridge_mod,
-        "use_ros",
+        "ros_action",
         lambda: ros_bridge_mod.RosBridgedRobot("rover", "/cmd_vel", "/odom", publish_rate=10.0),
     ),
-    ("RtpsRobot", rtps_mod, "use_rtps", lambda: rtps_mod.RtpsRobot("rover", "/cmd_vel", publish_rate=10.0)),
+    ("RtpsRobot", rtps_mod, "rtps_action", lambda: rtps_mod.RtpsRobot("rover", "/cmd_vel", publish_rate=10.0)),
     (
         "RosbridgeRobot",
         rosbridge_mod,
-        "use_rosbridge",
+        "rosbridge_action",
         lambda: rosbridge_mod.RosbridgeRobot("rover", "/cmd_vel", "/odom", publish_rate=10.0),
     ),
 ]
@@ -93,7 +101,7 @@ _DRIVE_OWNERS: list[tuple[str, Any, str, Callable[[], Any]]] = [
     (
         "AckermannRosRobot",
         ackermann_mod,
-        "use_ros",
+        "ros_action",
         lambda: ackermann_mod.AckermannRosRobot("car", "/servo", publish_rate=10.0),
     ),
 ]
@@ -165,6 +173,17 @@ def _latches_a_single_shot(monkeypatch: pytest.MonkeyPatch, bridge: Any) -> bool
     return result["status"] == "success" and len(calls) == 1 and calls[0]["fields"] != _ZERO_TWIST
 
 
+#: Forwarded arguments that carry the operator decision rather than the message.
+#: A gate is a fresh closure per call, so two identical commands are never equal
+#: dicts while it is in them - and nothing in it reaches the robot.
+_OFF_THE_WIRE = frozenset({"gate", "tool_context"})
+
+
+def _on_the_wire(call: dict[str, Any]) -> dict[str, Any]:
+    """The forwarded call without the operator decision travelling beside it."""
+    return {key: value for key, value in call.items() if key not in _OFF_THE_WIRE}
+
+
 def _clamps_velocity(monkeypatch: pytest.MonkeyPatch, bridge: Any) -> bool:
     """A ceiling makes two different over-ceiling requests indistinguishable.
 
@@ -177,7 +196,7 @@ def _clamps_velocity(monkeypatch: pytest.MonkeyPatch, bridge: Any) -> bool:
     """
     _, at = _drive(monkeypatch, bridge, linear=_ABOVE_ANY_CEILING, count=1)
     _, above = _drive(monkeypatch, bridge, linear=_ABOVE_ANY_CEILING * 2, count=1)
-    return bool(at) and bool(above) and at[0] == above[0]
+    return bool(at) and bool(above) and _on_the_wire(at[0]) == _on_the_wire(above[0])
 
 
 def _refuses_a_hold_past_a_ceiling(monkeypatch: pytest.MonkeyPatch, bridge: Any) -> bool:

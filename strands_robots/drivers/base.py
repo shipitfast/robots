@@ -46,9 +46,15 @@ Constructor contract (a Protocol cannot express ``__init__``): the factory
 builds a native driver as
 ``driver_cls(tool_name=<canonical name>, cameras=<cameras or None>,
 data_config=<data_config or None>, **kwargs)``, so a driver must accept those
-three keywords and tolerate the caller's extras. ``port=`` arrives in
-``**kwargs`` and stays polymorphic - a serial path, an IP address or a URL,
-interpreted by the driver that receives it.
+three keywords. Every further keyword it honours it declares as a parameter -
+``port=`` among them, which stays polymorphic (a serial path, an IP address or a
+URL, interpreted by the driver that receives it). The signature is therefore the
+driver's whole keyword roster, and the factory refuses a keyword outside it
+(:func:`constructor_keywords`) rather than forwarding it into a ``**kwargs``
+sink: a driver that tolerates an unread keyword reports success having ignored
+it, so ``Robot('so101', mode='real', driver='strands', prot='/dev/ttyACM0')``
+built an arm that auto-detects a port while the caller believed they had named
+one. The lerobot path already refuses that typo by name; this is the mirror.
 
 ``cameras`` is the one of the three that is *not* forwarded unconditionally. A
 driver that accepts it only for parity - which every driver shipped here does,
@@ -222,20 +228,6 @@ class HardwareDriver(Protocol):
         """
 
 
-#: The driver a robot gets when nothing says otherwise. Every robot in the
-#: package registry is a lerobot robot today, so the default keeps them working
-#: without a per-robot declaration.
-DEFAULT_DRIVER = "lerobot"
-
-#: Accepted ``driver=`` values. ``"auto"`` expresses no preference: it reads the
-#: registry and falls back to :data:`DEFAULT_DRIVER`. Mirrors the
-#: :data:`~strands_robots.registry.LIST_ROBOTS_MODES` pattern - a value outside
-#: this tuple is refused by name rather than silently treated as the default,
-#: because a typo that resolves to a working driver is a caller who never learns
-#: the driver they asked for does not exist.
-DRIVER_CHOICES = ("auto", DEFAULT_DRIVER, "strands")
-
-
 #: Every member :class:`HardwareDriver` requires, derived from the Protocol
 #: itself so the two can never disagree. A second hand-written list would be a
 #: second source of truth, and the one that drifts is always the copy.
@@ -247,6 +239,33 @@ DRIVER_SURFACE: tuple[str, ...] = tuple(sorted(name for name in dir(HardwareDriv
 #: ``self`` needs something in that slot, and it is never called or read - a
 #: driver class is graded before any instance of it exists.
 _UNBOUND_SELF = object()
+
+
+def constructor_keywords(driver_cls: type) -> tuple[str, ...]:
+    """Return every keyword *driver_cls*'s constructor binds.
+
+    Derived from the signature rather than listed anywhere, so a driver's roster
+    cannot drift from what it reads: the keywords a driver honours are the
+    parameters it declares (the constructor contract in this module's
+    docstring). A ``**kwargs`` sink contributes nothing - it binds no name and
+    reads none.
+
+    Args:
+        driver_cls: A driver class, typically one registered through
+            :func:`~strands_robots.drivers.register_native_driver`.
+
+    Returns:
+        The parameter names, sorted. Read off the class rather than off
+        ``__init__``, so the bound ``self`` is not one of them.
+    """
+    variadic = (inspect.Parameter.VAR_KEYWORD, inspect.Parameter.VAR_POSITIONAL)
+    return tuple(
+        sorted(
+            parameter.name
+            for parameter in inspect.signature(driver_cls).parameters.values()
+            if parameter.kind not in variadic
+        )
+    )
 
 
 def missing_driver_members(candidate: object) -> tuple[str, ...]:

@@ -1,9 +1,8 @@
 """LeRobotDataset recorder bridge for strands-robots.
 
-Wraps LeRobotDataset so that both real hardware (:mod:`strands_robots.robot`)
-and simulation (:mod:`strands_robots.simulation`) can produce training-ready
-datasets with
-a single add_frame() call per control step.
+Wraps LeRobotDataset so any control loop produces a training-ready dataset with
+one add_frame() call per step - a :mod:`strands_robots.simulation` backend's
+``start_recording``, or a script driving :mod:`strands_robots.robot` itself.
 
 Usage:
     recorder = DatasetRecorder.create(
@@ -25,7 +24,6 @@ import difflib
 import importlib.util
 import inspect
 import logging
-import re
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -34,12 +32,14 @@ from typing import Any
 import numpy as np
 
 from strands_robots._dyld import quiet_video_backend
+from strands_robots.dataset_source import resolve_dataset_dir
+from strands_robots.dataset_transfer import sync_dataset_to_bucket
+from strands_robots.recording_errors import RecordingFrameError
 from strands_robots.utils import (
     boolean_flag_error,
     camera_schema_key,
     lerobot_version,
     name_list_error,
-    non_negative_whole_number_error,
     partial_construction_repr,
     positive_count_error,
     positive_whole_number_error,
@@ -49,20 +49,6 @@ from strands_robots.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _quiet_backend_kwargs(dataset_cls: Any) -> dict[str, Any]:
-    """``{"video_backend": "pyav"}`` when torchcodec cannot load, else ``{}``.
-
-    For the read-back constructors, which take no ``video_backend`` from the
-    caller: the same one-line choice :func:`quiet_video_backend` makes for the
-    recorder, guarded on the LeRobot version accepting the parameter.
-    """
-    if "video_backend" not in inspect.signature(dataset_cls).parameters:
-        return {}
-    resolved = quiet_video_backend()
-    return {"video_backend": resolved} if resolved is not None else {}
-
-
-# Every LeRobot codec surface validates the requested codec against the same
 # codec-name allowlist - ``configs.video.VALID_VIDEO_CODECS = {"h264", "hevc",
 # "libsvtav1", "libaom-av1", "auto"} | HW_VIDEO_CODECS`` - and *rejects* the
 # ffmpeg library names ("libx264"/"libx265"). This holds for the current
@@ -132,251 +118,6 @@ def _codec_create_kwargs(sig_params: Any, vcodec: str, *, context: str = "create
             return {}
         return {"camera_encoder": VideoEncoderConfig(vcodec=codec)}
     return {}
-
-
-# Allowlist patterns for HF Storage Bucket sync targets. Both `bucket` and
-# `run_id` reach the `hf` CLI argv and the `hf://buckets/...` URI; they are
-# agent-reachable via stop_recording(bucket=, run_id=) dispatched through the
-# simulation action layer, so they MUST be validated before any subprocess /
-# URI interpolation (AGENTS.md > LLM Input Safety). `bucket` is "name" or
-# "org/name"; `run_id` is a single path segment. Neither may contain shell
-# metacharacters, path-traversal (".."), or separators beyond the one allowed
-# bucket "org/name" slash.
-_BUCKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)?\Z")
-_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
-
-
-def sync_dataset_to_bucket(
-    root: str | Path,
-    bucket: str,
-    run_id: str | None = None,
-    *,
-    create: bool = True,
-    private: bool = True,
-    delete: bool = False,
-) -> dict[str, Any]:
-    """Sync an on-disk LeRobotDataset into an HF Storage Bucket (Phase 1/2).
-
-    Lifecycle-independent: needs only a finalized dataset directory on disk
-    (``meta/`` present) and the ``hf`` CLI - no live
-    :class:`DatasetRecorder`, no sim world. Covers syncing a dataset
-    recorded earlier in the process, one recorded on hardware via
-    ``lerobot-record``, or a daily re-sync of a directory that grew. Both
-    :meth:`DatasetRecorder.sync_to_bucket` and the idle-path bucket sync in
-    ``stop_recording`` delegate here so input validation and CLI
-    orchestration exist exactly once.
-
-    Mutable, Xet-deduplicated dump target for COLLECTION - avoids git-LFS
-    history bloat of push_to_hub during recording. Daily re-sync uploads
-    only changed chunks (content-defined chunking). Requires the ``hf`` CLI
-    with the ``buckets``/``sync`` subcommands (``huggingface_hub>=1.5``)
-    and ``hf auth login``.
-
-    ``bucket`` and ``run_id`` are validated against an allowlist before any
-    subprocess or URI interpolation: ``bucket`` must be ``"name"`` or
-    ``"org/name"`` and ``run_id`` a single path segment, both restricted to
-    ``[A-Za-z0-9._-]`` (no path traversal or shell metacharacters). This
-    path is agent-reachable via ``stop_recording(bucket=, run_id=)``. A
-    rejected value returns ``{"status": "error", ...}`` without running ``hf``.
-
-    ``create``, ``private`` and ``delete`` select *postures* rather than
-    scaling a quantity, so each is checked against
-    :func:`~strands_robots.utils.boolean_flag_error` before the ``hf`` CLI is
-    even located - the same domain the mesh provisioning entry points apply to
-    their own capability flags. Read by truthiness they fail toward the
-    permissive posture in *both* directions, because every non-empty string is
-    truthy and every falsy non-boolean takes the other branch:
-    ``delete="false"`` - the spelling an operator reaches for when opting out -
-    appends ``--delete`` and mirror-deletes remote files absent locally, while
-    ``private=0`` drops ``--private`` and creates the bucket *public*.
-
-    The shard layout is already Xet/bucket-friendly at lerobot's defaults
-    (100 MB data parquet / 200 MB video MP4 shards), and ``meta/`` MUST
-    ship or downstream loses normalization stats.
-
-    Args:
-        root: Local dataset directory, ``str`` or ``Path`` (must contain
-            ``meta/``).
-        bucket: Bucket target, ``"name"`` or ``"org/name"``.
-        run_id: Subpath inside the bucket; defaults to the dataset directory
-            name (``Path(root).name``).
-        create: Create the bucket first (pre-existing bucket is not an error).
-            Must be a boolean.
-        private: Create the bucket as private (only used with ``create=True``).
-            Must be a boolean.
-        delete: Forward ``--delete`` to ``hf sync`` (mirror semantics -
-            remove remote files absent locally). Must be a boolean.
-
-    Returns:
-        ``{"status": "success", "bucket_uri": ...}`` or
-        ``{"status": "error", "message": ...}``. Never raises on ``hf``
-        failure; errors are surfaced in the result dict. A flag outside its
-        domain is reported the same way, without locating or running the CLI.
-    """
-    # Before the CLI probe so the same caller mistake reports identically
-    # whether or not `hf` is installed, and so a refused posture flag can
-    # never reach `hf buckets create` or `hf sync`.
-    for flag_name, flag_value in (("create", create), ("private", private), ("delete", delete)):
-        if flag_error := boolean_flag_error(flag_value, flag_name, "sync_dataset_to_bucket"):
-            return {"status": "error", "message": flag_error}
-
-    import subprocess
-
-    hf = _hf_executable()
-    if hf is None:
-        return {
-            "status": "error",
-            "message": f'`hf` CLI not found. pip install -U "{_HF_BUCKET_CLI_MIN_SPEC}" and run `hf auth login`.',
-        }
-
-    # `hf buckets` / `hf sync` need huggingface_hub>=1.5; on every older
-    # release (0.36.x, but also 1.0-1.4.x) the CLI exists and rejects those
-    # subcommands with usage noise. Gate on the installed package version so
-    # users get an upgrade instruction instead.
-    version_error = _huggingface_hub_version_error()
-    if version_error is not None:
-        return {"status": "error", "message": version_error}
-
-    if not _BUCKET_RE.match(bucket):
-        return {
-            "status": "error",
-            "message": f"invalid bucket {bucket!r}: must match "
-            "'name' or 'org/name' using [A-Za-z0-9._-] (no path traversal "
-            "or shell metacharacters).",
-        }
-
-    local_root = str(root)
-    # meta/ must ship or downstream loses normalization stats.
-    if not (Path(local_root) / "meta").exists():
-        return {
-            "status": "error",
-            "message": f"No meta/ under {local_root}; the dataset was never finalized. "
-            "Call finalize() (stop_recording does this) before syncing to a bucket "
-            "(stats/info required for streaming/training).",
-        }
-
-    run_id = run_id or Path(local_root).name
-    if not _RUN_ID_RE.match(run_id):
-        return {
-            "status": "error",
-            "message": f"invalid run_id {run_id!r}: must be a single path "
-            "segment using [A-Za-z0-9._-] (no '/', path traversal, or shell "
-            "metacharacters).",
-        }
-    dest = f"hf://buckets/{bucket}/{run_id}"
-
-    if create:
-        cp = subprocess.run(
-            [hf, "buckets", "create", bucket] + (["--private"] if private else []),
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-        blob = (cp.stderr + cp.stdout).lower()
-        # An already-created bucket is the normal case for a daily re-sync, so it
-        # must not fail the sync. The hub reports it as "You already created this
-        # bucket repo" with a 409, which does not contain "exists" - match the
-        # status code and both phrasings rather than one substring.
-        already_exists = "exist" in blob or "409" in blob or "already created" in blob
-        if cp.returncode != 0 and not already_exists:
-            return {
-                "status": "error",
-                "message": f"bucket create failed: {cp.stderr.strip()}",
-            }
-
-    cmd = [hf, "sync", local_root, dest]
-    if delete:
-        cmd.append("--delete")
-    logger.info("Syncing %s -> %s", local_root, dest)
-    proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-    if proc.returncode != 0:
-        return {
-            "status": "error",
-            "message": proc.stderr.strip() or proc.stdout.strip(),
-        }
-
-    return {"status": "success", "bucket_uri": dest}
-
-
-def _hf_executable() -> str | None:
-    """Resolve the ``hf`` CLI, preferring the one in the running interpreter's
-    environment before falling back to PATH.
-
-    ``huggingface_hub`` installs the ``hf`` entry point next to the active
-    Python (e.g. inside a virtualenv's ``bin``/``Scripts``). A bare ``hf`` on
-    PATH is only found when that environment is also on PATH, which is often not
-    the case for a subprocess launched from a venv whose ``bin`` was never
-    activated. Checking ``sys.executable``'s directory first makes
-    ``sync_to_bucket`` work from any environment where ``huggingface_hub`` is
-    installed, not just an activated one. Returns ``None`` if no ``hf`` is found.
-    """
-    import shutil
-
-    exe_dir = Path(sys.executable).parent
-    for name in ("hf", "hf.exe"):
-        candidate = exe_dir / name
-        if candidate.exists():
-            return str(candidate)
-    return shutil.which("hf")
-
-
-#: Oldest ``huggingface_hub`` release whose ``hf`` CLI carries the
-#: ``hf buckets`` / ``hf sync`` subcommands :func:`sync_dataset_to_bucket`
-#: invokes.
-#:
-#: They first ship in 1.5.0, as ``huggingface_hub/cli/buckets.py`` registered by
-#: ``cli/hf.py`` (``app.add_group(buckets_cli, name="buckets")`` and
-#: ``app.command()(sync)``). 1.0-1.4.x install the ``hf`` entry point without
-#: that module, so they answer both invocations with
-#: ``Error: No such command 'buckets'`` / ``'sync'``.
-#:
-#: This is the single source of the floor: the version gate below, the upgrade
-#: instructions it and :func:`sync_dataset_to_bucket` emit, and the pin the
-#: ``[wbc]`` extra declares are all checked against it, so the accepted domain
-#: cannot drift from the release that can actually honor a bucket sync.
-_HF_BUCKET_CLI_MIN_VERSION = (1, 5)
-
-#: The requirement string every bucket-sync upgrade instruction quotes, derived
-#: from :data:`_HF_BUCKET_CLI_MIN_VERSION` so the advice cannot name a release
-#: that does not ship the subcommands.
-_HF_BUCKET_CLI_MIN_SPEC = "huggingface_hub>=" + ".".join(str(part) for part in _HF_BUCKET_CLI_MIN_VERSION)
-
-
-def _huggingface_hub_version_error() -> str | None:
-    """Return an actionable error message if ``huggingface_hub`` is too old for bucket sync.
-
-    The ``hf buckets`` / ``hf sync`` subcommands ship in
-    :data:`_HF_BUCKET_CLI_MIN_VERSION` and later. On any older release - the
-    0.36.x stable line, but equally 1.0-1.4.x - the ``hf`` binary exists, so
-    :func:`_hf_executable` succeeds, but the subcommands fail with usage noise
-    (``Error: No such command 'buckets'``) that gives no hint the fix is an
-    upgrade. Version-checking the installed package up front turns that noise
-    into a clear upgrade instruction without spawning a subprocess.
-
-    Returns ``None`` (no error) when:
-
-    - the installed version is >= :data:`_HF_BUCKET_CLI_MIN_VERSION`, or
-    - ``huggingface_hub`` is not importable in this interpreter (the ``hf``
-      binary may come from a different environment on PATH whose version we
-      cannot see; the normal subprocess error path still applies), or
-    - the version string is unparseable (fail open rather than block a
-      possibly-capable CLI on a cosmetic version format).
-    """
-    try:
-        import huggingface_hub
-    except ImportError:
-        return None
-
-    version = getattr(huggingface_hub, "__version__", "")
-    match = re.match(r"(\d+)\.(\d+)", version)
-    if match is None:
-        return None
-    if (int(match.group(1)), int(match.group(2))) >= _HF_BUCKET_CLI_MIN_VERSION:
-        return None
-    return (
-        f"bucket sync requires {_HF_BUCKET_CLI_MIN_SPEC} (`hf buckets`/`hf sync`); "
-        f"installed: {version}. pip install -U '{_HF_BUCKET_CLI_MIN_SPEC}'."
-    )
 
 
 # Lazy check for LeRobot availability.
@@ -563,87 +304,6 @@ def _get_lerobot_dataset_class():
         # instruction for three of the four: lerobot is installed, so the
         # command names a package that is already there and changes nothing.
         raise ImportError(f"{_describe_lerobot_import_failure(exc)}\nRequired for LeRobotDataset recording.") from exc
-
-
-def _lerobot_home() -> Path:
-    """Return LeRobot's on-disk dataset home (``$HF_LEROBOT_HOME``).
-
-    Uses lerobot's own ``HF_LEROBOT_HOME`` constant when importable so the
-    resolved path matches exactly where ``LeRobotDataset`` reads/writes
-    (honouring the ``HF_LEROBOT_HOME`` environment override). Falls back to the
-    documented default ``~/.cache/huggingface/lerobot`` when lerobot is absent.
-    """
-    try:
-        from lerobot.utils.constants import HF_LEROBOT_HOME
-
-        return Path(HF_LEROBOT_HOME)
-    except (ImportError, ValueError, RuntimeError):
-        return Path.home() / ".cache" / "huggingface" / "lerobot"
-
-
-def local_dataset_dir(repo_id: str) -> Path | None:
-    """The local directory a ``repo_id`` that is itself a path names.
-
-    A ``repo_id`` that is absolute, ``./``-prefixed, or carries no
-    ``owner/name`` slash is read as a local directory. That reading is this
-    repo's, not LeRobot's - ``LeRobotDataset`` resolves any absent root to
-    ``$HF_LEROBOT_HOME/{repo_id}`` whatever the id looks like - so these are
-    exactly the ids whose directory this repo has to state on every surface that
-    opens a dataset by id. Stating it on some of them and not others puts the
-    directory written to and the directory read back in two different places.
-
-    Args:
-        repo_id: HuggingFace dataset id (``owner/name``) or a local path.
-
-    Returns:
-        The directory the id names, or None for an ``owner/name`` Hub id.
-
-        ``None`` is a resolution, not a gap: that id's directory is LeRobot's to
-        derive, and a *reader* must leave it there. An absent root is how
-        LeRobot selects the revision-safe Hub snapshot cache for a download
-        (``snapshot_download(cache_dir=HF_LEROBOT_HUB_CACHE)``); naming the
-        directory instead switches it to a plain ``local_dir=`` materialization
-        and skips the re-download a legacy on-disk layout triggers. A *writer*
-        must never open that shared cache, which is why
-        :func:`resolve_dataset_dir` names ``$HF_LEROBOT_HOME/{repo_id}`` for the
-        same id - the two are the same directory whenever it already exists
-        locally, and they differ only in who owns a download.
-    """
-    if "/" not in repo_id or repo_id.startswith("/") or repo_id.startswith("./"):
-        return Path(repo_id)
-    return None
-
-
-def resolve_dataset_dir(repo_id: str, root: str | None = None) -> Path:
-    """Resolve the on-disk directory a dataset will be WRITTEN to.
-
-    * explicit ``root`` -> used verbatim;
-    * a ``repo_id`` that is itself a path -> the directory it names
-      (:func:`local_dataset_dir`);
-    * otherwise ``$HF_LEROBOT_HOME/{repo_id}``.
-
-    Every writing entry point hands the result down as an explicit ``root``
-    rather than letting LeRobot resolve a second time - otherwise the directory
-    inspected before the write and the directory written to are two different
-    places for exactly the ids the middle rule covers.
-
-    This is the writer's resolution: the third rule names a concrete directory
-    for a Hub id because a writer must not be handed LeRobot's shared snapshot
-    cache. A reader resolves the middle rule only and leaves the third to
-    LeRobot; see :func:`local_dataset_dir` on why the two differ.
-
-    Args:
-        repo_id: HuggingFace dataset id (``owner/name``) or a local path.
-        root: Explicit local dataset directory, if any.
-
-    Returns:
-        The resolved dataset directory as a :class:`~pathlib.Path`.
-    """
-    if root:
-        return Path(root)
-    if (local := local_dataset_dir(repo_id)) is not None:
-        return local
-    return _lerobot_home() / repo_id
 
 
 def _prepare_create_target(dataset_dir: Path, *, overwrite: bool) -> None:
@@ -972,25 +632,6 @@ def _frame_shape_error(
     return None
 
 
-class RecordingFrameError(RuntimeError):
-    """A frame the dataset recorder could not write, in fail-fast mode.
-
-    Raised by :meth:`DatasetRecorder.add_frame` when the underlying
-    ``LeRobotDataset`` write fails and the recorder was constructed with
-    ``strict=True`` (the default). The frame is already gone at that point, so
-    the episode on disk is shorter than the rollout that produced it and every
-    surviving frame is re-timestamped from the declared ``fps`` - the caller has
-    to be told.
-
-    A distinct type, rather than the underlying error, so a rollout driver can
-    tell a lost recording frame apart from a failure in a caller's telemetry
-    hook. The drivers deliberately tolerate a few consecutive telemetry
-    failures; granting that tolerance to a lost recording frame truncates the
-    dataset while the rollout still reports success. The originating error is
-    chained and its text preserved.
-    """
-
-
 class DatasetRecorder:
     """Bridge between strands-robots control loops and LeRobotDataset.
 
@@ -1176,7 +817,7 @@ class DatasetRecorder:
             task: Default task description
             root: Local directory for dataset storage. When omitted, the
                 directory is resolved by
-                :func:`~strands_robots.dataset_recorder.resolve_dataset_dir`
+                :func:`~strands_robots.dataset_source.resolve_dataset_dir`
                 and forwarded to ``LeRobotDataset.create`` explicitly, so the
                 target ``overwrite`` inspects is the target the dataset is
                 written to.
@@ -1436,6 +1077,8 @@ class DatasetRecorder:
         image_writer_threads: int = 4,
         video_backend: str | None = None,
         camera_key_map: dict[str, str] | None = None,
+        joint_names: list[str] | None = None,
+        extra_state_specs: list[tuple[str, list[str]]] | None = None,
     ) -> "DatasetRecorder":
         """Resume recording into an EXISTING LeRobotDataset (append episodes).
 
@@ -1457,7 +1100,7 @@ class DatasetRecorder:
             repo_id: HuggingFace dataset ID (same as the original recording).
             root: Local dataset directory. When omitted, the directory this
                 ``repo_id`` resolves to
-                (:func:`~strands_robots.dataset_recorder.resolve_dataset_dir`) -
+                (:func:`~strands_robots.dataset_source.resolve_dataset_dir`) -
                 the same one :meth:`create` writes to, so the id that created a
                 dataset reopens it. It is forwarded to LeRobot as an explicit
                 root either way; LeRobot refuses an absent one, because the
@@ -1476,6 +1119,16 @@ class DatasetRecorder:
                 Encoder selection is controlled by ``vcodec`` (not this param).
             camera_key_map: Optional remap of observed camera stream names to
                 the declared schema names (see create()).
+            joint_names: The scalar state keys, in schema order - the same list
+                :meth:`create` recorded the dataset with. Only read alongside
+                ``extra_state_specs``.
+            extra_state_specs: The vector state sources the dataset was created
+                with, as ``(source_key, [components])``. Pass whatever was
+                passed to :meth:`create`: a resumed recorder inherits the
+                EXPANDED column names from disk but cannot recover the source
+                keys they were flattened from, and ``add_frame`` reads the
+                sources. Omitting them for a dataset that has vector columns
+                records zeros in every one of them, silently.
 
         Returns:
             A DatasetRecorder wrapping the resumed dataset.
@@ -1533,6 +1186,31 @@ class DatasetRecorder:
 
         dataset = LeRobotDatasetCls.resume(**resume_kwargs)
         recorder = cls(dataset=dataset, task=task, camera_key_map=camera_key_map)
+        # The same source-key knowledge :meth:`create` records, for the same
+        # reason - and it has to be passed in, because a resumed recorder cannot
+        # derive it from the dataset it opens.
+        #
+        # ``add_frame`` reads the SOURCE keys (``base_pos``) and flattens each
+        # into the expanded schema columns (``base_pos.x`` ...). Left unset, the
+        # fallback below it reads the EXPANDED names off the on-disk schema, and
+        # an observation carrying ``base_pos`` as a vector answers ``None`` to
+        # every one of them - so the zero-fill fires per component, per frame,
+        # and every appended episode records the base at the origin, at rest.
+        # The vector length still matches the schema and the backends' hooks
+        # pass ``required_action_keys``, which disables the missing-column
+        # refusal, so nothing raises and nothing logs: a resumed floating-base
+        # episode is silently unusable for the locomotion training it was
+        # recorded for. Measured before this line existed: an observation with
+        # ``base_pos=[1.0, 2.0, 9.0]`` recorded ``[0, 0, 0]`` on the append while
+        # the joint columns beside it recorded correctly, which is what kept it
+        # invisible.
+        #
+        # All three simulation backends pass ``extra_state_specs`` to
+        # :meth:`create` and call :meth:`resume`, so this belongs here rather
+        # than in any one of them.
+        if extra_state_specs:
+            scalar_source = list(joint_names) if joint_names else []
+            recorder._state_source_keys = scalar_source + [k for k, _ in extra_state_specs]
         # Seed counters from the existing dataset so reporting reflects totals.
         try:
             recorder.episode_count = int(dataset.meta.total_episodes)
@@ -2148,127 +1826,3 @@ class DatasetRecorder:
             return f"DatasetRecorder(repo_id={self.repo_id}, episodes={self.episode_count}, frames={self.frame_count})"
         except AttributeError:
             return partial_construction_repr(self)
-
-
-# Shared replay-episode helpers
-
-
-def load_lerobot_episode(repo_id: str, episode: int = 0, root: str | None = None):
-    """Load a LeRobotDataset and resolve the frame range for an episode.
-
-    Args:
-        repo_id: HuggingFace dataset id.
-        episode: Episode index, a non-negative whole number. Any real scalar
-            with an integral value is accepted (a ``2.0`` from a config, a
-            ``np.int64`` from arithmetic); the value is coerced with ``int()``
-            once the shared guard has round-tripped it, so an accepted index
-            reaches the O(1) episode-row lookup rather than the last-resort
-            frame scan a float index falls through to.
-        root: Local dataset directory. When omitted, a ``repo_id`` that is
-            itself a path is read as the directory it names - the same one the
-            recording entry points write to, so the id that recorded a dataset
-            reads it back. An ``owner/name`` id keeps an absent root so LeRobot
-            resolves its own revision-safe cache
-            (:func:`~strands_robots.dataset_recorder.local_dataset_dir`).
-
-    Returns:
-        Tuple of (dataset, episode_start, episode_length) on success.
-
-    Raises:
-        ImportError: If lerobot is not installed.
-        ValueError: If the episode index is not a usable non-negative whole
-            number, is out of range, or the resolved episode has no frames.
-    """
-    # The domain is the shared non-negative whole-number rule, not a bare
-    # ``< 0`` test. That test gave a verdict to three classes of value it
-    # could not actually honor:
-    #
-    # * ``bool`` passed it (``True < 0`` is False) and then indexed the
-    #   episode table as an int, so ``episode=True`` resolved **episode 1**
-    #   and returned it as a success - a different episode than any caller
-    #   passing a flag could have meant.
-    # * A non-integral or non-finite value passed it too and was blamed on
-    #   the dataset after a full-length boundary scan ("Episode 2.5 has no
-    #   frames"), naming the data rather than the index.
-    # * A str/list/None reached the comparison itself and raised
-    #   ``TypeError``, which is not the ``ValueError`` this function
-    #   documents as its refusal channel.
-    #
-    # Shared with the ``replay_episode`` teleop knob rather than restated:
-    # that parameter is the same quantity on a neighbouring surface, and
-    # ``non_negative_whole_number_error`` already names it.
-    if msg := non_negative_whole_number_error(episode, "episode", "load_lerobot_episode"):
-        raise ValueError(msg)
-    # Safe because the guard performed this coercion and compared the result
-    # back; see its docstring on why the two steps are ordered this way.
-    episode = int(episode)
-
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    # The directory to read, resolved by the same rule the recording was written
-    # through. A ``repo_id`` that is itself a path is a local directory here as
-    # it is there (:func:`local_dataset_dir`); forwarding the caller's ``None``
-    # unresolved sent the read somewhere the recording never was, because
-    # LeRobot reads an absent root as ``$HF_LEROBOT_HOME/{repo_id}`` whatever
-    # the id looks like. So the id that recorded a dataset could not read it
-    # back: the miss falls through to a Hub lookup for a dataset name that only
-    # ever named a directory.
-    #
-    # Only that rule is resolved here. An ``owner/name`` id keeps its absent
-    # root, which is how LeRobot selects the revision-safe snapshot cache for a
-    # download - and it already reads back what a local write put at
-    # ``$HF_LEROBOT_HOME/{repo_id}``, since that is the same directory LeRobot
-    # derives. Resolving it here would move Hub downloads out of that cache for
-    # no gain.
-    read_root = Path(root) if root else local_dataset_dir(repo_id)
-    ds = LeRobotDataset(
-        repo_id=repo_id,
-        root=str(read_root) if read_root is not None else None,
-        **_quiet_backend_kwargs(LeRobotDataset),
-    )
-
-    num_episodes = ds.meta.total_episodes if hasattr(ds.meta, "total_episodes") else len(ds.meta.episodes)
-    if episode >= num_episodes:
-        raise ValueError(f"Episode {episode} out of range (0-{num_episodes - 1})")
-
-    episode_start = 0
-    episode_length = 0
-    try:
-        ep_info = ds.meta.episodes[episode] if hasattr(ds.meta, "episodes") else {}
-        if "dataset_from_index" in ep_info:
-            # LeRobot 0.6 records the range on the episode's own metadata row,
-            # so this is one row read whatever the index is. Every lerobot in
-            # the declared range writes those columns, which is why this rung
-            # leads: the two below it are compatibility fallbacks, and the
-            # ``length`` accumulation reads one row per *preceding* episode to
-            # recompute a number this row already states.
-            episode_start = int(ep_info["dataset_from_index"])
-            episode_length = int(ep_info["dataset_to_index"]) - episode_start
-        elif hasattr(ds, "episode_data_index"):
-            from_idx = ds.episode_data_index["from"][episode].item()
-            to_idx = ds.episode_data_index["to"][episode].item()
-            episode_start = from_idx
-            episode_length = to_idx - from_idx
-        else:
-            for i in range(episode):
-                prior_info = ds.meta.episodes[i] if hasattr(ds.meta, "episodes") else {}
-                episode_start += prior_info.get("length", 0)
-            episode_length = ep_info.get("length", 0)
-    except Exception:
-        # Last resort: scan frames to find episode boundaries
-        for idx in range(len(ds)):
-            frame = ds[idx]
-            frame_ep = frame.get("episode_index", -1) if hasattr(frame, "get") else -1
-            if hasattr(frame_ep, "item"):
-                frame_ep = frame_ep.item()
-            if frame_ep == episode:
-                if episode_length == 0:
-                    episode_start = idx
-                episode_length += 1
-            elif episode_length > 0:
-                break
-
-    if episode_length == 0:
-        raise ValueError(f"Episode {episode} has no frames")
-
-    return ds, episode_start, episode_length

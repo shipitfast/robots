@@ -17,10 +17,9 @@ on import.
 import logging
 
 from strands_robots.drivers.base import (
-    DEFAULT_DRIVER,
-    DRIVER_CHOICES,
     DRIVER_SURFACE,
     HardwareDriver,
+    constructor_keywords,
     drifted_driver_parameters,
     halt_failure_detail,
     missing_driver_members,
@@ -64,6 +63,7 @@ _SHIPPED_DRIVERS: tuple[tuple[str, str, tuple[str, ...] | str], ...] = (
     ("strands_robots.drivers.ur", "URDriver", "SUPPORTED_ROBOTS"),
     ("strands_robots.drivers.crazyflie", "CrazyflieDriver", "SUPPORTED_ROBOTS"),
     ("strands_robots.drivers.earthrover", "EarthRoverDriver", "SUPPORTED_ROBOTS"),
+    ("strands_robots.drivers.yahboom_m3pro", "YahboomM3ProDriver", "SUPPORTED_ROBOTS"),
 )
 
 
@@ -131,10 +131,9 @@ def _register_shipped_drivers() -> None:
 _register_shipped_drivers()
 
 __all__ = [
-    "DEFAULT_DRIVER",
-    "DRIVER_CHOICES",
     "DRIVER_SURFACE",
     "HardwareDriver",
+    "constructor_keywords",
     "drifted_driver_parameters",
     "driver_choice_error",
     "get_native_driver_class",
