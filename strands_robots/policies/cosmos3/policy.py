@@ -64,6 +64,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from strands_robots.policies._log_safety import sanitize_log_value
 from strands_robots.policies._state_keys import drop_velocity_siblings
 from strands_robots.policies.base import Policy
 from strands_robots.utils import dial_host_error, name_list_error, tcp_port_error
@@ -652,8 +653,10 @@ class Cosmos3Policy(Policy):
                 "observation; reading the joint state from the observation's own position keys "
                 "%s instead. Call set_robot_state_keys() with the observed joint names to bind "
                 "them explicitly.",
-                self.robot_state_keys[:8],
-                order,
+                # %s over the sanitized repr renders what %r rendered, with the
+                # observation-derived key names' line breaks escaped (alerts 1281/1282).
+                sanitize_log_value(repr(self.robot_state_keys[:8])),
+                sanitize_log_value(repr(order)),
             )
             self._state_key_mismatch_warned = True
         return order
