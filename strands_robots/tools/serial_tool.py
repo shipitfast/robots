@@ -162,6 +162,18 @@ _OPTIONS_BY_ACTION: dict[str, tuple[str, ...]] = {
 _ACTIONS: tuple[str, ...] = ("list_ports", *_OPTIONS_BY_ACTION)
 
 
+def _unknown_action_error(action: str) -> dict[str, Any]:
+    """The refusal for an action name outside ``_ACTIONS``.
+
+    Owned here so the gate ahead of the port check and the exhaustiveness
+    terminal of the dispatch chain render one message.
+    """
+    return {
+        "status": "error",
+        "content": [{"text": f"Unknown action: {action}\nAvailable: {', '.join(_ACTIONS)}"}],
+    }
+
+
 def _register_field_error(value: Any, param: str, action: str) -> str | None:
     """Error text when ``value`` cannot be encoded into its Feetech register field.
 
@@ -450,10 +462,7 @@ def serial_tool(
         if action not in _ACTIONS:
             # Graded before the port check: an action that does not exist must
             # not dial the bus (opening a USB-serial port asserts DTR).
-            return {
-                "status": "error",
-                "content": [{"text": f"Unknown action: {action}\nAvailable: {', '.join(_ACTIONS)}"}],
-            }
+            return _unknown_action_error(action)
 
         if action == "list_ports":
             ports = list_serial_ports()
@@ -620,9 +629,10 @@ def serial_tool(
             else:
                 return {"status": "error", "content": [{"text": f"Feetech Motor {motor_id} no response"}]}
 
-        else:
-            # action == "monitor", the one name left in _ACTIONS after the
-            # refusal above. Continuous monitoring (limited time for safety).
+        elif action == "monitor":
+            # An explicit comparison, not a trailing else: the dispatched-
+            # vocabulary grader derives the served set from these literals.
+            # Continuous monitoring (limited time for safety).
             monitor_data = []
             # The safety window is a duration, so it is measured on
             # time.monotonic(); each record's ``timestamp`` below stays on the
@@ -651,6 +661,14 @@ def serial_tool(
                     {"json": {"monitor_data": monitor_data}},
                 ],
             }
+
+        else:
+            # Unreachable once the gate above has run: every name in _ACTIONS
+            # has a branch. Kept as the chain's exhaustiveness terminal so the
+            # return type is total, and it releases the port like every other
+            # refusal past this point.
+            ser.close()
+            return _unknown_action_error(action)
 
     except serial.SerialException as e:
         return {"status": "error", "content": [{"text": f"Serial error: {e}"}]}
