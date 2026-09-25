@@ -1488,6 +1488,35 @@ class LerobotLocalPolicy(Policy):
                 # packed as degrees, so the stats-only remedy leaves
                 # observation.state a near-constant. The warning names both.
                 inert = bridge.inert_normalization_features()
+                # Worse than the passthrough on its own: a DECLARED embodiment whose
+                # state_units/action_units are not native writes its conversion into
+                # the very tensor the inert normalizer then leaves alone, so the
+                # converted value reaches the model raw. Measured on so101's MJCF
+                # joint range: the degrees pack reaches 160.0 where the native pack
+                # reaches 2.79 and the checkpoint was trained on ~1 sigma. The
+                # warning below prescribes exactly this unit half, so a caller who
+                # already declared it is advised to do what they did. Both halves are
+                # known here, so refuse and name them - the same posture the
+                # mismatched-width guard above takes.
+                embodiment = self._embodiment
+                if inert and embodiment is not None and embodiment.converts_units:
+                    raise ValueError(
+                        f"lerobot_local: embodiment {embodiment.name!r} converts units "
+                        f"(state_units={embodiment.state_units!r}, "
+                        f"action_units={embodiment.action_units!r}), but "
+                        f"{self.pretrained_name_or_path or '<model>'} has an ACTIVE normalization "
+                        f"pipeline whose stats do not cover {inert}, so nothing scales the "
+                        "conversion back: the converted state reaches the model unscaled (the "
+                        "so101 joint range packs to 160.0 where packing it natively reaches 2.79 "
+                        "and the checkpoint was trained on ~1 sigma) and the predicted action is "
+                        "un-unnormalized before being converted back. Supply the training "
+                        "dataset's stats for BOTH sides -- processor_overrides="
+                        "{'normalizer_processor': {'stats': <dataset stats>}, "
+                        "'unnormalizer_processor': {'stats': <dataset stats>}} -- or drop the "
+                        "conversion and let the native values through: call "
+                        "set_robot_state_keys([...]) to bind the keys, or pass an embodiment "
+                        "whose state_units/action_units are 'native'."
+                    )
                 if inert:
                     # The stats LeRobot could not find are usually IN this
                     # checkpoint under dataset-prefixed keys. Name them: a
@@ -2221,8 +2250,9 @@ class LerobotLocalPolicy(Policy):
             # Written onto the config, because that is the only place lerobot
             # reads it: ``RTCInferenceMixin`` takes the ceiling from
             # ``self.rtc_config.max_guidance_weight``, and the RTC kwarg
-            # contract (``ActionSelectKwargs``) carries only ``inference_delay``,
-            # ``prev_chunk_left_over`` and ``execution_horizon``. Kept only on
+            # contract - the ``TypedDict`` ``predict_action_chunk`` unpacks -
+            # carries only ``inference_delay``, ``prev_chunk_left_over`` and
+            # ``execution_horizon``. Kept only on
             # this policy - as it was - the caller's ceiling reached the INFO
             # line below and nothing else, so a checkpoint tuned with a ``2.0``
             # ceiling ran the model's own ``10.0``. The horizon needs no
@@ -3009,7 +3039,11 @@ class LerobotLocalPolicy(Policy):
             # and, once a declared embodiment has already been rejected at load
             # time, no embodiment at all, since re-passing that one is the same
             # loop reached through obs_rename rather than state_keys.
-            + state_key_remedy(scalar_keys, embodiment_rejected=self._embodiment_config_failed)
+            + state_key_remedy(
+                scalar_keys,
+                embodiment_rejected=self._embodiment_config_failed,
+                normalization_inert=self._normalization_is_inert(),
+            )
         )
         if self.strict_keys:
             raise ValueError("strict_keys=True: " + msg)
@@ -3021,6 +3055,22 @@ class LerobotLocalPolicy(Policy):
             logger.warning("%s", sanitize_log_value(msg))
             self._state_key_mismatch_warned = True
         return drop_velocity_siblings(scalar_keys)
+
+    def _normalization_is_inert(self) -> bool:
+        """Whether this policy declares a normalization no stats back.
+
+        The unit half of a state-key remedy: with an inert normalization,
+        recommending an ``embodiment=`` that converts units hands the caller a
+        rescale nothing undoes. One reader of
+        :meth:`~strands_robots.policies.lerobot_local.processor.ProcessorBridge.inert_normalization_features`
+        for both mismatch guards, so they cannot advise differently.
+
+        Returns:
+            ``True`` when a bridge is loaded and reports a declared
+            normalization its stats do not cover.
+        """
+        bridge = self._processor_bridge
+        return bool(bridge is not None and bridge.inert_normalization_features())
 
     def _collect_state_values(self, observation_dict: dict[str, Any], order: list[str]) -> list[float]:
         """Pull the joint-state vector from ``observation_dict`` in ``order``.
@@ -3087,6 +3137,7 @@ class LerobotLocalPolicy(Policy):
                 + state_key_remedy(
                     observed_state_keys(observation_dict),
                     embodiment_rejected=self._embodiment_config_failed,
+                    normalization_inert=self._normalization_is_inert(),
                 )
                 # Same registry-checked remedy as the all-missing guard, so one
                 # rule serves both degradations.

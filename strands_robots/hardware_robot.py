@@ -36,11 +36,9 @@ import asyncio
 import dataclasses
 import difflib
 import functools
-import importlib
 import logging
 import math
 import os
-import pkgutil
 import shutil
 import threading
 import time
@@ -69,6 +67,7 @@ from strands_robots.utils import (
     boolean_flag_error,
     camera_token_error,
     dds_domain_id_error,
+    ensure_lerobot_family_registered,
     positive_count_error,
     positive_finite_number_error,
     refusal_repr,
@@ -135,18 +134,6 @@ _RCLPY_TRANSPORT_INSTALL_HINT = (
 
 
 # ---------------------------------------------------------------------------
-# Lazy lerobot RobotConfig registration helper.
-# ---------------------------------------------------------------------------
-#
-# lerobot's robot drivers register themselves with ``RobotConfig`` (a
-# draccus ``ChoiceRegistry``) via ``@RobotConfig.register_subclass(...)``
-# at module import time. Because ``lerobot.robots.__init__`` does not
-# eagerly import every subpackage, the registry is empty until something
-# triggers the import. ``_create_minimal_config`` calls this helper once
-# per process to populate it. ``@functools.cache`` makes the second call
-# a dict lookup, so the per-Robot() overhead amortises to ~0.
-
-
 # Cross-robot kwargs forwarded to lerobot config constructors.  Exposed
 # as a module-level constant so tests can import it (single source of
 # truth).
@@ -233,63 +220,6 @@ _CAMERA_TYPE_KEY = "type"
 _ADDRESS_FIELDS = ("ip_address", "remote_ip", "robot_ip", "host")
 
 
-@functools.cache
-def _ensure_lerobot_cameras_registered() -> None:
-    """Import every camera backend subpackage so CameraConfig is populated.
-
-    The mirror of :func:`_ensure_lerobot_robots_registered`, and for the same
-    reason: each backend registers its config via
-    ``@CameraConfig.register_subclass`` at module-import time, but
-    ``lerobot.cameras.__init__`` deliberately does not import them -- it says so
-    in a comment, to avoid pulling backend-specific dependencies into every
-    ``import lerobot``. Until they are imported ``CameraConfig`` has *no*
-    registered choices at all, so a registry lookup that skips this step reports
-    every camera type as unknown.
-
-    Walks ``lerobot.cameras`` with ``pkgutil`` so a backend lerobot adds in a
-    future release needs no change here, then registers third-party
-    ``lerobot_camera_*`` distributions through lerobot's own plugin loader.
-
-    Idempotent via ``@functools.cache`` -- the first call walks the tree,
-    subsequent calls are dict lookups.
-    """
-    try:
-        import lerobot.cameras as _lr_cameras
-    except ImportError as exc:
-        # Mirrors the robot walk: lerobot wholly absent is expected on
-        # sim-only hosts (debug), while lerobot present but
-        # ``lerobot.cameras`` unimportable is a partial install worth a
-        # warning. Either way the caller gets a clean "Unsupported camera
-        # type" naming the choices that did register.
-        try:
-            import lerobot  # noqa: F401  (probe-only)
-        except ImportError:
-            logger.debug("lerobot not installed: %s", exc)
-        else:
-            logger.warning(
-                "lerobot is installed but lerobot.cameras is not importable (partial install?): %s",
-                exc,
-            )
-        return
-
-    for _, sub_name, is_pkg in pkgutil.iter_modules(_lr_cameras.__path__):
-        if not is_pkg:
-            continue
-        full_name = f"{_lr_cameras.__name__}.{sub_name}"
-        try:
-            importlib.import_module(full_name)
-        except (ImportError, OSError) as exc:
-            # A backend whose SDK is absent (``pyrealsense2``, ``reachy2_sdk``)
-            # or whose ``__init__`` probes the OS. It simply does not appear in
-            # the choice registry, which is the correct outcome: naming it later
-            # raises "Unsupported camera type" listing what is available.
-            # ``(ImportError, OSError)`` is the canonical narrow pair for a
-            # hardware-probing import per AGENTS.md > Review Learnings (#86).
-            logger.debug("[hardware_robot] skip %s: %s", full_name, exc)
-
-    _ensure_lerobot_plugins_registered()
-
-
 def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
     """Resolve a camera ``type`` to the lerobot config class it names.
 
@@ -310,7 +240,7 @@ def _resolve_camera_config_class(camera_name: str, cam_type: Any) -> type:
     """
     from lerobot.cameras.configs import CameraConfig
 
-    _ensure_lerobot_cameras_registered()
+    ensure_lerobot_family_registered("cameras")
     try:
         return cast(type, CameraConfig.get_choice_class(cam_type))
     except (KeyError, TypeError):
@@ -545,110 +475,6 @@ def _normalize_max_relative_target(value: Any, robot_type: str) -> float | dict[
     if err := positive_finite_number_error(value, param, context):
         raise ValueError(f"{err} {advice}")
     return float(value)
-
-
-@functools.cache
-def _ensure_lerobot_robots_registered() -> None:
-    """Import every robot driver subpackage so RobotConfig is populated.
-
-    Walks ``lerobot.robots`` with ``pkgutil`` so we automatically pick up
-    every robot lerobot ships -- past, present, and future -- including
-    those whose ``robot_type`` doesn't match its subpackage name (e.g.
-    ``hope_jr_arm`` in ``hope_jr/``, ``lekiwi_client`` in ``lekiwi/``,
-    ``so100_follower`` and ``so101_follower`` both in ``so_follower/``).
-    Then invokes lerobot's third-party plugin loader so any installed
-    ``lerobot_robot_*`` distribution registers itself too.
-
-    Idempotent via ``@functools.cache`` -- the first call walks the tree,
-    subsequent calls are dict lookups.
-    """
-    try:
-        import lerobot.robots as _lr_robots
-    except ImportError as exc:
-        # Distinguish two failure modes so the log level matches signal
-        # value:
-        #   1. lerobot wholly absent -- expected on sim-only / CI-only
-        #      hosts that never reach hardware code; debug is enough.
-        #      Caller will get a clean ``Unsupported robot type`` at the
-        #      ChoiceRegistry lookup site.
-        #   2. lerobot present but ``lerobot.robots`` unimportable --
-        #      genuine partial-install signal worth a warning so the
-        #      operator can triage without ``--log-level=DEBUG``.
-        try:
-            import lerobot  # noqa: F401  (probe-only)
-        except ImportError:
-            logger.debug("lerobot not installed: %s", exc)
-        else:
-            logger.warning(
-                "lerobot is installed but lerobot.robots is not importable (partial install?): %s",
-                exc,
-            )
-        return
-
-    # Walk every immediate subpackage of ``lerobot.robots`` and import
-    # it. Each subpackage's ``__init__`` (or its ``config_*`` module)
-    # runs the ``@RobotConfig.register_subclass(...)`` decorator as a
-    # side effect.
-    for _, sub_name, is_pkg in pkgutil.iter_modules(_lr_robots.__path__):
-        if not is_pkg:
-            continue
-        full_name = f"{_lr_robots.__name__}.{sub_name}"
-        try:
-            importlib.import_module(full_name)
-        except (ImportError, OSError) as exc:
-            # Driver-specific runtime dep missing (e.g. ``unitree_sdk2py``,
-            # ``reachy2_sdk``) OR an OS-level probe failure inside a
-            # driver's ``__init__`` (USB enumeration in ``unitree_sdk2py``
-            # raising ``OSError``, ``FileNotFoundError`` on a missing SDK
-            # config, etc.). Robot simply won't appear in the choice
-            # registry -- that is the correct outcome: trying to construct
-            # it later will raise ``Unsupported robot type`` with the
-            # actual list of available types. Per AGENTS.md > Review
-            # Learnings (#86) > "Exception Clauses Must Be Narrow" the
-            # canonical pattern for hardware-probing imports is
-            # ``(ImportError, OSError)``; widening further would mask
-            # genuine bugs in driver registration code.
-            logger.debug("[hardware_robot] skip %s: %s", full_name, exc)
-
-    _ensure_lerobot_plugins_registered()
-
-
-@functools.cache
-def _ensure_lerobot_plugins_registered() -> None:
-    """Import every installed third-party lerobot plugin distribution.
-
-    lerobot's own loader imports every distribution whose name starts with one
-    of its plugin prefixes (``lerobot_robot_``, ``lerobot_camera_``,
-    ``lerobot_teleoperator_``, ...), and each of those registers itself into the
-    matching :class:`draccus.ChoiceRegistry` as an import side effect. One call
-    therefore populates every registry at once, which is why this is a single
-    cached helper rather than a per-kind step: a vendor camera and a vendor
-    robot arrive from the same import, so registering one kind while the caller
-    happens to be resolving the other would leave the second unreachable.
-
-    Idempotent via ``@functools.cache``.
-    """
-    try:
-        from lerobot.utils.import_utils import register_third_party_plugins
-    except ImportError:
-        # ``register_third_party_plugins`` lives in modern lerobot only;
-        # older versions skip this opt-in step (built-ins still work).
-        logger.debug("[hardware_robot] register_third_party_plugins unavailable")
-    else:
-        try:
-            register_third_party_plugins()
-        except (ImportError, AttributeError, OSError) as exc:
-            # #291: narrowed from bare ``except Exception`` per AGENTS.md
-            # Review Learnings (#86). Third-party plugin registration can fail
-            # for three benign, recoverable reasons: a plugin distribution
-            # whose import chain is broken (ImportError), a lerobot version
-            # whose loader entry-point shape differs (AttributeError), or an
-            # OS-level probe inside a plugin's registration (OSError). Any of
-            # these should degrade to "that plugin is absent from the registry"
-            # -- not crash hardware init. A genuinely unexpected exception
-            # (e.g. a plugin raising ValueError from buggy registration code)
-            # now propagates so it is not silently masked.
-            logger.warning("[hardware_robot] third-party plugin registration failed: %s", exc)
 
 
 class TaskStatus(Enum):
@@ -1382,7 +1208,7 @@ class Robot(TeleopMixin, AgentTool):
         # third-party plugin loader for ``lerobot_robot_*`` distributions.
         # Both calls are cached after the first invocation so subsequent
         # ``Robot()`` calls are essentially free.
-        _ensure_lerobot_robots_registered()
+        ensure_lerobot_family_registered("robots")
 
         # Resolve the config class via lerobot's draccus ChoiceRegistry -
         # this is the source-of-truth lookup that ``make_robot_from_config``
@@ -1641,7 +1467,50 @@ class Robot(TeleopMixin, AgentTool):
         # (unknown kwargs are the provider's own refusal to make).
         policy_config.update({k: v for k, v in policy_kwargs.items() if v is not None})
 
+        # The provider's own pre-construction check, run for the same reason
+        # ``SimEngine._preflight_policy_config`` runs it before ``create_policy``:
+        # a configuration the provider can refuse WITHOUT constructing - a chunk
+        # count the consumer cannot execute, an ``image_keys`` list that
+        # withholds a feature the embodiment feeds, camera names that cannot be
+        # routed to a VLA's declared image inputs - otherwise surfaces only after
+        # the multi-minute weight download, on an arm this task has already
+        # energized and an operator who has already approved the rollout. That is
+        # the shape ``_policy_provider_error`` / ``_policy_port_error`` /
+        # ``_policy_requires_error`` exist to close, left open for the checks the
+        # provider makes for itself. The ValueError this raises reaches
+        # ``_execute_task`` as any other build failure does, so the refusal is
+        # reported with the arm released.
+        await self._run_policy_preflight(policy_provider, policy_config)
+
         return create_policy(policy_provider, **policy_config)
+
+    async def _run_policy_preflight(self, policy_provider: str, policy_config: dict[str, Any]) -> None:
+        """Run the provider's class-level ``preflight`` against this arm's observation.
+
+        The gate, the read and the refusal are
+        :func:`~strands_robots.policies.preflight_reason`'s - the one rule the
+        sim engine and a native driver's task verb read too. This method owes it
+        the arm: the read crosses the motors bus and warms a frame out of every
+        configured camera, so it runs on a worker thread rather than on the loop
+        the task's own cooperative stop is checked from.
+
+        Args:
+            policy_provider: Provider name, as passed to ``create_policy``.
+            policy_config: The assembled provider kwargs ``create_policy`` will
+                be given, so the hook judges the configuration that will be built.
+
+        Raises:
+            ValueError: The provider's ``preflight`` refused this configuration.
+        """
+        from .policies import preflight_reason
+
+        def observation_keys() -> set[str]:
+            observation = read_observation(self.robot)
+            return set(observation) if isinstance(observation, Mapping) else set()
+
+        reason = await asyncio.to_thread(preflight_reason, policy_provider, observation_keys, **policy_config)
+        if reason is not None:
+            raise ValueError(reason)
 
     def _close_open_devices(self) -> None:
         """Close every device that is open, one at a time and best-effort.

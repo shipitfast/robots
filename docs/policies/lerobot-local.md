@@ -213,6 +213,13 @@ policy = create_policy(
 )
 ```
 
+Together, because the units half on its own is refused rather than run: a map
+that converts writes its conversion into the very tensor the inert normalizer
+then leaves alone, so the full so101 joint range reaches the model at 160.0 where
+the native pack reaches 2.79 and the checkpoint was trained on ~1 sigma. The load
+names the inert features and both ways out - supply the stats above, or drop the
+conversion (`set_robot_state_keys([...])`, or a `"native"` map).
+
 The built-in `so100` / `so101` maps declare `state_units`/`action_units`
 `"degrees"`; every other map defaults to `"native"`, which is right for real
 hardware - an SO follower already reports driver units - and wrong for a sim
@@ -265,6 +272,14 @@ discarded (see [Camera routing](#embodiment-obs_rename-and-the-pre-flight-check)
 - then re-passing it would loop. The remedy then says the embodiment was
 rejected and points at `camera_key_map=` / `obs_rename_override=` to make it
 validate, or `set_robot_state_keys([...])`.
+
+A candidate that converts units is withheld too when normalization is inert
+(the "stats do not cover" warning above): `so100` and `so101` declare
+`state_units='degrees'`, correct only against degree-recorded stats, and with
+none the so101 joint range reaches the model at up to 160.0 where packing it
+natively reaches 2.79. The remedy then points at `set_robot_state_keys([...])`,
+which leaves the units alone, and names the `processor_overrides` that would
+make the embodiment correct.
 
 ## Camera routing
 
