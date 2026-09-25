@@ -695,6 +695,12 @@ dev = [
     "ruff>=0.15.12,<0.16.0",
     "mypy>=1.0.0,<2.0.0",
     "pytest-timeout>=2.0.0,<3.0.0",
+    # The suite runs in one process; the plugin is here so the cells that grade
+    # a distributed session (tests/test_session_truncation_is_reported.py) can
+    # spawn one. Installing it does not distribute anything on its own. It is
+    # pinned again in [tool.hatch.envs.default].dependencies, because that list
+    # -- not this extra -- is what `hatch run test` installs.
+    "pytest-xdist>=3.0.0,<4.0.0",
 ]
 
 [project.scripts]
@@ -736,6 +742,11 @@ dependencies = [
     "pytest>=6.0,<10.0.0",
     "pytest-cov>=4.0.0,<6.0.0",
     "pytest-timeout>=2.0.0,<3.0.0",
+    # Spawned, never inherited: the cells in
+    # tests/test_session_truncation_is_reported.py run a nested `pytest -n 2`,
+    # and without the plugin in this environment that run exits 4 on
+    # `unrecognized arguments: -n` with nothing on stdout. Same bound as [dev].
+    "pytest-xdist>=3.0.0,<4.0.0",
     "ruff>=0.15.12,<0.16.0",
     "mypy>=1.0.0,<2.0.0",
 ]
@@ -813,7 +824,14 @@ override-dependencies = [
 UV_TORCH_BACKEND = "{env:UV_TORCH_BACKEND:auto}"
 
 [tool.hatch.envs.default.scripts]
-test = "pytest {args:tests}"
+# The unit suite distributes over the cores, one worker per file. The flags
+# live on this script and not in `[tool.pytest.ini_options].addopts`, which
+# every pytest invocation rooted here inherits: `tests_integ/` binds fixed
+# ports, named containers, one GPU and physical serial buses, so two of its
+# files in flight at once is two writers on one arm. `test-integ` and a bare
+# `pytest` therefore stay in one process; pinned by
+# tests/test_the_suite_distributes_only_where_it_measured.py.
+test = "pytest -n auto --dist loadfile {args:tests}"
 test-integ = "pytest tests_integ/ -v --timeout=300 {args}"
 lint = ["ruff check strands_robots tests tests_integ", "ruff format --check strands_robots tests tests_integ", "mypy strands_robots tests tests_integ"]
 format = ["ruff check --fix strands_robots tests tests_integ", "ruff format strands_robots tests tests_integ"]

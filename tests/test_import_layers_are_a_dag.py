@@ -5,6 +5,10 @@ Two properties of ``strands_robots``, both read from the source by
 
 * the **runtime** module-scope import graph has no cycle - a cycle there is what
   makes an import order load-bearing and an interpreter deadlock possible;
+* no member is PLACED below its own imports - an inversion has to be one the
+  code forces, not one the layer map invented, so a member that could simply
+  move up (nothing that imports it sits at or below where it reads) fails
+  rather than being declarable;
 * every edge that points at a higher layer is written down - a runtime one in
   ``KNOWN_UPWARD_EDGES``, a deferred one (inside a function body) in
   ``KNOWN_DEFERRED_UPWARD_EDGES``. Each pin is an equality, so an inversion
@@ -188,6 +192,74 @@ class TestTheContract:
         assert sorted(found - declared) == [], "undeclared deferred inversion; fix it or declare it"
         assert sorted(declared - found) == [], "declared deferred inversion is gone; delete its line"
 
+    def test_no_inversion_is_one_a_different_placement_would_remove(self, graph: Any) -> None:
+        """A roster entry has to be forced by the code, not by the layer map.
+
+        The two equalities above make a roster a ratchet but say nothing about
+        whether an entry deserved to exist. A member placed below where it reads
+        reports every downward import as an inversion, and writing those down
+        records the placement: ``__main__`` sat in ``app``, so the console entry
+        point naming the dashboard CLI it exists to start was an ``app ->
+        dashboard`` inversion with a line of its own. Nothing imports a ``python
+        -m`` entry point, so it moved to the top layer and the line went.
+        """
+        assert mod.misplaced_members(graph) == (), (
+            "a member is placed below its own imports; move it in LAYERS: "
+            f"{[(name, mod.LAYER_NAMES[was], mod.LAYER_NAMES[now]) for name, was, now in mod.misplaced_members(graph)]}"
+        )
+
+    def test_the_placement_it_grades_is_the_one_that_was_wrong(
+        self, graph: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Put ``__main__`` back in ``app`` and the cell above names it.
+
+        Without this the rule passes by measuring nothing, and it is the only
+        placement the package has had that the rule rejects.
+        """
+        monkeypatch.setitem(mod.LAYER_OF_MEMBER, "__main__", mod.LAYER_NAMES.index("app"))
+        assert mod.misplaced_members(graph) == (
+            ("__main__", mod.LAYER_NAMES.index("app"), mod.LAYER_NAMES.index("dashboard")),
+        )
+
+    @pytest.mark.parametrize(
+        ("member", "reads"),
+        [
+            ("drivers", "policies and simulation"),
+        ],
+    )
+    def test_an_inversion_a_move_cannot_remove_is_not_reported_as_a_placement(
+        self, graph: Any, member: str, reads: str
+    ) -> None:
+        """The one declared inversion is forced, and that is measured.
+
+        ``drivers`` reads a layer above it, so the rule two cells up sees it; it
+        is not reported, because something at or below where it reads imports it
+        and moving it would only invert that edge instead. Drop the "nothing that
+        imports it forbids the move" half of the rule and it turns into a false
+        report, which is what this row pins.
+
+        Two members have left this table, and both left the same way - the thing
+        they reached up for moved down to them. ``teleop_mixin`` deferred its read
+        of the ``teleoperator`` factory, which sat in ``app`` only because it
+        borrowed a private lerobot-registry walk from the hardware ``Robot``.
+        ``_hitl_audit`` deferred its read of the safety audit log, which sat in
+        ``mesh`` only because the mesh wrote to it first - it imports nothing from
+        the package, and a ``core`` gate, a ``mesh`` peer and a ``tools`` body all
+        write to it. A row here whose member reads nothing above it grades
+        nothing, so the row goes when the inversion does.
+        """
+        assert member in mod.LAYER_OF_MEMBER, reads
+        reaching_up = [
+            (importer, target)
+            for kind in ("runtime", "late")
+            for importer, targets in getattr(graph, kind).items()
+            if mod.member_of(importer) == member
+            for target in targets
+            if (mod.layer_of(target) or 0) > mod.LAYER_OF_MEMBER[member]
+        ]
+        assert reaching_up, f"{member} reads nothing above it, so this row grades nothing"
+        assert member not in {name for name, _was, _now in mod.misplaced_members(graph)}
+
     def test_no_module_reaches_a_public_name_off_the_package_root(self, graph: Any) -> None:
         """The facade is not a back door around the two rosters above.
 
@@ -336,15 +408,19 @@ class TestTheContract:
         that lives above one of its callers is a safety decision that caller
         reaches up for, or copies.
 
-        Neither reads anything above ``core`` at import time. The audit row's one
-        upward read - the mesh safety log it writes through - is deferred to the
-        call and pinned here as exactly that, so a second upward dependency
-        cannot join it unnoticed, and moving it to module scope fails.
+        Neither reads anything above ``core``, at import time or from inside a
+        call: the empty sets are the pin, so a gate that reaches up for a peer, a
+        host or a tool fails here whether it does so on import or on first use.
+        The audit row's one dependency used to be the exception - the safety log
+        it writes through sat in ``mesh``, so the write was deferred to keep a
+        transport stack off the import of a tool that gates a ROS graph. The log
+        sits in ``core`` beside it now and imports nothing from the package, so
+        the write is a module-scope call and the exception is gone.
         """
         core = mod.LAYER_NAMES.index("core")
-        deferred = {
+        deferred: dict[str, set[str]] = {
             "strands_robots._command_gate": set(),
-            "strands_robots._hitl_audit": {"strands_robots.mesh.audit"},
+            "strands_robots._hitl_audit": set(),
         }
         for name, allowed_late in deferred.items():
             assert name in graph.modules
@@ -363,7 +439,7 @@ class TestTheContract:
         }
         assert {"app", "tools"} <= callers, f"only {sorted(callers)} ask a human, so the rule above is vacuous"
 
-    def test_nothing_below_the_dashboard_reaches_into_it_but_the_command_that_starts_it(self, graph: Any) -> None:
+    def test_nothing_below_the_dashboard_reaches_into_it(self, graph: Any) -> None:
         """The web layer is the top of the stack, and deferring a read of it hides that.
 
         ``dashboard`` is the only layer with nothing above it, so an edge into it
@@ -379,10 +455,10 @@ class TestTheContract:
         failed import. The store sits in ``core`` now
         (:mod:`strands_robots._motion_grants`), under all three of them.
 
-        ``__main__ -> dashboard.cli`` is the one edge that remains and the only
-        one that belongs: the CLI is what a reader runs to START the dashboard, so
-        the command has to name it. Listed rather than allowed by rule, so a
-        second one fails here.
+        No edge remains. The last one was ``__main__ -> dashboard.cli``, and the
+        command that starts the dashboard has to name its CLI - what was wrong
+        was reading that as an inversion, when a ``python -m`` entry point is
+        the one module nothing imports and so belongs in the top layer itself.
         """
         dashboard = mod.LAYER_NAMES.index("dashboard")
         offenders = sorted(
@@ -392,9 +468,7 @@ class TestTheContract:
             for target in targets
             if mod.layer_of(target) == dashboard and (mod.layer_of(importer) or 0) < dashboard
         )
-        assert offenders == [("strands_robots.__main__", "strands_robots.dashboard.cli")], (
-            f"a layer below the dashboard imports one of its modules: {offenders}"
-        )
+        assert offenders == [], f"a layer below the dashboard imports one of its modules: {offenders}"
 
     def test_no_layer_below_app_reaches_into_it(self, graph: Any) -> None:
         """The ``app`` layer is a consumer of the package, not a dependency of it.
@@ -408,13 +482,22 @@ class TestTheContract:
         (raised by the dataset writer, caught by the rollout drivers a layer
         down).
 
-        The one deferred edge that still points into it - the mixin's
-        lerobot-deferred ``teleoperator`` read - is declared in
-        ``KNOWN_DEFERRED_UPWARD_EDGES`` and graded by the equality above rather
-        than by this cell.
+        Every kind of import is graded, not just the runtime ones, because a
+        deferral is still a dependency: the last edge into ``app`` from below was
+        the mixin reaching into the ``teleoperator`` factory from inside
+        ``attach_teleop``, and it survived a runtime-only reading of this rule for
+        as long as the factory sat in ``app``. It sits in ``drivers|mesh`` now,
+        beside the mixin, so the set is empty for all three kinds and a module
+        moved back up here fails this cell rather than only the roster equality.
         """
         app = mod.LAYER_NAMES.index("app")
-        offenders = sorted(edge for edge in mod.upward_edges(graph) if mod.layer_of(edge[1]) == app)
+        offenders = sorted(
+            (importer, target)
+            for kind in ("runtime", "typing_only", "late")
+            for importer, targets in getattr(graph, kind).items()
+            for target in targets
+            if mod.layer_of(target) == app and (below := mod.layer_of(importer)) is not None and below < app
+        )
         assert offenders == [], f"a layer below app imports one of its modules: {offenders}"
 
     @pytest.mark.parametrize(
@@ -425,6 +508,12 @@ class TestTheContract:
                 "core",
                 frozenset(),
                 frozenset({"core", "sim|policies"}),
+            ),
+            (
+                "strands_robots.audit",
+                "core",
+                frozenset(),
+                frozenset({"core", "drivers|mesh", "tools"}),
             ),
             (
                 "strands_robots._motion_grants",
@@ -465,8 +554,14 @@ class TestTheContract:
             (
                 "strands_robots.teleop_mixin",
                 "drivers|mesh",
-                frozenset({"strands_robots.teleoperator"}),
+                frozenset(),
                 frozenset({"drivers|mesh", "sim|policies", "app"}),
+            ),
+            (
+                "strands_robots.teleoperator",
+                "drivers|mesh",
+                frozenset(),
+                frozenset({"drivers|mesh", "app"}),
             ),
             (
                 "strands_robots.rtps.participant",
@@ -509,9 +604,18 @@ class TestTheContract:
         reads nothing above that layer at import time, which is what lets it sit
         there; and its callers are the layers that need it, which is why it sits
         under them. A deferred read above the layer is listed explicitly rather
-        than allowed in general - the mixin's ``teleoperator`` read is late
-        because that module imports lerobot, and promoting it to module scope has
-        to fail here.
+        than allowed in general, so promoting one to module scope has to fail
+        here.
+
+        ``teleop_mixin`` and ``teleoperator`` are the pair that row shape was
+        needed for. The mixin deferred its read of the factory because the
+        factory sat in ``app``, and the only thing holding it there was a private
+        walk of lerobot's robot registry that it borrowed from the hardware
+        ``Robot`` to tell a caller that ``so101_follower`` is a follower, not a
+        leader. That walk is shared from ``core`` now, so the factory sits beside
+        the mixin that attaches what it builds, both sets are empty, and the
+        mixin's import stays deferred for the reason it states - lerobot - rather
+        than for the layering.
 
         The five ``dataset`` rows are one concern touched five ways: what a
         dataset recorded (``dataset_metadata``, the ``meta/episodes`` parquet the

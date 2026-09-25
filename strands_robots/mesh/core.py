@@ -23,9 +23,9 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from strands_robots._mesh_switch import mesh_env_request
+from strands_robots.audit import log_safety_event
 from strands_robots.bus_access import joint_read_source, read_joints, read_observation
 from strands_robots.mesh import security as _security
-from strands_robots.mesh.audit import log_safety_event
 from strands_robots.mesh.pacing import Ticker
 from strands_robots.mesh.sensors import SensorLoopsMixin
 from strands_robots.mesh.session import (
@@ -731,12 +731,21 @@ class Mesh(SensorLoopsMixin):
             auth_mode = _zenoh_config.resolve_auth_mode()
             namespace = _zenoh_config.resolve_namespace()
             is_permissive, resolved = _acl_config.snapshot_acl(namespace)
-        except ValueError as warn_exc:
+        except (ValueError, ImportError) as warn_exc:
             # Narrow tuple per AGENTS.md > Review Learnings (#86):
             # ValueError surfaces bad STRANDS_MESH_AUTH_MODE / unloadable
             # ACL. Fail-CLOSED (treat as permissive) so the gate refuses
             # to bring up the wire. Wider exception types (OSError, etc.)
             # propagate so genuine bugs aren't masked at WARNING level.
+            #
+            # ImportError is in the tuple because this method is
+            # documented as a DECISION (True refuses, False proceeds) and
+            # the call sits in try/finally, not try/except -- so anything
+            # escaping leaves ``start()`` as a traceback instead of a
+            # verdict. ``_parse_json5`` raises ImportError when the
+            # declared ``json5`` dep is missing, which takes a partial
+            # install (zenoh present, json5 absent) and is a
+            # configuration problem, not a bug the narrow tuple protects.
             logger.warning(
                 "[mesh] %s: ACL gate evaluation failed (%s) -- treating as permissive default; refusing to start",
                 self.peer_id,
@@ -3592,7 +3601,7 @@ class Mesh(SensorLoopsMixin):
         reaching an already locked-out peer must halt a rollout the first one
         missed rather than be rejected. The event is also published on
         ``strands/safety/estop`` and recorded in the audit log (see
-        :func:`strands_robots.mesh.audit.log_safety_event`).
+        :func:`strands_robots.audit.log_safety_event`).
 
         Returns the responses collected within the broadcast timeout, the local
         robot's own answer first (shaped like a peer's, with this peer's id) --

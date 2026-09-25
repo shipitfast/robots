@@ -6,7 +6,7 @@ description: Running, stopping, evaluating and watching a policy in simulation.
 
 | Action | Key params |
 |--------|-----------|
-| `run_policy` | `robot_name` (required), `policy_provider="mock"`, `policy_config={}`, `policy_object=None`, `instruction=""`, `duration=10.0`, `control_frequency=50.0`, `action_horizon=8`, `n_steps=None`, `seed=None`, `async_rtc=None`, `rtc_inference_timeout_s=None`, `stop_when=None`, `observer=None` ([observers](observers.md)), `video=None` |
+| `run_policy` | `robot_name` (required), `policy_provider="mock"`, `policy_config={}`, `policy_object=None`, `instruction=""`, `duration=10.0`, `control_frequency=None`, `action_horizon=8`, `n_steps=None`, `seed=None`, `async_rtc=None`, `rtc_inference_timeout_s=None`, `stop_when=None`, `observer=None` ([observers](observers.md)), `video=None` |
 | `start_policy` | same args, async/non-blocking |
 | `stop_policy` | `robot_name` (optional, defaults to `""` - every rollout) |
 | `list_policies_running` | - |
@@ -55,7 +55,11 @@ use, bound to the tool-error envelope through `SimEngine._validate_posture_flags
 and checked ahead of robot resolution, so a refused call builds no policy and
 touches no scene. `run_policy` checks all four and treats `async_rtc=None` as its
 "resolve from the policy" spelling; `eval_policy` declares `async_rtc` as a plain
-`bool` and refuses `None`. Unlike the numeric knobs the check sits at the facades
+`bool` and refuses `None`. `wbc_install_torque_control` is declared by all three
+rollout surfaces - `run_policy`, `eval_policy` and `evaluate_benchmark` - which
+install the controller through the one reader
+`SimEngine._install_action_controller`, so a scored rollout drives the scene the
+way an unscored one does. Unlike the numeric knobs the check sits at the facades
 only: `PolicyRunner.run` takes these flags as the facades hand them and
 does not repeat it.
 

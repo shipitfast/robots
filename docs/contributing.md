@@ -16,15 +16,22 @@ uv pip install -e '.[all,dev]'
 ## Commands
 
 ```bash
-hatch run test                       # full suite
+hatch run test                       # full suite (distributed over your cores)
 hatch run test --no-cov tests/       # fast, no coverage
+hatch run test -n0 tests/test_x.py   # one process, for pdb or a timing check
 hatch run lint                       # ruff check + ruff format --check + mypy
 hatch run format                     # ruff fix + format
 mkdocs serve                         # docs at http://localhost:8000
 mkdocs build --strict                # CI gate
 ```
 
-CI runs `hatch run test -x --strict-markers`.
+CI runs `hatch run test -x --strict-markers`. The `test` script carries `-n
+auto --dist loadfile`, so both that run and yours spread over the available
+cores, one worker per file; `-n0` puts the session back in one process. The
+flags live on that script rather than in `addopts` on purpose: `hatch run
+test-integ` and a bare `pytest` stay in one process, because `tests_integ/`
+binds fixed ports, named containers, one GPU and physical serial buses, none
+of which two files may hold at once.
 
 `-x` means a red run stops at the first failure with the rest of the suite
 unexecuted, and its counts line is shaped exactly like a complete run's. So
@@ -63,7 +70,7 @@ that equivalence first.
 
 **JSON registries** - new robots and policies are JSON edits + tests. No hardcoded lookups in `.py` files.
 
-**Imports point downward** - the package reads as seven layers, `core -> registry -> drivers|mesh -> sim|policies -> app -> tools -> dashboard`, and a module imports only its own layer or below. Check with `python scripts/check_import_layers.py` (source-only, imports nothing). It fails on a cycle in the runtime graph and on an upward import that is not declared - `KNOWN_UPWARD_EDGES` for a module-scope one, `KNOWN_DEFERRED_UPWARD_EDGES` for one inside a function body - both rosters of inversions left to fix, which shrink by deleting a line. Deferring an import breaks a cycle without changing who depends on whom, so it is exempt from the first property and graded by the second. `if TYPE_CHECKING:` imports are reported and graded by neither.
+**Imports point downward** - the package reads as seven layers, `core -> registry -> drivers|mesh -> sim|policies -> app -> tools -> dashboard`, and a module imports only its own layer or below. Check with `python scripts/check_import_layers.py` (source-only, imports nothing). It fails on a cycle in the runtime graph and on an upward import that is not declared - `KNOWN_UPWARD_EDGES` for a module-scope one, `KNOWN_DEFERRED_UPWARD_EDGES` for one inside a function body - both rosters of inversions left to fix, which shrink by deleting a line. Deferring an import breaks a cycle without changing who depends on whom, so it is exempt from the first property and graded by the second. `if TYPE_CHECKING:` imports are reported and graded by neither. A third property keeps the rosters honest: a member placed below the layers it imports would report every one of them as an inversion, so the script fails on a member that could simply move up - an inversion has to be one the code forces, not one the layer map invented.
 
 **A dependency change and its relock are one commit** - editing `pyproject.toml` without running `uv lock` leaves the lock describing a manifest that no longer exists. `uv.lock` is one of the manifests GitHub's dependency graph parses, so a stale lock is a stale *security surface*, not just a stale install. Check it before pushing with `python scripts/check_lockfile_parity.py` (offline, no resolver) or `uv lock --check`.
 

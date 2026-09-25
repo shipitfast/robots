@@ -1939,10 +1939,10 @@ class MuJoCoSimEngine(
         # the download path decides the same question when it works out whether
         # a robot's assets need fetching, so a second copy here could disagree
         # with it about the same model.
-        from strands_robots.assets.download import _mjcf_missing_meshes
+        from strands_robots.assets.download import _mesh_problem_detail, _mjcf_mesh_problems
 
         try:
-            missing = bool(_mjcf_missing_meshes(model_path))
+            missing = bool(_mjcf_mesh_problems(model_path))
         except (OSError, UnicodeDecodeError):
             # An unreadable model contributes no reference this check can
             # resolve. MuJoCo names the unreadable file itself on the load that
@@ -1973,6 +1973,23 @@ class MuJoCoSimEngine(
                         )
                     }
                 ],
+            }
+
+        # A download that ran is not a download that delivered: a clone made
+        # without git-lfs writes pointer stubs for every mesh its upstream keeps
+        # in LFS and still exits 0. Proceeding then hands the tree to MuJoCo,
+        # whose decoder reports "number of faces should be between 1 and 200000
+        # ... perhaps this is an ASCII file?" against a path that is on disk -
+        # the cryptic report this method exists to replace.
+        try:
+            problems = _mjcf_mesh_problems(model_path)
+        except (OSError, UnicodeDecodeError):
+            problems = {}
+        if problems:
+            detail = _mesh_problem_detail(os.path.basename(model_path), problems)
+            return {
+                "status": "error",
+                "content": [{"text": f"Robot '{robot_name}' has no loadable meshes after re-fetching: {detail}"}],
             }
         return None
 
@@ -3440,12 +3457,17 @@ class MuJoCoSimEngine(
         joint-position targets; on the stock position-servo Unitree G1 those
         targets fight the uniform ``kp=500`` servo gain and override SONIC's
         tuned per-joint PD, so ``sim.run_policy(policy_provider="wbc")`` would
-        otherwise fall over within a fraction of a second. When the driven
+        otherwise fall over within a fraction of a second - and
+        ``evaluate_benchmark(policy_provider="wbc")`` would publish that fall as
+        the policy's own ``success_rate``, which is why all three rollout
+        surfaces install through
+        :meth:`~strands_robots.simulation.base.SimEngine._install_action_controller`. When the driven
         actuators are position-servo (see
         :func:`~strands_robots.policies.wbc.wbc_uses_position_servo`) and no
         action controller is already installed, this wires up
         :func:`~strands_robots.policies.wbc.install_wbc_torque_control` and
         returns its :meth:`uninstall` so the scene is restored after the run.
+        The message names no surface, since every rollout surface reaches it.
 
         ``policy`` may be the ``WBCPolicy`` itself or any wrapper that declares
         it through :attr:`~strands_robots.policies.base.Policy.children` - a
@@ -3492,7 +3514,7 @@ class MuJoCoSimEngine(
 
         controller = install_wbc_torque_control(self, wbc_policy, robot_name)
         logger.info(
-            "run_policy: auto-installed WBC torque control on %r (position-servo "
+            "auto-installed WBC torque control on %r (position-servo "
             "actuators detected). WBC emits joint-position targets the stock servo "
             "gain would override; the torque shim applies SONIC's per-joint PD law "
             "so the gait is stable. Pass wbc_install_torque_control=False to opt out.",
